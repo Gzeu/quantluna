@@ -7,11 +7,11 @@ Problema rezolvată:
 LiveTrader accesa atributele TradeSignal via getattr(sig, 'zscore', default),
 getattr(sig, 'hedge_ratio', default) etc. TradeSignal nu are atribut 'hedge_ratio'
 — îl are ca 'beta'. Același lucru pentru 'kalman_uncertainty' vs 'uncertainty'.
-Aceasta crea o divergență silențioasă: LiveTrader primea 0.0 pentru hedge ratio
+Aceasta crea o divergență silentioasă: LiveTrader primea 0.0 pentru hedge ratio
 în loc de beta-ul real, ceea ce contamina _publish_state() și dashboard-ul.
 
 Soluție:
-LiveSignalAdapter wrappează SignalGenerator și expune o interfață normalizată
+LiveSignalAdapter wrappază SignalGenerator și expune o interfață normalizată
 cu atributele exacte pe care LiveTrader le consumă. Niciun getattr fallback
 nu mai e necesar în LiveTrader — va fi înlocuit cu accesul direct.
 
@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import pandas as pd
+from loguru import logger
 
 from strategy.signal import SignalGenerator, TradeSignal, Signal
 
@@ -103,7 +104,7 @@ class NormalizedSignal:
 
 class LiveSignalAdapter:
     """
-    Wrapper peste SignalGenerator care expune interfața NormalizedSignal.
+    Wrapper peste SignalGenerator care expune interfata NormalizedSignal.
 
     Usage în LiveTrader:
         adapter = LiveSignalAdapter(signal_gen)
@@ -147,6 +148,40 @@ class LiveSignalAdapter:
     def reset(self) -> None:
         """Hard reset intern SignalGenerator."""
         self._gen.reset()
+
+    def reset_kalman(self) -> None:
+        """
+        FIX-6: Reset explicit al stării Kalman Filter.
+
+        Apelat de LiveTrader._on_reconnect() la fiecare WS reconnect
+        pentru a evita hedge ratio stale după o întrerupere a feed-ului.
+
+        Ordinea de prioritate:
+          1. inner.kalman.reset()        — reset specific Kalman (preferat)
+          2. inner.reset()               — full SignalGenerator reset (fallback)
+          3. log warning                 — dacă nicio metodă nu există
+
+        După reset, filtrul va trece prin warm_up bars înainte de a genera
+        semnale. LiveTrader setează state=WARMING_UP separat.
+        """
+        inner = self._gen
+        if hasattr(inner, "kalman") and hasattr(inner.kalman, "reset"):
+            inner.kalman.reset()
+            logger.info(
+                "LiveSignalAdapter.reset_kalman(): Kalman state reset "
+                "via inner.kalman.reset() — warm-up necesar"
+            )
+        elif hasattr(inner, "reset"):
+            inner.reset()
+            logger.warning(
+                "LiveSignalAdapter.reset_kalman(): inner.kalman.reset() indisponibil — "
+                "fallback la SignalGenerator.reset() (full reset, inclusiv buffers)"
+            )
+        else:
+            logger.warning(
+                "LiveSignalAdapter.reset_kalman(): nicio metoda reset disponibila "
+                "pe SignalGenerator — beta poate fi stale dupa reconnect!"
+            )
 
     @property
     def inner(self) -> SignalGenerator:
