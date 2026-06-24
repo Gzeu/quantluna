@@ -153,6 +153,7 @@ class SignalGenerator:
                 if "half_life_hours" in row and not pd.isna(row["half_life_hours"])
                 else np.nan
             )
+            # Explicit None checks (v3 fix: handles zero-value series correctly)
             fund_rate = float(funding_annual.iloc[i]) if funding_annual is not None else 0.0
             reg_mult  = float(regime_multiplier.iloc[i]) if regime_multiplier is not None else 1.0
 
