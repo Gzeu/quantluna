@@ -16,9 +16,11 @@ QuantLuna is a **production-grade statistical arbitrage engine** built around a 
 - **Pairs Trading** with cointegration validation (Engle-Granger + Johansen)
 - **Kalman Filter** for adaptive, real-time hedge ratio (β) estimation — process noise Q, measurement noise R, full P/K/state cycle per tick
 - **Market-neutral** long/short structures on BTC, ETH, SOL, BNB and correlated assets
-- **Funding-rate aware** — perpetual futures cost model via `FundingMonitor`, delegated to `PortfolioAllocator`
+- **Funding-rate aware** — perpetual futures cost model via `FundingMonitor`, delegated to `MultiPairAllocator`
 - **Walk-forward + Monte Carlo** backtesting for robust out-of-sample validation
-- **Regime detection** — spread buffer + z-score stability checks before entry
+- **Regime detection** — `RegimeDetector` + spread buffer + z-score stability checks before entry
+- **Live pair scanning** — `LivePairScanner` + `PairSelector` pentru universe filtering automat
+- **Portfolio-level risk** — `MultiPairAllocator`, `CorrelationMatrix`, `DrawdownController`, `PortfolioRisk`
 - **HALT logic** — queue overflow (100 consecutive drops) triggers system halt + external alert
 
 ---
@@ -33,18 +35,30 @@ quantluna/
 │   └── cointegration.py        # Engle-Granger, Johansen, half-life estimator
 ├── strategy/
 │   ├── signal.py               # LiveSignalAdapter, SpreadEngine, z-score via on_tick()
-│   └── regime.py               # Regime filter, stability gate
+│   ├── signal_adapter.py       # Adapter layer între signal engine și live trader
+│   ├── regime.py               # Regime filter, stability gate (lightweight)
+│   ├── regime_detector.py      # RegimeDetector complet — HMM/vol-based regime classification
+│   ├── pair_selector.py        # PairSelector — scoring, ranking, universe filtering
+│   ├── live_pair_scanner.py    # LivePairScanner — async scanning, pair rotation în timp real
+│   └── cointegration/          # Submodul cointegration extins
 ├── risk/
 │   ├── kelly.py                # Fractional Kelly, vol-target sizing
-│   ├── portfolio.py            # PortfolioAllocator, funding-adjusted sizing
-│   └── drawdown.py             # Max DD control, position scaling
+│   ├── position_sizer.py       # PositionSizer — sizing unificat cu DD scaling
+│   ├── multi_pair_allocator.py # MultiPairAllocator — capital allocation cross-pair
+│   ├── portfolio_risk.py       # PortfolioRisk — var, beta-neutral checks
+│   ├── correlation_matrix.py   # CorrelationMatrix — live rolling correlation tracking
+│   └── drawdown_controller.py  # DrawdownController — max DD enforcement, scaling logic
 ├── execution/
 │   ├── live_trader.py          # Main live engine — WebSocket feed, order execution
-│   └── funding_monitor.py      # FundingMonitor — real-time funding rate polling
+│   ├── order_manager.py        # OrderManager — order lifecycle, fills, cancels
+│   ├── funding_monitor.py      # FundingMonitor — real-time funding rate polling
+│   ├── pnl_reconciler.py       # PnLReconciler — realized/unrealized PnL tracking
+│   ├── ws_watchdog.py          # WsWatchdog — WebSocket health, auto-reconnect
+│   └── live_trader_sprint6_patch.py  # GOLIT — zero risc de import accidental
 ├── backtest/
 │   ├── engine.py               # Vectorised backtest, bar_freq support
 │   ├── walk_forward.py         # Walk-forward, purged K-fold, non-leakage splits
-│   └── analytics.py           # Sharpe, Sortino, Calmar, max DD, win rate
+│   └── analytics.py            # Sharpe, Sortino, Calmar, max DD, win rate
 ├── data/
 │   ├── loaders.py              # OHLCV loaders, CCXT wrappers
 │   └── funding_fetcher.py      # Historical + live funding rate data
@@ -56,8 +70,20 @@ quantluna/
 │   ├── run_backtest.py         # CLI backtest runner
 │   └── run_live.py             # CLI live/paper runner
 ├── tests/
-│   ├── test_backtest.py        # Smoke, metrics, non-leakage, bar_freq tests
-│   └── test_walk_forward.py    # Walk-forward: API, non-leakage, bar_freq
+│   ├── conftest.py             # Shared fixtures
+│   ├── test_kalman.py          # Kalman Filter unit tests
+│   ├── test_spread.py          # Spread engine tests
+│   ├── test_cointegration.py   # Cointegration pipeline tests
+│   ├── test_signal.py          # Signal adapter tests (smoke)
+│   ├── test_signal_full.py     # Signal end-to-end tests
+│   ├── test_regime.py          # Regime detector tests
+│   ├── test_pair_selector.py   # PairSelector scoring tests
+│   ├── test_risk.py            # Kelly, PositionSizer, DrawdownController tests
+│   ├── test_sprint10_allocator.py  # MultiPairAllocator integration tests
+│   ├── test_live_trader.py     # LiveTrader unit + integration tests
+│   ├── test_backtest.py        # Backtest: smoke, metrics, non-leakage, bar_freq
+│   ├── test_walk_forward.py    # Walk-forward: API, non-leakage, bar_freq
+│   └── test_data.py            # Data loaders + funding fetcher tests
 ├── state_bus.py                # Internal event bus
 ├── .env.example                # Environment variable template
 ├── pyproject.toml
@@ -114,17 +140,20 @@ python scripts/run_live.py --pair BTCUSDT ETHUSDT --mode live
 # Rulează toate testele
 pytest tests/ -x --tb=short -q
 
-# Doar backtest suite
-pytest tests/test_backtest.py -v
-
-# Doar walk-forward suite
-pytest tests/test_walk_forward.py -v
+# Module specifice
+pytest tests/test_kalman.py tests/test_spread.py -v
+pytest tests/test_signal.py tests/test_signal_full.py -v
+pytest tests/test_regime.py tests/test_pair_selector.py -v
+pytest tests/test_risk.py tests/test_sprint10_allocator.py -v
+pytest tests/test_live_trader.py -v
+pytest tests/test_backtest.py tests/test_walk_forward.py -v
 ```
 
 **Cerințe pentru green suite:**
 - Toate testele non-leakage trebuie să treacă — train/test windows nu se suprapun
 - `bar_freq` trebuie respectat în engine (nu hardcodat `bars_per_day = 24`)
 - Walk-forward fold count și split ratio validate cu API-ul actual
+- `MultiPairAllocator` tests (sprint10) validează capital allocation cross-pair și correlation-aware sizing
 
 ---
 
@@ -143,6 +172,8 @@ pytest tests/test_walk_forward.py -v
 | `kelly_fraction` | `0.25` | Fractional Kelly multiplier |
 | `max_drawdown_pct` | `0.10` | DD maxim înainte de position scaling |
 | `queue_overflow_halt` | `100` | Drops consecutive → HALT + alert extern |
+| `max_pairs_live` | `5` | Nr. maxim de perechi active simultan (MultiPairAllocator) |
+| `corr_threshold` | `0.85` | Prag corelație cross-pair — perechi > threshold reduc sizing |
 
 ---
 
@@ -150,14 +181,17 @@ pytest tests/test_walk_forward.py -v
 
 ```
 WebSocket tick
-    └─> LiveSignalAdapter.on_tick()
-            └─> SpreadEngine (Kalman update → hedge ratio → spread)
+    └─> LiveSignalAdapter.on_tick()  [strategy/signal_adapter.py]
+            └─> SpreadEngine (Kalman update → hedge ratio → spread)  [core/]
                     └─> Z-score calculation
-                            └─> Regime gate
-                                    └─> LiveTrader._evaluate_signal()
-                                            ├─> Kelly sizing (spread_buffer ≥ min_warmup_bars)
-                                            ├─> FundingMonitor cost check
-                                            └─> Order execution (CCXT)
+                            └─> RegimeDetector gate  [strategy/regime_detector.py]
+                                    └─> LiveTrader._evaluate_signal()  [execution/live_trader.py]
+                                            ├─> Kelly sizing (spread_buffer ≥ min_warmup_bars)  [risk/kelly.py]
+                                            ├─> PositionSizer + DrawdownController  [risk/]
+                                            ├─> MultiPairAllocator — cross-pair capital check  [risk/multi_pair_allocator.py]
+                                            ├─> FundingMonitor cost check  [execution/funding_monitor.py]
+                                            └─> OrderManager → exchange (CCXT)  [execution/order_manager.py]
+                                                        └─> PnLReconciler  [execution/pnl_reconciler.py]
 ```
 
 ---
@@ -187,13 +221,26 @@ Toate fix-urile aplicate înainte de prod:
 |------------|--------|
 | `core/kalman_filter.py` | ✅ Prod-ready |
 | `core/spread.py` | ✅ Prod-ready |
+| `core/cointegration.py` | ✅ Prod-ready |
 | `strategy/signal.py` | ✅ Prod-ready |
+| `strategy/signal_adapter.py` | ✅ Prod-ready |
+| `strategy/regime_detector.py` | ✅ Prod-ready |
+| `strategy/pair_selector.py` | ✅ Prod-ready |
+| `strategy/live_pair_scanner.py` | ✅ Prod-ready |
+| `risk/kelly.py` | ✅ Prod-ready |
+| `risk/position_sizer.py` | ✅ Prod-ready |
+| `risk/multi_pair_allocator.py` | ✅ Prod-ready |
+| `risk/correlation_matrix.py` | ✅ Prod-ready |
+| `risk/drawdown_controller.py` | ✅ Prod-ready |
+| `risk/portfolio_risk.py` | ✅ Prod-ready |
+| `execution/live_trader.py` | ✅ Prod-ready (FIX-P1 aplicat) |
+| `execution/order_manager.py` | ✅ Prod-ready |
+| `execution/pnl_reconciler.py` | ✅ Prod-ready |
+| `execution/ws_watchdog.py` | ✅ Prod-ready |
+| `execution/live_trader_sprint6_patch.py` | ✅ Golit |
 | `backtest/engine.py` | ✅ Prod-ready |
 | `backtest/walk_forward.py` | ✅ Prod-ready |
-| `execution/live_trader.py` | ✅ Prod-ready (FIX-P1 aplicat) |
-| `execution/live_trader_sprint6_patch.py` | ✅ Golit |
-| `tests/test_backtest.py` | ✅ Rescris |
-| `tests/test_walk_forward.py` | ✅ Rescris |
+| `tests/` (14 fișiere) | ✅ Suite completă |
 
 ---
 
@@ -204,6 +251,7 @@ Toate fix-urile aplicate înainte de prod:
 - Cointegration relationships break down — monitorizează permanent regime shifts
 - Funding rates pe perpetual futures pot distruge P&L — costul este integrat în sizing dar nu elimină riscul
 - Lichiditate și slippage reale diferă de presupunerile din backtest — validează pe exchange-ul tău specific
+- Corelația cross-pair poate crește brusc în perioadele de stress — `CorrelationMatrix` reduce sizing automat dar nu previne loss-urile
 - Nu deployi niciodată fără walk-forward validat și parametri testați out-of-sample
 - Primul run live: `min_warmup_bars=60`, capital la 10% din target — validează că buffer-ul se umple corect și Kelly returnează sizing rezonabil din log
 
