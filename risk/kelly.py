@@ -118,9 +118,27 @@ class KellyCrossPair:
         n = len(pnl)
 
         # --- Vol target sizing ---
-        spread_returns = pd.Series(spread_series).pct_change().dropna()
-        pair_vol = float(spread_returns.std()) if len(spread_returns) > 5 else 0.02
-        pair_vol = max(pair_vol, 1e-6)  # evită division by zero
+        # FIX-2: spread-ul pairs trading e o diferență de prețuri, NU un preț.
+        # pct_change() pe spread produce valori instabile sau ±inf când
+        # spread-ul trece prin zero (frecvent în crypto). Calculăm volatilitatea
+        # ca std() absolut al spread-ului, normalizat față de media sa absolută
+        # pentru a obține o fracție comparabilă cu vol_target.
+        spread_arr = pd.Series(spread_series).dropna().astype(float)
+        if len(spread_arr) > 5:
+            pair_vol_abs = float(spread_arr.std())
+            spread_mean_abs = float(spread_arr.abs().mean())
+            if spread_mean_abs > 1e-8 and pair_vol_abs > 0:
+                pair_vol = pair_vol_abs / spread_mean_abs
+            else:
+                # spread_mean_abs ≈ 0 → spread oscilează în jurul lui 0 (normal
+                # în pairs trading); folosim std absolut ca proxy direct
+                pair_vol = pair_vol_abs if pair_vol_abs > 0 else 0.02
+                notes.append("spread_near_zero — pair_vol calculat ca std absolut")
+        else:
+            pair_vol = 0.02
+            notes.append("spread_buf_mic (<5 valori) — pair_vol fallback 0.02")
+
+        pair_vol = max(pair_vol, 1e-4)  # floor realist (evită sizing astronomic)
         vol_target_fraction = min(
             cfg.vol_target / pair_vol,
             cfg.max_fraction_per_pair,
