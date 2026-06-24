@@ -1,59 +1,68 @@
 # QuantLuna — Changelog
 
+## Sprint 7 — 2026-06-24
+
+### Added
+- `execution/ws_watchdog.py` — `WsWatchdog` async task. Monitorizare health
+  WebSocket price feed: `ping()` apelat de `LiveTrader._process_tick()`,
+  check loop la fiecare 2s. Trei stari: LIVE / STALE (> 10s) / CRITICAL (> 30s).
+  Publică `ws_stale`, `ws_stale_alert`, `ws_last_tick_age_s` în `StateBus`.
+  La STALE: suprimaă drift alerts din `PnLReconciler` (evită false positives).
+  Rezolvă risk rezidual Sprint 6 #1.
+- `backtest/engine.py` — `WalkForwardEngine` complet:
+  walk-forward cu `n_splits` configurabil, purge + embargo la granitțe IS/OOS,
+  warm-start Kalman pe IS data pentru fiecare fold OOS,
+  simulare tranzacții cu fees (maker/taker), slippage (bps), funding cost
+  (pro-rata anual), volatilitate-țintă + Kelly fracțional sizing.
+  Metrici complete: Sharpe, Sortino, Calmar, max DD, win rate, profit factor,
+  Omega ratio. `BacktestResults.print_report()` cu cost breakdown OOS.
+
+### Changed
+- `state_bus.py` — patch Sprint 6 + Sprint 7:
+  - Câmpuri Sprint 6: `funding_y`, `funding_x`, `funding_net`,
+    `reconciled_open_pnl`, `pnl_drift_usd`, `pnl_drift_alert`,
+    `position_size_y`, `position_size_x`, `open_pnl_usd` (alias `open_pnl`).
+  - Câmpuri Sprint 7: `ws_stale`, `ws_last_tick_age_s`, `ws_stale_alert`.
+  - `snapshot()` returnează `StateSnapshot` object (nu dict); `snapshot_dict()`
+    nou pentru serializare JSON. `subscribe()` și `_broadcast()` folosesc
+    `snapshot_dict()` intern.
+  - `update()`: sync automat `open_pnl` ↔ `open_pnl_usd` alias.
+
+### Architecture
+- `WsWatchdog` se integrează în `LiveTrader`: `ping()` la fiecare tick,
+  `run()` ca `asyncio.Task`. `is_live` property pentru gate entries.
+- `PnLReconciler._publish()` verifică `bus.snapshot().ws_stale` înainte de
+  `pnl_drift_alert` — suprimă alert dacă feed-ul e stale.
+- `WalkForwardEngine.factory` pattern: injectare `SpreadEngine` fresh per fold
+  pentru izolare completă a stării Kalman între fold-uri.
+
+### Risk Mitigations Sprint 7
+- `stale_warn_s=10s` default conservator; Bybit WS hiccups normale sunt < 5s.
+  Ajustează la 15s dacă primești false STALE alerts la funding rollover.
+- `purge_bars=10` + `embargo_bars=5` default — suficient pentru 1h bars.
+  Pentru 5m bars, crește la 50 + 20.
+- Funding cost în backtest simulat ca rată anuală constantă — nu capturează
+  spikes de funding. Folosit ca lower bound al costului real.
+
+---
+
 ## Sprint 6 — 2026-06-24
 
 ### Added
-- `execution/funding_monitor.py` — `FundingMonitor` async task, polling CCXT
-  `fetch_funding_rate()` pentru ambele legs, anualizare configurabilă, publică
-  `funding_y`, `funding_x`, `funding_net` în `StateBus`. Elimină câmpurile
-  funding la `0.0` din dashboard (risk rezidual Sprint 5 #1).
-- `execution/pnl_reconciler.py` — `PnLReconciler` async task, polling
-  `fetch_positions()` la interval configurabil, compară `unrealizedPnl` de pe
-  exchange cu `open_pnl_usd` calculat local din mark price WS. Alert la drift
-  `> pnl_drift_alert_usd`. Publică `reconciled_open_pnl`, `pnl_drift_usd`,
-  `pnl_drift_alert`, `position_size_y/x`, `entry_price_y/x` în `StateBus`
-  (risk rezidual Sprint 5 #2).
-- `strategy/signal_adapter.py` — `LiveSignalAdapter` + `NormalizedSignal`:
-  wrapper explicit peste `SignalGenerator.generate_live()` care expune
-  atributele corecte (`hedge_ratio` = `TradeSignal.beta`,
-  `kalman_uncertainty` = `TradeSignal.uncertainty`). Elimină silențios
-  `getattr` fallback cu `0.0` în `LiveTrader` (risk rezidual Sprint 5 #3).
-- `execution/live_trader_sprint6_patch.py` — ghid de integrare structurat
-  pentru patch-ul necesar în `live_trader.py`.
-
-### Architecture
-- `FundingMonitor` și `PnLReconciler` rulează ca `asyncio.Task` independente,
-  lansate de `LiveTrader.run()`, oprite prin `task.cancel()` la shutdown.
-- `LiveSignalAdapter` acceptă atât `SignalGenerator` raw cât și adapter deja
-  instanțiat — backward compatible, fără modificare obligatorie în cod existent
-  care folosește `SignalGenerator` direct.
-- `StateBus.update()` thread-safe acceptă dict parțial — câmpurile noi de
-  funding și reconciliere se adaugă fără modificări în schema existentă.
-
-### Risk Mitigations
-- Funding annualization factor configurat explicit în `FundingConfig` —
-  nu hardcodat; verificare necesară per contract înainte de producție.
-- `PnLReconciler` reutilizează exchange CCXT din `FundingMonitor` pentru
-  a limita conexiunile REST simultane.
-- `pnl_drift_alert_usd` default conservator (5 USD); documentat pentru
-  scalare la conturi > 10k USD.
+- `execution/funding_monitor.py` — `FundingMonitor` async task
+- `execution/pnl_reconciler.py` — `PnLReconciler` async task
+- `strategy/signal_adapter.py` — `LiveSignalAdapter` + `NormalizedSignal`
+- `execution/live_trader_sprint6_patch.py` — ghid de integrare Sprint 6
 
 ---
 
 ## Sprint 5 — 2026-06-24
 
 ### Added
-- `state_bus.py` — `StateBus` singleton cu `StateSnapshot` dataclass,
-  `update()` thread-safe, `subscribe()` async generator cu broadcast
-  și evicție automată a subscriberilor lenti.
-- `dashboard/server.py` — FastAPI: `GET /`, `GET /state`, `WS /ws`.
-  `start_dashboard()` helper pentru lansare ca asyncio task.
-- `dashboard/index.html` — Dashboard live: 8 KPI cards, chart z-score
-  cu benzi ±2σ, chart P&L cumulat, panel Kalman, funding rates,
-  tabel trades recente, teme light/dark, WS reconnect automat.
-- `execution/live_trader.py` patch — `_publish_state()` la fiecare tick,
-  `record_trade()` pe bus la fiecare exit, `state_bus_enabled` în
-  `LiveConfig`.
+- `state_bus.py` — `StateBus` singleton + `StateSnapshot`
+- `dashboard/server.py` — FastAPI: `GET /`, `GET /state`, `WS /ws`
+- `dashboard/index.html` — Dashboard live
+- `execution/live_trader.py` patch Sprint 5
 
 ---
 

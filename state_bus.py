@@ -1,9 +1,21 @@
 """
-state_bus.py  —  QuantLuna Sprint 5
+state_bus.py  —  QuantLuna Sprint 7
 
 Single source of truth for all runtime state.
-Fed by: LiveTrader, SignalGenerator, PortfolioRisk, OrderManager.
+Fed by: LiveTrader, SignalGenerator, PortfolioRisk, OrderManager,
+        FundingMonitor, PnLReconciler, WsWatchdog.
 Broadcasts JSON snapshots to WebSocket subscribers.
+
+Changes Sprint 6:
+  - Funding live: funding_y, funding_x, funding_net (annualized)
+  - P&L reconciliation: reconciled_open_pnl, pnl_drift_usd, pnl_drift_alert
+  - Position detail: position_size_y, position_size_x (from fetch_positions)
+  - Renamed open_pnl → open_pnl_usd for clarity (local mark-price estimate)
+
+Changes Sprint 7:
+  - WS health: ws_stale, ws_last_tick_age_s, ws_stale_alert
+  - snapshot() now returns StateSnapshot object directly (not dict) for
+    internal consumers; to_dict() still available for JSON serialization
 
 Usage:
     bus = StateBus()
@@ -48,18 +60,28 @@ class StateSnapshot:
     half_life: float = 0.0
     regime: str = "unknown"         # 'cointegrated' | 'breakdown' | 'unknown'
 
-    # --- Funding ---
-    funding_rate_y: float = 0.0     # current 8h rate
+    # --- Funding (Sprint 6 — populat de FundingMonitor) ---
+    funding_y: float = 0.0          # annualized rate leg Y
+    funding_x: float = 0.0          # annualized rate leg X
+    funding_net: float = 0.0        # funding_y - funding_x
+    # Câmpuri legacy menținute pentru compatibilitate backward
+    funding_rate_y: float = 0.0     # current 8h rate (raw, neanualizat)
     funding_rate_x: float = 0.0
     next_funding_ts_y: str = ""
     next_funding_ts_x: str = ""
 
     # --- P&L ---
     realized_pnl: float = 0.0
-    open_pnl: float = 0.0
+    open_pnl_usd: float = 0.0       # Sprint 6: redenumit din open_pnl (local WS estimate)
+    open_pnl: float = 0.0           # alias backward-compat (== open_pnl_usd)
     daily_pnl: float = 0.0
     total_fees_usdt: float = 0.0
     trade_count: int = 0
+
+    # --- P&L Reconciliation (Sprint 6 — populat de PnLReconciler) ---
+    reconciled_open_pnl: float = 0.0    # unrealizedPnl de pe exchange via fetch_positions
+    pnl_drift_usd: float = 0.0          # |reconciled - local|
+    pnl_drift_alert: bool = False        # True dacă drift > threshold
 
     # --- Position ---
     in_position: bool = False
@@ -69,6 +91,14 @@ class StateSnapshot:
     entry_price_x: float = 0.0
     qty_y: float = 0.0
     qty_x: float = 0.0
+    # Sprint 6: position sizes confirmate de exchange
+    position_size_y: float = 0.0
+    position_size_x: float = 0.0
+
+    # --- WS Health (Sprint 7 — populat de WsWatchdog) ---
+    ws_stale: bool = False              # True dacă ultimul tick e mai vechi de threshold
+    ws_last_tick_age_s: float = 0.0     # secunde de la ultimul on_tick()
+    ws_stale_alert: bool = False        # True dacă stale persists > stale_critical_s
 
     # --- Recent trades (last 50) ---
     recent_trades: list = field(default_factory=list)
@@ -102,6 +132,7 @@ class StateBus:
     def update(self, patch: Dict[str, Any]) -> None:
         """
         Merge patch dict into snapshot. Schedules broadcast.
+        Accepts partial dicts — only provided fields are updated.
         Call from sync or async context (fire-and-forget).
         """
         for k, v in patch.items():
@@ -110,16 +141,22 @@ class StateBus:
             else:
                 logger.debug(f"StateBus: unknown field '{k}' ignored")
 
+        # Keep open_pnl alias in sync with open_pnl_usd
+        if "open_pnl_usd" in patch:
+            self._snapshot.open_pnl = self._snapshot.open_pnl_usd
+        elif "open_pnl" in patch:
+            self._snapshot.open_pnl_usd = self._snapshot.open_pnl
+
         # Append to series if present
         if "zscore" in patch:
             self._append_series(
                 self._snapshot.zscore_series,
                 patch["zscore"],
             )
-        if "realized_pnl" in patch or "open_pnl" in patch:
+        if "realized_pnl" in patch or "open_pnl_usd" in patch or "open_pnl" in patch:
             self._append_series(
                 self._snapshot.pnl_series,
-                self._snapshot.realized_pnl + self._snapshot.open_pnl,
+                self._snapshot.realized_pnl + self._snapshot.open_pnl_usd,
             )
 
         asyncio.get_event_loop().call_soon_threadsafe(self._schedule_broadcast)
@@ -140,8 +177,16 @@ class StateBus:
             self._snapshot.recent_trades = self._snapshot.recent_trades[-self.MAX_TRADES_LEN:]
         self._schedule_broadcast()
 
-    def snapshot(self) -> Dict[str, Any]:
-        """Return current snapshot as dict (deep copy)."""
+    def snapshot(self) -> StateSnapshot:
+        """
+        Return current StateSnapshot (deep copy).
+        Sprint 7: returns StateSnapshot object, not dict.
+        Use snapshot().to_dict() for JSON serialization.
+        """
+        return deepcopy(self._snapshot)
+
+    def snapshot_dict(self) -> Dict[str, Any]:
+        """Return snapshot as dict — for JSON serialization (dashboard, /state endpoint)."""
         return deepcopy(self._snapshot.to_dict())
 
     # ------------------------------------------------------------------
@@ -160,7 +205,7 @@ class StateBus:
             self._subscribers.add(q)
         try:
             # Send current state immediately on subscribe
-            await q.put(self.snapshot())
+            await q.put(self.snapshot_dict())
             while True:
                 snap = await q.get()
                 yield snap
@@ -178,7 +223,7 @@ class StateBus:
     async def _broadcast(self) -> None:
         if not self._subscribers:
             return
-        snap = self.snapshot()
+        snap = self.snapshot_dict()
         dead: Set[asyncio.Queue] = set()
         for q in self._subscribers:
             try:
