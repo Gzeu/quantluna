@@ -1,5 +1,53 @@
 # QuantLuna — Changelog
 
+## fix(integration) — 2026-06-24
+
+### Fixed — Integration Commit (Sprint 4-10 Consolidation)
+
+**`execution/live_trader.py` — rescris complet**
+
+- `PortfolioRisk.record_trade()` lipsea — adăugat în `risk/portfolio_risk.py`
+- `PortfolioAllocator` Sprint 10 neintegrat — integrat complet:
+  - `__init__` acceptă `allocator: Optional[PortfolioAllocator]`; creat intern dacă lipsă
+  - `_open_position()`: sizing via `allocator.request_entry()` + Kelly `notional_usd`;
+    eliminat sizing manual hardcodat
+  - Per tick: `allocator.update_state()` — correlation matrix + DD update
+  - La exit: `allocator.record_exit()` în `finally` block
+- `close_all(reason)` — metodă async nouă pentru HARD_STOP / PAIR_DD / urgenta externă
+- Sprint 6 patch (`live_trader_sprint6_patch.py`) aplicat direct în cod:
+  - `FundingMonitor` + `PnLReconciler` tasks pornite în `run()`
+  - `LiveSignalAdapter` wrap automat pentru `SignalGenerator` raw
+  - Acces direct pe `NormalizedSignal` (eliminat `getattr` fragil)
+  - `LiveConfig` câmpuri Sprint 6 (`monitor_api_key`, `funding_poll_interval_s` etc.)
+- `live_trader_sprint6_patch.py` — marcat deprecat cu `ImportError` explicit
+
+**`execution/live_trader.py` — WsWatchdog integrat (Sprint 7)**
+
+- `WsWatchdog` importat și creat în `__init__` (`self.watchdog`)
+- `watchdog.ping()` apelat în `_consumer()` la fiecare tick din WS
+- `_run_watchdog()` pornit ca task în `asyncio.gather()` alături de `_ws_feed`, `_consumer`, `_heartbeat`
+- Gate entry: `watchdog_gate_entries=True` blochează `_open_position()` când `watchdog.state != LIVE`
+- `LiveConfig.watchdog: WatchdogConfig` — câmp nou configurable
+- `is_trading_allowed` include `watchdog.is_live` în condiție
+- Heartbeat log include `ws=watchdog.state` + `last_tick_age_s`
+
+**`tests/test_live_trader.py` — fișier nou**
+
+- 9 clase de test, 25+ cazuri acoperind:
+  - Construcție și injectare allocator/watchdog
+  - `close_all()`: no-op, path normal, eșec order (HALTED indiferent)
+  - Entry: blocare DD zilnic, blocare watchdog STALE, blocare allocator,
+    sizing corect din Kelly `notional_usd`, revert la eșec order
+  - Exit: calcul PnL, `record_exit()` apelat, `trade_pnl_history`, cleanup state,
+    `record_exit()` apelat și la eșec order (finally block)
+  - HARD_STOP și PAIR_DD path în `_on_tick`
+  - `watchdog.ping()` apelat per tick
+  - `_compute_pnl()` long/short/no-entry-fill
+  - Daily PnL reset
+  - `is_trading_allowed` property
+
+---
+
 ## Sprint 10 — 2026-06-24
 
 ### Added
@@ -85,8 +133,6 @@ decision = allocator.request_entry(
     current_zscore=-2.3,
     entry_beta=0.0534,
 )
-print(decision.summary())
-
 if decision.allowed:
     notional = decision.notional_usd  # → trimite ordin
 
@@ -97,8 +143,6 @@ snap = allocator.update_state(
 )
 if snap.level.value == "HARD_STOP":
     await live_trader.close_all()
-for pair_id in snap.pairs_force_close:
-    await live_trader.close_pair(pair_id)
 
 # La exit:
 allocator.record_exit("ETH/BTC_perp")
@@ -106,17 +150,11 @@ allocator.record_exit("ETH/BTC_perp")
 
 ### Risk Notes Sprint 10
 
-- Ledoit-Wolf shrinkage necesită `scikit-learn`. Fără el, fallback automat la
-  numpy `corrcoef`. Adăugați `scikit-learn` în requirements.txt.
-- Kelly pe sample mic (< 20 trades) folosește vol_target_only.
-  Pe pair nou fără historical trades, sizing-ul va fi conservativ — corect.
-- HARD_STOP nu se auto-resetează. `manual_resume()` trebuie apelat
-  explicit după analiză post-hoc a cauzei drawdown-ului.
-- `max_concurrent_pairs=4-5` este recomandarea pentru capital 10-50k USD.
-  Sub 10k: max 2-3 perechi. Peste 100k: reconsideraiți sizing și limits.
-- Correlation matrix se actualizează per tick. La startup (înainte de
-  `min_history` bare), toate pair-urile noi sunt permise automat —
-  verificați manual primele 30 bare după lansare.
+- Ledoit-Wolf shrinkage necesită `scikit-learn`. Fără el, fallback automat la numpy `corrcoef`.
+- Kelly pe sample mic (< 20 trades) folosește `vol_target_only`. Pe pair nou, sizing conservativ.
+- HARD_STOP nu se auto-resetează. `manual_resume()` trebuie apelat explicit.
+- `max_concurrent_pairs=4-5` pentru capital 10-50k USD.
+- Correlation matrix se actualizează per tick. Primele 30 bare — verificați manual.
 
 ---
 

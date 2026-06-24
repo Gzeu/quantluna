@@ -6,17 +6,18 @@ Sprint history integrat:
   Sprint 5: StateBus integration, _publish_state()
   Sprint 6: FundingMonitor + PnLReconciler tasks, LiveSignalAdapter wrapping,
             NormalizedSignal typed access, monitor_api_key support, cleanup tasks
+  Sprint 7: WsWatchdog integrat — ping() per tick, run() task, gate la entry
   Sprint 10: PortfolioAllocator integration — sizing via KellyCrossPair,
              close_all() pentru HARD_STOP, DD-aware entry gate,
              allocator.update_state() per tick, allocator.record_exit() la exit
 
 Flux de decizie la entry (Sprint 10):
-  1. PortfolioAllocator.request_entry() evaluează toți cei 5 gates:
-     DD level, max pairs, correlation, Kelly sizing, portfolio exposure
-  2. Dacă allowed: notional vine din Kelly cross-pair (nu hardcodat din config)
-  3. Per tick: allocator.update_state() actualizează correlation matrix + DD
-  4. La HARD_STOP: close_all() închide toate pozițiile imediat
-  5. La exit: allocator.record_exit() curăță toate structurile interne
+  1. WsWatchdog.is_live  → blocat dacă feed stale (Sprint 7)
+  2. PortfolioAllocator.request_entry()  → 5 gates: DD, max pairs, corr, Kelly, exposure
+  3. notional vine din Kelly cross-pair (nu hardcodat)
+  4. Per tick: allocator.update_state() + watchdog.ping()
+  5. La HARD_STOP: close_all() închide toate pozițiile
+  6. La exit: allocator.record_exit() curăță structurile interne
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import pandas as pd
 from .order_manager import ExecutionConfig, FillPair, OrderManager
 from .funding_monitor import FundingMonitor, FundingConfig, create_funding_monitor
 from .pnl_reconciler import PnLReconciler, ReconcilerConfig
+from .ws_watchdog import WsWatchdog, WatchdogConfig
 from strategy.signal_adapter import LiveSignalAdapter
 from risk import PortfolioAllocator, AllocatorConfig
 from risk.drawdown_controller import DDLevel
@@ -74,7 +76,7 @@ class LiveConfig:
     sym_x: str
     exchange: str = "bybit"           # "bybit" | "binance"
     capital_usdt: float = 10_000.0
-    max_leverage: float = 2.0          # folosit doar ca fallback; sizing vine din Kelly
+    max_leverage: float = 2.0          # fallback; sizing vine din Kelly
     min_warmup_bars: int = 30
     log_interval_s: int = 60
     heartbeat_interval_s: int = 30
@@ -84,19 +86,24 @@ class LiveConfig:
 
     # Sprint 6 — Funding Monitor
     funding_poll_interval_s: float = 60.0
-    funding_periods_per_year: float = 3.0 * 365.0  # Bybit USDT perp: 3 funding/zi
-    funding_alert_threshold: float = 0.05           # 5% annualized
+    funding_periods_per_year: float = 3.0 * 365.0
+    funding_alert_threshold: float = 0.05
 
     # Sprint 6 — P&L Reconciler
     pnl_reconcile_interval_s: float = 30.0
     pnl_drift_alert_usd: float = 5.0
 
-    # Sprint 6 — Credentșiale monitoring (read-only sub-account recomandat)
+    # Sprint 6 — Credentșiale monitoring
     monitor_api_key: str = ""
     monitor_api_secret: str = ""
     testnet: bool = False
 
-    # Sprint 10 — Allocator config (None = creează cu defaults din capital_usdt)
+    # Sprint 7 — WsWatchdog
+    watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
+    # Dacă True, blochează ENTRY (nu EXIT) când feed e STALE
+    watchdog_gate_entries: bool = True
+
+    # Sprint 10 — Allocator config
     allocator_config: Optional[AllocatorConfig] = None
 
 
@@ -109,15 +116,10 @@ class LiveTrader:
     Async live trading engine pentru un pair activ.
 
     Parametri constructor:
-      config         — LiveConfig
-      signal_gen     — SignalGenerator sau LiveSignalAdapter
-      allocator      — PortfolioAllocator (Sprint 10); dacă None, e creat intern
-      state_bus      — StateBus optional pentru dashboard
-
-    Nota: `portfolio_risk` (Sprint 4) nu mai e parametru direct —
-    este încapsulat în PortfolioAllocator. Dacă ai cod existent care
-    injectează portfolio_risk, transmite-l via allocator.cfg sau
-    lasă-l să fie creat implicit.
+      config     — LiveConfig
+      signal_gen — SignalGenerator sau LiveSignalAdapter
+      allocator  — PortfolioAllocator (Sprint 10); None = creat intern
+      state_bus  — StateBus optional pentru dashboard
     """
 
     def __init__(
@@ -126,19 +128,18 @@ class LiveTrader:
         signal_gen,
         allocator: Optional[PortfolioAllocator] = None,
         state_bus=None,
-        # backwards compat: acceptă portfolio_risk vechi dar îil ignoră
-        portfolio_risk=None,
+        portfolio_risk=None,   # backwards compat, ignorat
     ):
         self.cfg = config
         self._bus = state_bus
 
-        # Signal adapter — Sprint 6: wrap automat dacă e SignalGenerator raw
+        # Sprint 6: wrap automat SignalGenerator → LiveSignalAdapter
         if isinstance(signal_gen, LiveSignalAdapter):
             self.signal_gen = signal_gen
         else:
             self.signal_gen = LiveSignalAdapter(signal_gen)
 
-        # Portfolio Allocator — Sprint 10
+        # Sprint 10: PortfolioAllocator
         if allocator is not None:
             self.allocator = allocator
         else:
@@ -146,6 +147,9 @@ class LiveTrader:
                 capital_usd=config.capital_usdt,
             )
             self.allocator = PortfolioAllocator(alloc_cfg)
+
+        # Sprint 7: WsWatchdog — creat la __init__, pornit ca task în run()
+        self.watchdog = WsWatchdog(config.watchdog, state_bus)
 
         # State machine
         self._state: TraderState = TraderState.IDLE
@@ -164,7 +168,7 @@ class LiveTrader:
         self._entry_qty_y: float = 0.0
         self._entry_qty_x: float = 0.0
         self._entry_fill: Optional[FillPair] = None
-        self._entry_notional: float = 0.0   # notional din Kelly la entry
+        self._entry_notional: float = 0.0
 
         # PnL tracking
         self._last_log_ts: pd.Timestamp = pd.Timestamp.min
@@ -174,17 +178,20 @@ class LiveTrader:
         self._total_fees: float = 0.0
         self._trade_count: int = 0
         self._daily_reset_date: Optional[pd.Timestamp] = None
-        self._open_pnl: float = 0.0  # track per-tick pentru allocator.update_state()
+        self._open_pnl: float = 0.0
 
-        # Sprint 6 tasks
+        # Sprint 6 monitoring tasks
         self._funding_task: Optional[asyncio.Task] = None
         self._reconciler_task: Optional[asyncio.Task] = None
         self._funding_monitor_exchange = None
 
+        # Sprint 7 watchdog task
+        self._watchdog_task: Optional[asyncio.Task] = None
+
         # OrderManager (setat în run())
         self.orders: Optional[OrderManager] = None
 
-        # Trade PnL history pentru Kelly (fracție din capital)
+        # Kelly trade PnL history (fracție din capital)
         self._trade_pnl_history: list[float] = []
 
     # ------------------------------------------------------------------
@@ -215,6 +222,8 @@ class LiveTrader:
                     self._ws_feed(),
                     self._consumer(),
                     self._heartbeat(),
+                    # Sprint 7: WsWatchdog task pornit aici
+                    self._run_watchdog(),
                 )
             except asyncio.CancelledError:
                 logger.info("LiveTrader cancelled — shutting down")
@@ -226,6 +235,19 @@ class LiveTrader:
             finally:
                 await self._cancel_monitoring_tasks()
                 self.orders = None
+
+    # ------------------------------------------------------------------
+    # Sprint 7: WsWatchdog task wrapper
+    # ------------------------------------------------------------------
+
+    async def _run_watchdog(self):
+        """Wrapper pentru watchdog.run() inclus în asyncio.gather."""
+        try:
+            await self.watchdog.run()
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.warning(f"WsWatchdog error: {exc} — continuing without watchdog")
 
     # ------------------------------------------------------------------
     # Sprint 6: monitoring tasks lifecycle
@@ -252,7 +274,6 @@ class LiveTrader:
             self._funding_task = asyncio.create_task(
                 monitor.run(), name="funding_monitor"
             )
-
             reconciler_cfg = ReconcilerConfig(
                 sym_y=self.cfg.sym_y,
                 sym_x=self.cfg.sym_x,
@@ -294,7 +315,8 @@ class LiveTrader:
     async def close_all(self, reason: str = "HARD_STOP") -> None:
         """
         Închide forțat toate pozițiile active.
-        Apelat de DDController la HARD_STOP sau de WsWatchdog la reconnect timeout.
+        Apelat de DDController la HARD_STOP, de WsWatchdog la CRITICAL,
+        sau de orice caller extern care detectează o condiție de urgenta.
         """
         if self._state != TraderState.IN_POSITION:
             logger.info(f"close_all({reason}): no open position, nothing to close")
@@ -307,7 +329,6 @@ class LiveTrader:
                 "close_all_reason": reason,
             })
 
-        # Creează un semnal de exit sintetic
         class _ForceExitSignal:
             exit = True
             reason = reason
@@ -422,6 +443,8 @@ class LiveTrader:
     async def _consumer(self):
         while self._state != TraderState.HALTED:
             tick = await self._queue.get()
+            # Sprint 7: ping watchdog la fiecare tick primit din WS
+            self.watchdog.ping()
             self._update_prices(tick)
             if self._price_y > 0 and self._price_x > 0:
                 await self._on_tick(tick.ts)
@@ -461,7 +484,7 @@ class LiveTrader:
         if sig is None:
             return
 
-        # Sprint 10: actualizează allocator per tick (correlation matrix + DD)
+        # Sprint 10: actualizează allocator per tick
         self._open_pnl = self._compute_open_pnl() if self._state == TraderState.IN_POSITION else 0.0
         spread_val = sig.spread if hasattr(sig, "spread") else (self._price_y - sig.hedge_ratio * self._price_x)
         snap = self.allocator.update_state(
@@ -469,29 +492,27 @@ class LiveTrader:
             spread_updates={self._pair_id: spread_val},
         )
 
-        # Sprint 10: reacționează la HARD_STOP
+        # Sprint 10: HARD_STOP detection
         if snap.level == DDLevel.HARD_STOP:
-            logger.critical(f"HARD_STOP detectat — force close all | notes={snap.notes}")
+            logger.critical(f"HARD_STOP detectat | notes={snap.notes}")
             await self.close_all(reason="HARD_STOP")
             return
 
-        # Sprint 10: force close pair-level DD
+        # Sprint 10: pair-level DD force close
         if self._pair_id in snap.pairs_force_close and self._state == TraderState.IN_POSITION:
             logger.warning(f"PAIR DD exceeded — force close {self._pair_id}")
             await self.close_all(reason="PAIR_DD")
             return
 
-        # Publish to StateBus
         self._publish_state(sig, ts)
 
-        # Periodic logging
         if (ts - self._last_log_ts) >= self._log_interval:
             logger.info(
                 f"[{ts}] state={self._state.value} | "
                 f"z={sig.zscore:.3f} | beta={sig.hedge_ratio:.4f} | "
                 f"Y={self._price_y:.4f} X={self._price_x:.4f} | "
                 f"open_pnl={self._open_pnl:.2f} | daily={self._daily_pnl:.2f} | "
-                f"dd_level={snap.level.value}"
+                f"dd={snap.level.value} | ws={self.watchdog.state}"
             )
             self._last_log_ts = ts
 
@@ -509,7 +530,7 @@ class LiveTrader:
         return f"{self.cfg.sym_y}/{self.cfg.sym_x}"
 
     # ------------------------------------------------------------------
-    # StateBus publish (Sprint 5 + Sprint 10 additions)
+    # StateBus publish
     # ------------------------------------------------------------------
 
     def _publish_state(self, sig, ts: pd.Timestamp):
@@ -520,7 +541,7 @@ class LiveTrader:
             "price_y": self._price_y,
             "price_x": self._price_x,
             "timestamp_utc": ts.isoformat(),
-            # Sprint 6: acces direct pe NormalizedSignal (nu mai getattr)
+            # Sprint 6: NormalizedSignal typed access
             "zscore": sig.zscore,
             "spread": sig.spread,
             "hedge_ratio": sig.hedge_ratio,
@@ -545,6 +566,8 @@ class LiveTrader:
             # Sprint 10: portfolio
             "dd_level": self.allocator.dd_level.value,
             "n_active_pairs": self.allocator._n_pairs,
+            # Sprint 7: watchdog
+            "ws_watchdog_state": self.watchdog.state,
         })
 
     def _compute_open_pnl(self) -> float:
@@ -561,11 +584,11 @@ class LiveTrader:
         )
 
     # ------------------------------------------------------------------
-    # Position management (Sprint 10: sizing din Kelly, nu hardcodat)
+    # Position management
     # ------------------------------------------------------------------
 
     async def _open_position(self, sig, ts: pd.Timestamp):
-        # Daily DD gate (pre-allocator)
+        # Daily DD gate
         if abs(self._daily_pnl) >= self.cfg.capital_usdt * self.cfg.max_daily_drawdown:
             logger.warning(f"Daily DD limit — halting | daily_pnl={self._daily_pnl:.2f}")
             self._state = TraderState.HALTED
@@ -573,7 +596,15 @@ class LiveTrader:
                 self._bus.update({"trader_state": TraderState.HALTED.value})
             return
 
-        # Sprint 10: PortfolioAllocator decide sizing
+        # Sprint 7: WsWatchdog gate — blochează entry dacă feed nu e LIVE
+        if self.cfg.watchdog_gate_entries and not self.watchdog.is_live:
+            logger.warning(
+                f"Entry BLOCKED: WsWatchdog state={self.watchdog.state} "
+                f"(feed stale {self.watchdog.last_tick_age_s:.1f}s) — skip entry"
+            )
+            return
+
+        # Sprint 10: PortfolioAllocator sizing
         pnl_series = pd.Series(self._trade_pnl_history) if self._trade_pnl_history else None
         spread_series = pd.Series([sig.spread] * max(30, len(self._trade_pnl_history) + 1))
 
@@ -601,7 +632,8 @@ class LiveTrader:
             f"ENTRY | {side_y} {self.cfg.sym_y} {qty_y:.4f}@{self._price_y:.4f} "
             f"| {side_x} {self.cfg.sym_x} {qty_x:.4f}@{self._price_x:.4f} "
             f"| z={sig.zscore:.3f} | beta={hedge_ratio:.4f} "
-            f"| notional=${notional_y:.0f} | method={decision.kelly_result.method_used if decision.kelly_result else 'n/a'}"
+            f"| notional=${notional_y:.0f} "
+            f"| method={decision.kelly_result.method_used if decision.kelly_result else 'n/a'}"
         )
 
         self._state = TraderState.IN_POSITION
@@ -623,7 +655,7 @@ class LiveTrader:
         except Exception as exc:
             logger.error(f"ENTRY failed: {exc} — reverting to ACTIVE")
             self._state = TraderState.ACTIVE
-            self.allocator.record_exit(self._pair_id)  # curăță allocator
+            self.allocator.record_exit(self._pair_id)
             if self._bus:
                 self._bus.update({"trader_state": TraderState.ACTIVE.value})
 
@@ -653,10 +685,8 @@ class LiveTrader:
             self._total_fees += exit_fill.total_fee_usdt
             self._trade_count += 1
 
-            # Sprint 10: record P&L per trade (fracție din capital) pentru Kelly
             pnl_fraction = pnl / max(self.cfg.capital_usdt, 1.0)
             self._trade_pnl_history.append(pnl_fraction)
-            # menținem doar ultimele 200 trades pentru Kelly estimate
             if len(self._trade_pnl_history) > 200:
                 self._trade_pnl_history = self._trade_pnl_history[-200:]
 
@@ -679,7 +709,6 @@ class LiveTrader:
         except Exception as exc:
             logger.error(f"EXIT failed: {exc} — POSITION MAY STILL BE OPEN!")
         finally:
-            # Sprint 10: eliberează allocator indiferent de succes/eșec exit
             self.allocator.record_exit(self._pair_id)
             self._state = TraderState.ACTIVE
             if self._bus:
@@ -712,19 +741,13 @@ class LiveTrader:
     async def _heartbeat(self):
         while self._state != TraderState.HALTED:
             await asyncio.sleep(self.cfg.heartbeat_interval_s)
-            now = pd.Timestamp.now(tz="UTC")
             logger.debug(
                 f"Heartbeat | state={self._state.value} | "
                 f"queue={self._queue.qsize()} | "
                 f"Y={self._price_y:.4f} X={self._price_x:.4f} | "
-                f"dd_level={self.allocator.dd_level.value}"
+                f"dd={self.allocator.dd_level.value} | "
+                f"ws={self.watchdog.state} ({self.watchdog.last_tick_age_s:.1f}s ago)"
             )
-            if self._last_tick_y is not None:
-                age = (now - self._last_tick_y.ts).total_seconds()
-                if age > self.cfg.heartbeat_interval_s * 2:
-                    logger.warning(
-                        f"Stale feed {self.cfg.sym_y}: last tick {age:.0f}s ago"
-                    )
 
     # ------------------------------------------------------------------
     # Helpers
@@ -733,7 +756,7 @@ class LiveTrader:
     async def _on_reconnect(self):
         if self._state not in (TraderState.IDLE, TraderState.HALTED):
             logger.warning(
-                f"WS reconnected — reset warm-up | beta preserved, "
+                f"WS reconnected — reset warm-up | "
                 f"entry inhibited for {self.cfg.min_warmup_bars} bars"
             )
             self._warming_bars = 0
@@ -754,6 +777,8 @@ class LiveTrader:
 
     @property
     def is_trading_allowed(self) -> bool:
-        return self.allocator.is_trading_allowed and self._state not in (
-            TraderState.HALTED, TraderState.CLOSING
+        return (
+            self.allocator.is_trading_allowed
+            and self.watchdog.is_live
+            and self._state not in (TraderState.HALTED, TraderState.CLOSING)
         )
