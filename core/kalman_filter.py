@@ -1,182 +1,194 @@
-"""
-QuantLuna — Kalman Filter for Dynamic Hedge Ratio Estimation
+from __future__ import annotations
 
-State space model:
-  State:       beta_t  (hedge ratio) — what we estimate
-  Observation: y_t = beta_t * x_t + alpha_t + epsilon_t
-
-Equations:
-  Predict:
-    beta_hat_t|t-1 = beta_hat_t-1|t-1
-    P_t|t-1       = P_t-1|t-1 + Q
-
-  Update:
-    y_hat_t  = x_t * beta_hat_t|t-1
-    e_t      = y_t - y_hat_t           (innovation)
-    S_t      = x_t^2 * P_t|t-1 + R    (innovation variance)
-    K_t      = P_t|t-1 * x_t / S_t    (Kalman Gain)
-    beta_hat_t = beta_hat_t|t-1 + K_t * e_t
-    P_t      = (1 - K_t * x_t) * P_t|t-1
-"""
 import numpy as np
 import pandas as pd
-from typing import Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional, List
 from loguru import logger
 
 
 @dataclass
 class KalmanState:
-    """Current state of the Kalman Filter."""
-    beta: float           # Current hedge ratio estimate
-    alpha: float          # Current intercept estimate
-    P_beta: float         # State covariance for beta
-    P_alpha: float        # State covariance for alpha
+    """Snapshot of the filter state after one update."""
+    beta: float
+    alpha: float
+    P_beta: float
+    P_alpha: float
     kalman_gain_beta: float
     kalman_gain_alpha: float
-    innovation: float     # Last residual (y_t - y_hat_t)
-    innovation_var: float # S_t — for signal quality assessment
+    innovation: float
+    innovation_var: float
+    is_warm: bool = False
     timestamp: Optional[pd.Timestamp] = None
+
+    @property
+    def kalman_gain(self) -> float:
+        """Primary Kalman Gain (beta component)."""
+        return self.kalman_gain_beta
 
 
 class KalmanHedgeRatio:
     """
     Two-state Kalman Filter estimating (beta, alpha) simultaneously.
 
-    The filter tracks both slope (hedge ratio) and intercept dynamically,
-    adapting to gradual regime shifts in the cointegration relationship.
+    State space model::
+
+        Observation:  y_t = beta_t * x_t + alpha_t + epsilon_t
+        State prior:  [beta_t, alpha_t] = [beta_{t-1}, alpha_{t-1}]  (random walk)
+
+    Kalman Equations::
+
+        Predict:  P_pred = P + Q
+        F           = [x_t, 1]
+        innovation  = y_t - F @ state
+        S           = F @ P_pred @ F.T + R
+        K           = P_pred @ F.T / S
+        state      += K * innovation
+        P (Joseph)  = (I - K*F) @ P_pred @ (I - K*F).T + R * K*K.T
 
     Parameters
     ----------
     delta : float
-        Process noise parameter. Controls adaptation speed.
-        Typical range: 1e-5 (very slow) to 1e-2 (very fast).
-        For crypto: 1e-4 to 5e-4 works well on 1h data.
+        Process noise parameter. Q = delta/(1-delta) * I.
+        Controls adaptation speed (1e-5=very slow, 1e-4=default, 5e-4=fast).
     observation_noise : float
         Measurement noise R. Higher = smoother but less reactive.
+    warm_up : int
+        Bars before is_warm becomes True. Results before warm-up
+        should not be used for trading signals.
     """
 
     def __init__(
         self,
         delta: float = 1e-4,
         observation_noise: float = 1e-2,
+        warm_up: int = 30,
         initial_beta: float = 1.0,
         initial_alpha: float = 0.0,
         initial_cov: float = 1.0,
-    ):
+    ) -> None:
         self.delta = delta
-        self.R = observation_noise
-        self.Q = delta / (1 - delta) * np.eye(2)  # Process noise matrix
+        self.observation_noise = observation_noise  # public alias
+        self.R = observation_noise                  # internal shorthand
+        self.warm_up = warm_up
+        self.Q = delta / (1.0 - delta) * np.eye(2)
 
-        # Initial state
+        self._beta0 = initial_beta
+        self._alpha0 = initial_alpha
+        self._cov0 = initial_cov
+
         self.beta = initial_beta
         self.alpha = initial_alpha
-        self.P = np.array([
-            [initial_cov, 0.0],
-            [0.0,         initial_cov]
-        ])
+        self.P = np.array([[initial_cov, 0.0], [0.0, initial_cov]])
 
-        self._history: list = []
-        self._is_warm = False
-        self._n_updates = 0
-        logger.debug(f"KalmanHedgeRatio init: delta={delta}, R={observation_noise}")
+        self._history: List[KalmanState] = []
+        self._is_warm: bool = False
+        self._n_updates: int = 0
 
-    # ------------------------------------------------------------------
-    # Core update step
-    # ------------------------------------------------------------------
-    def update(self, y: float, x: float, ts: Optional[pd.Timestamp] = None) -> KalmanState:
+        logger.debug(
+            f"KalmanHedgeRatio init: delta={delta}, R={observation_noise}, warm_up={warm_up}"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Core Update
+    # ------------------------------------------------------------------ #
+    def update(
+        self, y: float, x: float, ts: Optional[pd.Timestamp] = None
+    ) -> KalmanState:
         """
-        Process one observation and return updated state.
+        Process one observation and return updated KalmanState.
 
         Parameters
         ----------
-        y : float  — dependent asset price (e.g., ETH close)
-        x : float  — independent asset price (e.g., BTC close)
+        y : float  — dependent asset log-price or price
+        x : float  — independent asset log-price or price
         ts : optional timestamp
-
-        Returns
-        -------
-        KalmanState with updated beta, alpha, gain, innovation
         """
-        # Observation vector F = [x, 1]
         F = np.array([x, 1.0])
 
-        # --- Predict step ---
-        # beta_hat and alpha_hat stay the same (random walk prior)
+        # Predict
         P_pred = self.P + self.Q
 
-        # --- Innovation ---
-        y_hat = F @ np.array([self.beta, self.alpha])
+        # Innovation
+        y_hat = float(F @ np.array([self.beta, self.alpha]))
         innovation = y - y_hat
 
-        # --- Innovation variance ---
-        S = F @ P_pred @ F.T + self.R
+        # Innovation variance (scalar)
+        S = float(F @ P_pred @ F) + self.R
 
-        # --- Kalman Gain ---
-        K = P_pred @ F.T / S   # shape (2,)
+        # Kalman Gain
+        K = P_pred @ F / S  # (2,)
 
-        # --- Update state ---
-        state_vec = np.array([self.beta, self.alpha]) + K * innovation
-        self.beta = state_vec[0]
-        self.alpha = state_vec[1]
+        # State update
+        sv = np.array([self.beta, self.alpha]) + K * innovation
+        self.beta, self.alpha = float(sv[0]), float(sv[1])
 
-        # --- Update covariance ---
-        self.P = (np.eye(2) - np.outer(K, F)) @ P_pred
+        # Covariance update — Joseph form for numerical stability
+        I_KF = np.eye(2) - np.outer(K, F)
+        self.P = I_KF @ P_pred @ I_KF.T + self.R * np.outer(K, K)
 
         self._n_updates += 1
-        if self._n_updates >= 30:
+        if self._n_updates >= self.warm_up:
             self._is_warm = True
 
         state = KalmanState(
             beta=self.beta,
             alpha=self.alpha,
-            P_beta=self.P[0, 0],
-            P_alpha=self.P[1, 1],
-            kalman_gain_beta=K[0],
-            kalman_gain_alpha=K[1],
-            innovation=innovation,
-            innovation_var=S,
+            P_beta=float(self.P[0, 0]),
+            P_alpha=float(self.P[1, 1]),
+            kalman_gain_beta=float(K[0]),
+            kalman_gain_alpha=float(K[1]),
+            innovation=float(innovation),
+            innovation_var=float(S),
+            is_warm=self._is_warm,
             timestamp=ts,
         )
         self._history.append(state)
         return state
 
-    # ------------------------------------------------------------------
-    # Batch fit
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # Batch Fit
+    # ------------------------------------------------------------------ #
     def fit(self, y: pd.Series, x: pd.Series) -> pd.DataFrame:
         """
-        Fit Kalman Filter over full price series.
-        Returns DataFrame with beta, alpha, spread, kalman_gain, uncertainty.
+        Fit Kalman Filter over a full price series.
+
+        Returns
+        -------
+        pd.DataFrame with columns:
+            beta, alpha, spread (innovation), P_beta, P_alpha,
+            kalman_gain_beta, innovation_var, is_warm
         """
         if len(y) != len(x):
-            raise ValueError("y and x must have same length")
+            raise ValueError(f"y ({len(y)}) and x ({len(x)}) must have same length")
 
-        results = []
-        for ts, (yi, xi) in zip(y.index, zip(y.values, x.values)):
-            state = self.update(float(yi), float(xi), ts=ts)
-            results.append({
-                "timestamp": ts,
-                "beta": state.beta,
-                "alpha": state.alpha,
-                "spread": state.innovation,
-                "P_beta": state.P_beta,
-                "kalman_gain_beta": state.kalman_gain_beta,
-                "innovation_var": state.innovation_var,
-                "is_warm": self._is_warm or self._n_updates >= 30,
+        rows = []
+        for ts, yi, xi in zip(y.index, y.values, x.values):
+            s = self.update(float(yi), float(xi), ts=ts)
+            rows.append({
+                "timestamp":        ts,
+                "beta":             s.beta,
+                "alpha":            s.alpha,
+                "spread":           s.innovation,
+                "P_beta":           s.P_beta,
+                "P_alpha":          s.P_alpha,
+                "kalman_gain_beta": s.kalman_gain_beta,
+                "innovation_var":   s.innovation_var,
+                "is_warm":          s.is_warm,
             })
 
-        df = pd.DataFrame(results).set_index("timestamp")
+        df = pd.DataFrame(rows).set_index("timestamp")
         logger.info(
-            f"Kalman fit complete: {len(df)} bars, "
-            f"final beta={df['beta'].iloc[-1]:.4f}, "
-            f"beta_std={df['beta'].std():.4f}"
+            f"Kalman fit: {len(df)} bars | "
+            f"beta={df['beta'].iloc[-1]:.4f} | "
+            f"P_beta={df['P_beta'].iloc[-1]:.6f} | "
+            f"warm_up={self.warm_up}"
         )
         return df
 
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # Properties & Utilities
+    # ------------------------------------------------------------------ #
     @property
     def current_beta(self) -> float:
         return self.beta
@@ -187,21 +199,38 @@ class KalmanHedgeRatio:
 
     @property
     def uncertainty(self) -> float:
-        """Current 1-sigma uncertainty on beta estimate."""
-        return np.sqrt(self.P[0, 0])
+        """1-sigma uncertainty on the beta estimate (sqrt(P_beta))."""
+        return float(np.sqrt(self.P[0, 0]))
 
     @property
     def is_warm(self) -> bool:
         return self._is_warm
 
     def reset(self) -> None:
-        """Reset filter state for re-initialization."""
-        self.P = np.eye(2)
+        """Reset to initial state — use when switching pair or after regime break."""
+        self.beta = self._beta0
+        self.alpha = self._alpha0
+        self.P = np.array([[self._cov0, 0.0], [0.0, self._cov0]])
         self._n_updates = 0
         self._is_warm = False
         self._history.clear()
+        logger.debug("KalmanHedgeRatio reset")
 
     def get_history_df(self) -> pd.DataFrame:
+        """Return full update history as DataFrame (useful for debugging)."""
         if not self._history:
             return pd.DataFrame()
-        return pd.DataFrame([vars(s) for s in self._history]).set_index("timestamp")
+        records = [
+            {
+                "timestamp":        s.timestamp,
+                "beta":             s.beta,
+                "alpha":            s.alpha,
+                "P_beta":           s.P_beta,
+                "kalman_gain_beta": s.kalman_gain_beta,
+                "innovation":       s.innovation,
+                "innovation_var":   s.innovation_var,
+                "is_warm":          s.is_warm,
+            }
+            for s in self._history
+        ]
+        return pd.DataFrame(records).set_index("timestamp")
