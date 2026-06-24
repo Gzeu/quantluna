@@ -1,19 +1,32 @@
 """
-QuantLuna — RegimeDetector
+QuantLuna — RegimeDetector v2
 
 Volatility-regime classifier for pairs trading.
 Detects 4 states: NORMAL / HIGH_VOL / BREAKDOWN / TRANSITION
 
-Approach: rolling vol ratio (no HMM dependency) + ADF deterioration gate.
-Design rationale: HMM requires scipy.hmmlearn or pomegranate which add
-fragile deps. Rolling vol-ratio is transparent, testable, and fast enough
-for 1h bars. Upgrade path to HMM is available via subclassing.
+Approach: rolling vol ratio (primary, no external deps) +
+          optional Gaussian HMM 2-state (requires hmmlearn).
+
+Design rationale:
+  Rolling vol-ratio is transparent, testable, fast, and production-safe.
+  HMM is opt-in via use_hmm=True — falls back gracefully if hmmlearn not installed.
 
 Regime sizing scalars (get_regime_multiplier):
   NORMAL     → 1.00  (full size)
-  HIGH_VOL   → 0.50  (half size, wider spreads)
+  HIGH_VOL   → 0.50  (half size)
   TRANSITION → 0.75  (cautious)
-  BREAKDOWN  → 0.00  (no new trades, flatten existing)
+  BREAKDOWN  → 0.00  (no new trades, flatten)
+
+Changes v2:
+  - TRANSITION no longer permanently sticks: only first bar of regime candidate
+    sets TRANSITION; bars 2..N-1 keep previous confirmed regime until persistence met
+  - _transition_bars counter: tracks bars in transition, reset on confirmation
+  - Optional Gaussian HMM 2-state layer (use_hmm=True, graceful fallback)
+  - HMM states normalised: State 0=low-vol, State 1=high-vol (sorted by abs mean)
+  - regime_series(): returns pd.Series[VolRegime] for vectorised backtest usage
+  - batch(): hmm_state column included when HMM available (None otherwise)
+  - baseline_vol clamped to 1e-10 (division-by-zero guard on short series)
+  - _reset_online_state() resets all counters including _transition_bars
 """
 from __future__ import annotations
 
@@ -44,11 +57,12 @@ _REGIME_MULTIPLIER: Dict[VolRegime, float] = {
 @dataclass
 class RegimeState:
     regime: VolRegime
-    vol_ratio: float          # current_vol / baseline_vol
-    current_vol: float        # rolling std of spread returns
-    baseline_vol: float       # longer-window baseline
-    persistence_count: int    # bars current raw regime has held
-    confirmed: bool           # True once persistence threshold met
+    vol_ratio: float
+    current_vol: float
+    baseline_vol: float
+    persistence_count: int
+    confirmed: bool
+    hmm_state: Optional[int] = None      # 0=low-vol, 1=high-vol when HMM available
     timestamp: Optional[pd.Timestamp] = None
 
 
@@ -58,12 +72,14 @@ class RegimeDetector:
 
     Parameters
     ----------
-    vol_window         : short rolling window for current vol (default 24 bars)
-    baseline_window    : longer window for baseline vol (default 168 bars = 1 week @ 1h)
-    high_vol_threshold : vol_ratio above this → HIGH_VOL (default 1.5)
-    breakdown_threshold: vol_ratio above this → BREAKDOWN (default 2.5)
-    min_persistence    : consecutive bars required before regime switch is confirmed
-    adf_deterioration  : if provided, ADF p-value above this forces BREAKDOWN
+    vol_window          : short rolling window for current vol (default 24 bars)
+    baseline_window     : longer window for baseline vol (default 168 bars = 1 week @ 1h)
+    high_vol_threshold  : vol_ratio above this → HIGH_VOL (default 1.5)
+    breakdown_threshold : vol_ratio above this → BREAKDOWN (default 2.5)
+    min_persistence     : consecutive bars before regime switch is confirmed (default 3)
+    adf_deterioration   : ADF p-value above this forces BREAKDOWN (default 0.10)
+    use_hmm             : fit Gaussian HMM 2-state on batch() if hmmlearn available
+    hmm_n_iter          : EM iterations for HMM (default 100)
     """
 
     def __init__(
@@ -74,6 +90,8 @@ class RegimeDetector:
         breakdown_threshold: float = 2.5,
         min_persistence: int = 3,
         adf_deterioration: float = 0.10,
+        use_hmm: bool = False,
+        hmm_n_iter: int = 100,
     ) -> None:
         if vol_window >= baseline_window:
             raise ValueError("vol_window must be < baseline_window")
@@ -86,12 +104,20 @@ class RegimeDetector:
         self.breakdown_threshold = breakdown_threshold
         self.min_persistence = min_persistence
         self.adf_deterioration = adf_deterioration
+        self.use_hmm = use_hmm
+        self.hmm_n_iter = hmm_n_iter
+
+        self._hmm_model = None
+        self._hmm_available: bool = self._check_hmmlearn()
+        if use_hmm and not self._hmm_available:
+            logger.warning("use_hmm=True but hmmlearn not installed — falling back to vol-ratio only")
 
         # Online state
         self._spread_returns: List[float] = []
         self._raw_regime_count: int = 0
         self._raw_regime: VolRegime = VolRegime.NORMAL
         self._confirmed_regime: VolRegime = VolRegime.NORMAL
+        self._transition_bars: int = 0
 
     # ------------------------------------------------------------------
     # Public API
@@ -107,14 +133,14 @@ class RegimeDetector:
 
         Parameters
         ----------
-        spread     : spread values (output of SpreadEngine)
-        adf_pvalues: optional rolling ADF p-values; values > adf_deterioration
-                     force BREAKDOWN regardless of vol ratio
+        spread      : spread values (output of SpreadEngine)
+        adf_pvalues : optional rolling ADF p-values; values > adf_deterioration
+                      force BREAKDOWN regardless of vol ratio
 
         Returns
         -------
         DataFrame with columns: regime, vol_ratio, current_vol, baseline_vol,
-                                 confirmed, multiplier
+                                 confirmed, multiplier, hmm_state
         """
         spread_ret = spread.pct_change().fillna(0.0)
         self._reset_online_state()
@@ -123,7 +149,6 @@ class RegimeDetector:
         for i in range(len(spread_ret)):
             adf_p = float(adf_pvalues.iloc[i]) if adf_pvalues is not None else None
             state = self._step(float(spread_ret.iloc[i]), adf_p=adf_p)
-            ts = spread_ret.index[i] if hasattr(spread_ret.index, '__getitem__') else None
             regimes.append({
                 "regime":       state.regime.value,
                 "vol_ratio":    state.vol_ratio,
@@ -134,6 +159,13 @@ class RegimeDetector:
             })
 
         result = pd.DataFrame(regimes, index=spread.index)
+
+        # Optional HMM layer — batch only (Viterbi requires full sequence)
+        if self.use_hmm and self._hmm_available:
+            result["hmm_state"] = self._fit_predict_hmm(spread_ret.values)
+        else:
+            result["hmm_state"] = None
+
         counts = result["regime"].value_counts().to_dict()
         logger.info(f"Regime batch: {len(result)} bars | {counts}")
         return result
@@ -148,10 +180,6 @@ class RegimeDetector:
         return self._step(spread_return, adf_p=adf_pvalue, ts=ts)
 
     def get_regime_multiplier(self, regime: Optional[VolRegime] = None) -> float:
-        """
-        Return position sizing scalar for *regime*.
-        If regime is None, uses current confirmed regime.
-        """
         r = regime if regime is not None else self._confirmed_regime
         return _REGIME_MULTIPLIER[r]
 
@@ -159,8 +187,20 @@ class RegimeDetector:
         """Return the confirmed (persistence-filtered) current regime."""
         return self._confirmed_regime
 
+    def regime_series(
+        self,
+        spread: pd.Series,
+        adf_pvalues: Optional[pd.Series] = None,
+    ) -> pd.Series:
+        """
+        Convenience: returns pd.Series of VolRegime enum values.
+        Useful for vectorised regime lookups in backtest loops.
+        """
+        df = self.batch(spread, adf_pvalues=adf_pvalues)
+        return df["regime"].map(lambda v: VolRegime(v))
+
     # ------------------------------------------------------------------
-    # Internal
+    # Internal — vol-ratio classifier
     # ------------------------------------------------------------------
 
     def _step(
@@ -185,11 +225,11 @@ class RegimeDetector:
         arr = np.asarray(self._spread_returns)
         current_vol  = float(np.std(arr[-self.vol_window:]))
         baseline_arr = arr[-self.baseline_window:] if len(arr) >= self.baseline_window else arr
-        baseline_vol = float(np.std(baseline_arr)) or 1e-12
+        baseline_vol = max(float(np.std(baseline_arr)), 1e-10)  # division-by-zero guard
 
         vol_ratio = current_vol / baseline_vol
 
-        # -- Raw regime from vol ratio --
+        # Raw regime from vol ratio
         if vol_ratio >= self.breakdown_threshold:
             raw = VolRegime.BREAKDOWN
         elif vol_ratio >= self.high_vol_threshold:
@@ -197,11 +237,11 @@ class RegimeDetector:
         else:
             raw = VolRegime.NORMAL
 
-        # -- ADF deterioration override --
+        # ADF deterioration override
         if adf_p is not None and adf_p > self.adf_deterioration:
             raw = VolRegime.BREAKDOWN
 
-        # -- Persistence filter --
+        # Persistence filter
         if raw == self._raw_regime:
             self._raw_regime_count += 1
         else:
@@ -209,6 +249,7 @@ class RegimeDetector:
             self._raw_regime_count = 1
 
         confirmed = self._raw_regime_count >= self.min_persistence
+
         if confirmed:
             if self._confirmed_regime != raw:
                 logger.info(
@@ -216,9 +257,13 @@ class RegimeDetector:
                     f"(vol_ratio={vol_ratio:.2f}, persistence={self._raw_regime_count})"
                 )
             self._confirmed_regime = raw
+            self._transition_bars = 0
         elif self._raw_regime_count == 1 and raw != self._confirmed_regime:
-            # First bar of new candidate regime → TRANSITION
+            # First bar of a new candidate regime → TRANSITION
+            # Subsequent bars (2..N-1) keep the previous confirmed regime
+            self._transition_bars += 1
             self._confirmed_regime = VolRegime.TRANSITION
+        # else: accumulating persistence but not confirmed → keep prior regime
 
         return RegimeState(
             regime=self._confirmed_regime,
@@ -235,3 +280,61 @@ class RegimeDetector:
         self._raw_regime_count = 0
         self._raw_regime = VolRegime.NORMAL
         self._confirmed_regime = VolRegime.NORMAL
+        self._transition_bars = 0
+
+    # ------------------------------------------------------------------
+    # Internal — HMM layer (optional)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_hmmlearn() -> bool:
+        try:
+            import hmmlearn  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def _fit_predict_hmm(
+        self,
+        returns: np.ndarray,
+        n_components: int = 2,
+    ) -> np.ndarray:
+        """
+        Fit a Gaussian HMM with n_components hidden states on returns
+        and return the Viterbi state sequence.
+
+        State 0 = low-vol, State 1 = high-vol
+        (sorted by emission abs mean ascending — exchange-agnostic).
+
+        Returns array of -1 on any error (safe fallback).
+        """
+        try:
+            from hmmlearn.hmm import GaussianHMM
+
+            X = returns.reshape(-1, 1)
+            model = GaussianHMM(
+                n_components=n_components,
+                covariance_type="diag",
+                n_iter=self.hmm_n_iter,
+                random_state=42,
+                verbose=False,
+            )
+            model.fit(X)
+            states = model.predict(X)
+
+            # Normalise: state with lower abs mean = 0 (low-vol)
+            means  = np.array([np.abs(model.means_[s]).mean() for s in range(n_components)])
+            order  = np.argsort(means)
+            remap  = {int(order[i]): i for i in range(n_components)}
+            states = np.vectorize(remap.get)(states)
+
+            self._hmm_model = model
+            logger.info(
+                f"HMM fit OK: low-vol bars={int((states == 0).sum())} "
+                f"high-vol bars={int((states == 1).sum())}"
+            )
+            return states.astype(int)
+
+        except Exception as exc:
+            logger.warning(f"HMM fit failed, using vol-ratio only: {exc}")
+            return np.full(len(returns), -1, dtype=int)
