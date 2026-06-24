@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QuantLuna — Live Dashboard</title>
+<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@300..700&display=swap" rel="stylesheet">
+<style>
+/* ─── Design tokens ─────────────────────────────────────────────── */
+:root {
+  --font-body:    'Inter', system-ui, sans-serif;
+  --font-mono:    'JetBrains Mono', 'Fira Code', monospace;
+
+  --text-xs:   clamp(0.75rem,  0.7rem  + 0.25vw, 0.875rem);
+  --text-sm:   clamp(0.875rem, 0.8rem  + 0.35vw, 1rem);
+  --text-base: clamp(1rem,     0.95rem + 0.25vw, 1.125rem);
+  --text-lg:   clamp(1.125rem, 1rem    + 0.75vw, 1.5rem);
+  --text-xl:   clamp(1.5rem,   1.2rem  + 1.25vw, 2.25rem);
+
+  --space-1: 0.25rem; --space-2: 0.5rem;  --space-3: 0.75rem;
+  --space-4: 1rem;    --space-6: 1.5rem;  --space-8: 2rem;
+  --space-10: 2.5rem; --space-12: 3rem;
+
+  --radius-sm: 0.375rem; --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;  --radius-xl: 1rem;
+
+  --transition: 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+[data-theme="dark"] {
+  --bg:           #0d0f12;
+  --surface:      #131618;
+  --surface-2:    #181b1e;
+  --surface-3:    #1e2124;
+  --border:       rgba(255,255,255,0.07);
+  --text:         #e2e4e8;
+  --text-muted:   #6e737a;
+  --text-faint:   #3e4348;
+  --primary:      #4eaaff;
+  --primary-dim:  rgba(78,170,255,0.12);
+  --green:        #34d399;
+  --green-dim:    rgba(52,211,153,0.12);
+  --red:          #f87171;
+  --red-dim:      rgba(248,113,113,0.12);
+  --amber:        #fbbf24;
+  --amber-dim:    rgba(251,191,36,0.12);
+  --purple:       #a78bfa;
+  --shadow:       0 4px 16px rgba(0,0,0,0.4);
+}
+
+[data-theme="light"] {
+  --bg:           #f4f5f7;
+  --surface:      #ffffff;
+  --surface-2:    #f9fafb;
+  --surface-3:    #f0f2f5;
+  --border:       rgba(0,0,0,0.08);
+  --text:         #1a1d21;
+  --text-muted:   #6b7280;
+  --text-faint:   #d1d5db;
+  --primary:      #2563eb;
+  --primary-dim:  rgba(37,99,235,0.08);
+  --green:        #059669;
+  --green-dim:    rgba(5,150,105,0.08);
+  --red:          #dc2626;
+  --red-dim:      rgba(220,38,38,0.08);
+  --amber:        #d97706;
+  --amber-dim:    rgba(217,119,6,0.08);
+  --purple:       #7c3aed;
+  --shadow:       0 2px 8px rgba(0,0,0,0.08);
+}
+
+/* ─── Reset & base ──────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { -webkit-font-smoothing: antialiased; scroll-behavior: smooth; }
+body {
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  color: var(--text);
+  background: var(--bg);
+  min-height: 100dvh;
+  line-height: 1.5;
+}
+mono, .mono { font-family: var(--font-mono); }
+button { cursor: pointer; border: none; background: none; font: inherit; color: inherit; }
+a { color: var(--primary); text-decoration: none; }
+
+/* ─── Layout ────────────────────────────────────────────────────── */
+.shell {
+  display: grid;
+  grid-template-rows: 52px 1fr;
+  min-height: 100dvh;
+}
+
+/* Header */
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 var(--space-6);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  gap: var(--space-4);
+}
+.logo {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-weight: 700;
+  font-size: var(--text-base);
+  letter-spacing: -0.02em;
+}
+.logo svg { color: var(--primary); }
+.pair-label {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  padding: 2px var(--space-2);
+  background: var(--primary-dim);
+  color: var(--primary);
+  border-radius: var(--radius-sm);
+  font-weight: 600;
+}
+.header-right { display: flex; align-items: center; gap: var(--space-3); }
+.ws-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  transition: background var(--transition);
+}
+.ws-dot.connected { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.ws-dot.error { background: var(--red); }
+.theme-toggle {
+  width: 32px; height: 32px;
+  border-radius: var(--radius-md);
+  display: flex; align-items: center; justify-content: center;
+  color: var(--text-muted);
+  transition: background var(--transition), color var(--transition);
+}
+.theme-toggle:hover { background: var(--surface-3); color: var(--text); }
+.state-badge {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-sm);
+  font-weight: 600;
+  text-transform: uppercase;
+  background: var(--surface-3);
+  color: var(--text-muted);
+}
+.state-badge.active { background: var(--green-dim); color: var(--green); }
+.state-badge.in_position { background: var(--primary-dim); color: var(--primary); }
+.state-badge.halted { background: var(--red-dim); color: var(--red); }
+.state-badge.warming_up { background: var(--amber-dim); color: var(--amber); }
+.state-badge.closing { background: var(--amber-dim); color: var(--amber); }
+
+/* Main content */
+.main {
+  padding: var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  max-width: 1600px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+/* KPI row */
+.kpi-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(200px, 100%), 1fr));
+  gap: var(--space-3);
+}
+.kpi {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  box-shadow: var(--shadow);
+  transition: box-shadow var(--transition);
+}
+.kpi:hover { box-shadow: 0 6px 24px rgba(0,0,0,0.3); }
+.kpi-label {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 500;
+}
+.kpi-value {
+  font-family: var(--font-mono);
+  font-size: var(--text-lg);
+  font-weight: 600;
+  color: var(--text);
+  transition: color var(--transition);
+  line-height: 1.1;
+}
+.kpi-value.pos { color: var(--green); }
+.kpi-value.neg { color: var(--red); }
+.kpi-value.warn { color: var(--amber); }
+.kpi-sub {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+/* Two-column chart grid */
+.chart-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-4);
+}
+@media (max-width: 900px) { .chart-grid { grid-template-columns: 1fr; } }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  box-shadow: var(--shadow);
+}
+.card-title {
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-bottom: var(--space-3);
+}
+.chart-wrap { height: 240px; }
+
+/* Kalman panel */
+.kalman-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(180px, 100%), 1fr));
+  gap: var(--space-3);
+}
+
+/* Funding row */
+.funding-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
+}
+@media (max-width: 600px) { .funding-row { grid-template-columns: 1fr; } }
+.funding-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-4);
+  box-shadow: var(--shadow);
+}
+.funding-label { font-size: var(--text-xs); color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 500; margin-bottom: var(--space-2); }
+.funding-rate { font-family: var(--font-mono); font-size: var(--text-base); font-weight: 600; }
+.funding-next { font-size: var(--text-xs); color: var(--text-muted); font-family: var(--font-mono); margin-top: var(--space-1); }
+
+/* Trades table */
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: var(--text-xs); font-family: var(--font-mono); }
+th {
+  text-align: left;
+  padding: var(--space-2) var(--space-3);
+  color: var(--text-muted);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+td {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  white-space: nowrap;
+}
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: var(--surface-2); }
+.td-pos { color: var(--green); }
+.td-neg { color: var(--red); }
+
+/* Skeleton shimmer */
+@keyframes shimmer {
+  0%   { background-position: -400px 0; }
+  100% { background-position:  400px 0; }
+}
+.skeleton {
+  background: linear-gradient(90deg, var(--surface-3) 25%, var(--surface-2) 50%, var(--surface-3) 75%);
+  background-size: 400px 100%;
+  animation: shimmer 1.5s ease-in-out infinite;
+  border-radius: var(--radius-sm);
+  height: 1.2em;
+}
+
+/* Tooltip */
+.tooltip-wrap { position: relative; display: inline-block; }
+.tooltip-wrap:hover .tooltip-body { opacity: 1; pointer-events: auto; transform: translateY(0); }
+.tooltip-body {
+  position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%) translateY(4px);
+  background: var(--surface-3); border: 1px solid var(--border);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md); font-size: var(--text-xs);
+  white-space: nowrap; opacity: 0; pointer-events: none;
+  transition: opacity 120ms, transform 120ms;
+  z-index: 200;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 3px; }
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+}
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- HEADER -->
+  <header class="header">
+    <div class="logo">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-label="QuantLuna" role="img">
+        <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.5"/>
+        <path d="M12 3 C7 8 7 16 12 21" stroke="currentColor" stroke-width="1.5" fill="none"/>
+        <path d="M12 3 C17 8 17 16 12 21" stroke="currentColor" stroke-width="1.5" fill="none" opacity="0.4"/>
+        <circle cx="12" cy="12" r="2.5" fill="currentColor"/>
+      </svg>
+      QuantLuna
+    </div>
+    <div style="display:flex;align-items:center;gap:var(--space-3);">
+      <span class="pair-label" id="pair-label">—/—</span>
+      <span class="state-badge" id="state-badge">idle</span>
+    </div>
+    <div class="header-right">
+      <span class="ws-dot" id="ws-dot" title="WebSocket status"></span>
+      <span style="font-size:var(--text-xs);color:var(--text-muted);font-family:var(--font-mono);" id="last-update">--:--:--</span>
+      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme" data-theme-toggle>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+        </svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- MAIN -->
+  <main class="main">
+
+    <!-- KPI Row -->
+    <section class="kpi-row" aria-label="Key metrics">
+      <div class="kpi">
+        <div class="kpi-label">Realized P&amp;L</div>
+        <div class="kpi-value" id="kpi-rpnl">—</div>
+        <div class="kpi-sub" id="kpi-rpnl-sub">all time</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Open P&amp;L</div>
+        <div class="kpi-value" id="kpi-opnl">—</div>
+        <div class="kpi-sub" id="kpi-opnl-sub">current position</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Daily P&amp;L</div>
+        <div class="kpi-value" id="kpi-dpnl">—</div>
+        <div class="kpi-sub" id="kpi-dpnl-sub">today UTC</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Z-Score</div>
+        <div class="kpi-value" id="kpi-zscore">—</div>
+        <div class="kpi-sub" id="kpi-zscore-sub">entry ≥ 2.0 | exit ≤ 0.5</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Hedge Ratio β</div>
+        <div class="kpi-value mono" id="kpi-beta">—</div>
+        <div class="kpi-sub">Kalman estimate</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Half-Life</div>
+        <div class="kpi-value mono" id="kpi-hl">—</div>
+        <div class="kpi-sub">mean reversion bars</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Trades</div>
+        <div class="kpi-value" id="kpi-trades">—</div>
+        <div class="kpi-sub" id="kpi-fees">fees: —</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Regime</div>
+        <div class="kpi-value" id="kpi-regime">—</div>
+        <div class="kpi-sub">cointegration status</div>
+      </div>
+    </section>
+
+    <!-- Charts -->
+    <section class="chart-grid">
+      <div class="card">
+        <div class="card-title">Z-Score Series</div>
+        <div class="chart-wrap" id="chart-zscore"></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Cumulative P&amp;L (USDT)</div>
+        <div class="chart-wrap" id="chart-pnl"></div>
+      </div>
+    </section>
+
+    <!-- Kalman detail -->
+    <section class="card">
+      <div class="card-title">Kalman Filter Status</div>
+      <div class="kalman-grid">
+        <div class="kpi">
+          <div class="kpi-label">Kalman Gain</div>
+          <div class="kpi-value mono" id="kal-gain">—</div>
+          <div class="kpi-sub">0 = full trust prior | 1 = full trust obs</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Uncertainty (P)</div>
+          <div class="kpi-value mono" id="kal-unc">—</div>
+          <div class="kpi-sub">posterior variance</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Spread</div>
+          <div class="kpi-value mono" id="kal-spread">—</div>
+          <div class="kpi-sub">Y − β·X</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Price Y</div>
+          <div class="kpi-value mono" id="kal-py">—</div>
+          <div class="kpi-sub" id="kal-py-sym">—</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-label">Price X</div>
+          <div class="kpi-value mono" id="kal-px">—</div>
+          <div class="kpi-sub" id="kal-px-sym">—</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Funding rates -->
+    <section>
+      <div class="card-title" style="margin-bottom:var(--space-3);text-transform:uppercase;letter-spacing:0.06em;font-size:var(--text-xs);color:var(--text-muted);font-weight:600;">Funding Rates</div>
+      <div class="funding-row">
+        <div class="funding-card">
+          <div class="funding-label" id="fund-label-y">LEG Y</div>
+          <div class="funding-rate" id="fund-rate-y">—</div>
+          <div class="funding-next" id="fund-next-y">next: —</div>
+        </div>
+        <div class="funding-card">
+          <div class="funding-label" id="fund-label-x">LEG X</div>
+          <div class="funding-rate" id="fund-rate-x">—</div>
+          <div class="funding-next" id="fund-next-x">next: —</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Recent trades -->
+    <section class="card">
+      <div class="card-title">Recent Trades (last 50)</div>
+      <div class="table-wrap">
+        <table aria-label="Recent trades">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Time (UTC)</th>
+              <th>Side</th>
+              <th>Entry Y</th>
+              <th>Entry X</th>
+              <th>Exit Y</th>
+              <th>Exit X</th>
+              <th>Fees</th>
+              <th>P&amp;L</th>
+            </tr>
+          </thead>
+          <tbody id="trades-tbody">
+            <tr><td colspan="9" style="text-align:center;color:var(--text-muted);padding:var(--space-8);">No trades yet</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </main>
+</div><!-- .shell -->
+
+<script>
+(function () {
+  'use strict';
+
+  // ── Theme toggle ────────────────────────────────────────────────────
+  const root = document.documentElement;
+  let theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  root.setAttribute('data-theme', theme);
+
+  const themeBtn = document.getElementById('theme-toggle');
+  const SUN = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>`;
+  const MOON = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>`;
+  function applyTheme(t) {
+    root.setAttribute('data-theme', t);
+    themeBtn.innerHTML = t === 'dark' ? SUN : MOON;
+    themeBtn.setAttribute('aria-label', 'Switch to ' + (t === 'dark' ? 'light' : 'dark') + ' mode');
+    redrawCharts();
+  }
+  themeBtn.addEventListener('click', () => { theme = theme === 'dark' ? 'light' : 'dark'; applyTheme(theme); });
+  applyTheme(theme);
+
+  // ── Chart setup ─────────────────────────────────────────────────────
+  const CHART_MARGIN = { l: 44, r: 16, t: 8, b: 36 };
+  let zData = { ts: [], v: [] };
+  let pData = { ts: [], v: [] };
+
+  function chartLayout(yTitle) {
+    const dark = root.getAttribute('data-theme') === 'dark';
+    return {
+      margin: CHART_MARGIN,
+      paper_bgcolor: 'transparent',
+      plot_bgcolor: 'transparent',
+      font: { family: "'JetBrains Mono', monospace", size: 11, color: dark ? '#6e737a' : '#6b7280' },
+      xaxis: {
+        gridcolor: dark ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.04)',
+        zeroline: false, showline: false, tickfont: { size: 10 },
+      },
+      yaxis: {
+        title: { text: yTitle, font: { size: 10 }, standoff: 8 },
+        gridcolor: dark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)',
+        zeroline: true,
+        zerolinecolor: dark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.12)',
+        zerolinewidth: 1,
+        tickfont: { size: 10 },
+      },
+      hovermode: 'x unified',
+      showlegend: false,
+    };
+  }
+
+  function buildZTrace() {
+    const dark = root.getAttribute('data-theme') === 'dark';
+    return [{
+      x: zData.ts.map(t => new Date(t * 1000)),
+      y: zData.v,
+      type: 'scatter', mode: 'lines',
+      line: { color: dark ? '#4eaaff' : '#2563eb', width: 1.5, shape: 'spline' },
+      name: 'z-score',
+      fill: 'tozeroy',
+      fillcolor: dark ? 'rgba(78,170,255,0.06)' : 'rgba(37,99,235,0.04)',
+    }, {
+      x: [zData.ts[0] ? new Date(zData.ts[0]*1000) : new Date(), zData.ts[zData.ts.length-1] ? new Date(zData.ts[zData.ts.length-1]*1000) : new Date()],
+      y: [2, 2],
+      type: 'scatter', mode: 'lines',
+      line: { color: dark ? 'rgba(248,113,113,0.5)' : 'rgba(220,38,38,0.4)', width: 1, dash: 'dot' },
+      name: '+2σ',
+    }, {
+      x: [zData.ts[0] ? new Date(zData.ts[0]*1000) : new Date(), zData.ts[zData.ts.length-1] ? new Date(zData.ts[zData.ts.length-1]*1000) : new Date()],
+      y: [-2, -2],
+      type: 'scatter', mode: 'lines',
+      line: { color: dark ? 'rgba(248,113,113,0.5)' : 'rgba(220,38,38,0.4)', width: 1, dash: 'dot' },
+      name: '-2σ',
+    }];
+  }
+
+  function buildPnlTrace() {
+    const dark = root.getAttribute('data-theme') === 'dark';
+    const pos = pData.v.length === 0 || pData.v[pData.v.length - 1] >= 0;
+    return [{
+      x: pData.ts.map(t => new Date(t * 1000)),
+      y: pData.v,
+      type: 'scatter', mode: 'lines',
+      line: { color: pos ? (dark ? '#34d399' : '#059669') : (dark ? '#f87171' : '#dc2626'), width: 1.5, shape: 'spline' },
+      name: 'P&L',
+      fill: 'tozeroy',
+      fillcolor: pos ? (dark ? 'rgba(52,211,153,0.07)' : 'rgba(5,150,105,0.05)') : (dark ? 'rgba(248,113,113,0.07)' : 'rgba(220,38,38,0.05)'),
+    }];
+  }
+
+  const CFG = { displayModeBar: false, responsive: true, scrollZoom: false };
+
+  Plotly.newPlot('chart-zscore', buildZTrace(), chartLayout('z-score'), CFG);
+  Plotly.newPlot('chart-pnl', buildPnlTrace(), chartLayout('USDT'), CFG);
+
+  function redrawCharts() {
+    Plotly.react('chart-zscore', buildZTrace(), chartLayout('z-score'), CFG);
+    Plotly.react('chart-pnl', buildPnlTrace(), chartLayout('USDT'), CFG);
+  }
+
+  // ── DOM helpers ──────────────────────────────────────────────────────
+  function el(id) { return document.getElementById(id); }
+  function setMono(id, val, decimals = 4) {
+    const e = el(id);
+    if (!e) return;
+    e.textContent = val === null || val === undefined ? '—' : (+val).toFixed(decimals);
+  }
+  function setPnl(id, val, suffix = '') {
+    const e = el(id);
+    if (!e) return;
+    const n = +val;
+    e.textContent = (n >= 0 ? '+' : '') + n.toFixed(2) + ' USDT' + suffix;
+    e.className = 'kpi-value' + (n > 0 ? ' pos' : n < 0 ? ' neg' : '');
+  }
+  function setFunding(id, val) {
+    const e = el(id);
+    if (!e) return;
+    const pct = (+val * 100).toFixed(4);
+    e.textContent = pct + '%';
+    e.style.color = +val > 0 ? 'var(--green)' : +val < 0 ? 'var(--red)' : 'var(--text)';
+  }
+
+  // ── State update ─────────────────────────────────────────────────────
+  function applySnapshot(s) {
+    // Pair label
+    const sym_y = (s.sym_y || '').split('/')[0];
+    const sym_x = (s.sym_x || '').split('/')[0];
+    if (sym_y && sym_x) el('pair-label').textContent = sym_y + '/' + sym_x;
+
+    // Trader state badge
+    const badge = el('state-badge');
+    badge.textContent = s.trader_state || 'idle';
+    badge.className = 'state-badge ' + (s.trader_state || 'idle').replace('_', '_');
+
+    // KPIs
+    setPnl('kpi-rpnl', s.realized_pnl);
+    setPnl('kpi-opnl', s.open_pnl);
+    setPnl('kpi-dpnl', s.daily_pnl);
+    setMono('kpi-zscore', s.zscore, 3);
+    el('kpi-zscore').className = 'kpi-value' + (Math.abs(+s.zscore) >= 2 ? ' warn' : '');
+    setMono('kpi-beta', s.hedge_ratio, 4);
+    setMono('kpi-hl', s.half_life, 1);
+    el('kpi-trades').textContent = s.trade_count ?? '—';
+    el('kpi-fees').textContent = 'fees: ' + (s.total_fees_usdt != null ? (+s.total_fees_usdt).toFixed(2) + ' USDT' : '—');
+
+    const regime = s.regime || 'unknown';
+    const re = el('kpi-regime');
+    re.textContent = regime;
+    re.className = 'kpi-value' + (regime === 'cointegrated' ? ' pos' : regime === 'breakdown' ? ' neg' : '');
+
+    // Kalman
+    setMono('kal-gain', s.kalman_gain, 5);
+    setMono('kal-unc', s.kalman_uncertainty, 6);
+    setMono('kal-spread', s.spread, 4);
+    setMono('kal-py', s.price_y, 4);
+    setMono('kal-px', s.price_x, 4);
+    if (sym_y) el('kal-py-sym').textContent = sym_y + ' (Y)';
+    if (sym_x) el('kal-px-sym').textContent = sym_x + ' (X)';
+
+    // Funding
+    if (sym_y) el('fund-label-y').textContent = 'LEG Y — ' + sym_y;
+    if (sym_x) el('fund-label-x').textContent = 'LEG X — ' + sym_x;
+    setFunding('fund-rate-y', s.funding_rate_y);
+    setFunding('fund-rate-x', s.funding_rate_x);
+    el('fund-next-y').textContent = 'next: ' + (s.next_funding_ts_y || '—');
+    el('fund-next-x').textContent = 'next: ' + (s.next_funding_ts_x || '—');
+
+    // Series
+    if (s.zscore_series && s.zscore_series.length) {
+      zData.ts = s.zscore_series.map(p => p.ts);
+      zData.v  = s.zscore_series.map(p => p.v);
+      Plotly.react('chart-zscore', buildZTrace(), chartLayout('z-score'), CFG);
+    }
+    if (s.pnl_series && s.pnl_series.length) {
+      pData.ts = s.pnl_series.map(p => p.ts);
+      pData.v  = s.pnl_series.map(p => p.v);
+      Plotly.react('chart-pnl', buildPnlTrace(), chartLayout('USDT'), CFG);
+    }
+
+    // Trades table
+    if (s.recent_trades && s.recent_trades.length) {
+      const tbody = el('trades-tbody');
+      tbody.innerHTML = '';
+      const trades = [...s.recent_trades].reverse();
+      trades.forEach((t, i) => {
+        const pnl = +t.pnl;
+        const tr = document.createElement('tr');
+        tr.innerHTML = [
+          `<td>${trades.length - i}</td>`,
+          `<td>${t.ts ? new Date(+t.ts * 1000).toISOString().replace('T',' ').slice(0,19) : '—'}</td>`,
+          `<td>${t.side || '—'}</td>`,
+          `<td>${(+t.entry_y||0).toFixed(4)}</td>`,
+          `<td>${(+t.entry_x||0).toFixed(4)}</td>`,
+          `<td>${(+t.exit_y||0).toFixed(4)}</td>`,
+          `<td>${(+t.exit_x||0).toFixed(4)}</td>`,
+          `<td>${(+t.fees||0).toFixed(4)}</td>`,
+          `<td class="${pnl>=0?'td-pos':'td-neg'}">${pnl>=0?'+':''}${pnl.toFixed(2)}</td>`,
+        ].join('');
+        tbody.appendChild(tr);
+      });
+    }
+
+    // Last update
+    el('last-update').textContent = new Date().toISOString().slice(11,19) + ' UTC';
+  }
+
+  // ── WebSocket ─────────────────────────────────────────────────────────
+  const WS_URL = 'ws://' + location.host + '/ws';
+  const dot = el('ws-dot');
+  let ws, reconnectTimer;
+
+  function connect() {
+    ws = new WebSocket(WS_URL);
+
+    ws.onopen = () => {
+      dot.className = 'ws-dot connected';
+      clearTimeout(reconnectTimer);
+      // Bootstrap from /state
+      fetch('/state').then(r => r.json()).then(applySnapshot).catch(() => {});
+    };
+
+    ws.onmessage = (ev) => {
+      try { applySnapshot(JSON.parse(ev.data)); } catch (e) { console.warn('WS parse error', e); }
+    };
+
+    ws.onerror = () => { dot.className = 'ws-dot error'; };
+
+    ws.onclose = () => {
+      dot.className = 'ws-dot';
+      reconnectTimer = setTimeout(connect, 3000);
+    };
+  }
+
+  connect();
+
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,122 @@
+"""
+dashboard/server.py  —  QuantLuna Sprint 5
+
+FastAPI app:
+  GET  /        — serves dashboard/index.html
+  GET  /state   — current snapshot (debug / bootstrap)
+  WS   /ws      — live push stream (JSON patches from StateBus)
+
+Run:
+  uvicorn dashboard.server:app --host 0.0.0.0 --port 8765 --reload
+
+For production:
+  uvicorn dashboard.server:app --host 0.0.0.0 --port 8765 --workers 1
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+from pathlib import Path
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from state_bus import bus
+
+logger = logging.getLogger(__name__)
+
+DASHBOARD_DIR = Path(__file__).parent
+INDEX_HTML = DASHBOARD_DIR / "index.html"
+
+app = FastAPI(
+    title="QuantLuna Dashboard",
+    version="5.0.0",
+    docs_url=None,
+    redoc_url=None,
+)
+
+# Serve static assets from dashboard/static/ if present
+_static = DASHBOARD_DIR / "static"
+if _static.exists():
+    app.mount("/static", StaticFiles(directory=str(_static)), name="static")
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/")
+async def serve_dashboard():
+    """Serve the live dashboard HTML."""
+    if not INDEX_HTML.exists():
+        return JSONResponse(
+            {"error": "dashboard/index.html not found"},
+            status_code=503,
+        )
+    return FileResponse(str(INDEX_HTML), media_type="text/html")
+
+
+@app.get("/state")
+async def get_state():
+    """Current snapshot — useful for bootstrap and debugging."""
+    return JSONResponse(bus.snapshot())
+
+
+@app.websocket("/ws")
+async def ws_endpoint(websocket: WebSocket):
+    """
+    Push live StateBus snapshots to connected dashboard clients.
+    Each message is a full JSON snapshot (not a diff).
+    """
+    await websocket.accept()
+    client = websocket.client
+    logger.info(f"WS client connected: {client}")
+    try:
+        async for snapshot in bus.subscribe():
+            await websocket.send_json(snapshot)
+            # Yield control so other tasks can run
+            await asyncio.sleep(0)
+    except WebSocketDisconnect:
+        logger.info(f"WS client disconnected: {client}")
+    except Exception as exc:
+        logger.warning(f"WS error for {client}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Integration helper — call from your main.py or LiveTrader launch script
+# ---------------------------------------------------------------------------
+
+async def start_dashboard(host: str = "0.0.0.0", port: int = 8765):
+    """
+    Launch the dashboard server as an asyncio task alongside LiveTrader.
+
+    Example in main.py:
+        import asyncio
+        from dashboard.server import start_dashboard
+        from execution.live_trader import LiveTrader, LiveConfig
+        from state_bus import bus
+
+        config = LiveConfig(sym_y="ETH/USDT:USDT", sym_x="BTC/USDT:USDT")
+        trader = LiveTrader(config, signal_gen, portfolio_risk)
+
+        async def main():
+            await asyncio.gather(
+                start_dashboard(),
+                trader.run(),
+            )
+
+        asyncio.run(main())
+    """
+    import uvicorn
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_level="info",
+        loop="asyncio",
+    )
+    server = uvicorn.Server(config)
+    await server.serve()
