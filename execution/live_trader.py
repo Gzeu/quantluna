@@ -26,6 +26,12 @@ P1 fixes (înainte de capital semnificativ):
           Kelly vol estimate necesita cel puțin min_warmup_bars samples reale.
           Pragul 10 producea Kelly oversizing la primul entry prin serie artificială.
 
+P0 hotfixes (post-mainnet-test):
+  FIX-TZ: _last_log_ts inițializat tz-aware UTC — evită TypeError fatal la primul tick
+           pd.Timestamp.min (tz-naive) - pd.Timestamp.now(tz=UTC) → crash imediat
+  FIX-BUS: WsWatchdog None bus guard în live_trader — run_live.py fără StateBus
+            nu mai produce spam de WARNING la fiecare 2s
+
 Flux de decizie la entry:
   1. WsWatchdog.is_live  → blocat dacă feed stale (Sprint 7)
   2. PortfolioAllocator.request_entry()  → 5 gates: DD, max pairs, corr, Kelly, exposure
@@ -271,7 +277,9 @@ class LiveTrader:
         self._entry_notional: float = 0.0
         self._entry_zscore: float = 0.0
         self._entry_hedge_ratio: float = 0.0
-        self._last_log_ts: pd.Timestamp = pd.Timestamp.min
+        # FIX-TZ: inițializat tz-aware UTC pentru a evita TypeError la primul tick
+        # pd.Timestamp.min este tz-naive; scăzut din pd.Timestamp.now(tz='UTC') → crash
+        self._last_log_ts: pd.Timestamp = pd.Timestamp.min.tz_localize("UTC")
         self._log_interval = pd.Timedelta(seconds=config.log_interval_s)
         self._daily_pnl: float = 0.0
         self._realized_pnl: float = 0.0
@@ -452,9 +460,9 @@ class LiveTrader:
                     await asyncio.sleep(self.cfg.close_all_retry_delay_s)
 
         alert_msg = (
-            f"‼️ CRITICAL: close_all({reason}) EȘUAT după "
-            f"{self.cfg.close_all_max_retries} încercări! "
-            f"VERIFICAȚI MANUAL POZIȚIILE PE EXCHANGE! "
+            f"\u203c\ufe0f CRITICAL: close_all({reason}) E\u0218UAT dup\u0103 "
+            f"{self.cfg.close_all_max_retries} \u00eencercări! "
+            f"VERIFICA\u021aI MANUAL POZI\u021aIILE PE EXCHANGE! "
             f"pair={self._pair_id} | last_error={last_exc}"
         )
         await _send_alert(self.cfg.alert, alert_msg)
@@ -701,8 +709,6 @@ class LiveTrader:
         pnl_series = pd.Series(self._trade_pnl_history) if self._trade_pnl_history else None
 
         # FIX-P1: threshold = min_warmup_bars (configurabil) în loc de 10 hardcodat.
-        # Kelly vol estimate necesita cel puțin min_warmup_bars samples reale pentru
-        # a evita oversizing prin serie artificială plată ([spread] * 30).
         if len(self._spread_buffer) >= self.cfg.min_warmup_bars:
             spread_series = pd.Series(list(self._spread_buffer))
         else:
@@ -818,7 +824,7 @@ class LiveTrader:
             )
         except Exception as exc:
             logger.error(f"EXIT failed: {exc} — POSITION MAY STILL BE OPEN!")
-            await _send_alert(self.cfg.alert, f"EXIT FAILED | pair={self._pair_id} | error={exc} | VERIFICAȚI MANUAL POZIȚIILE!")
+            await _send_alert(self.cfg.alert, f"EXIT FAILED | pair={self._pair_id} | error={exc} | VERIFICA\u021aI MANUAL POZI\u021aIILE!")
             raise
         finally:
             self.allocator.record_exit(self._pair_id)
@@ -876,6 +882,7 @@ class LiveTrader:
                     self._bus.update({"trader_state": TraderState.WARMING_UP.value})
 
     def _reset_daily_pnl_if_needed(self, ts: pd.Timestamp):
+        # FIX-TZ: normalize() + tz_localize pentru comparație consistentă cu ts tz-aware
         date = ts.normalize()
         if self._daily_reset_date is None or date > self._daily_reset_date:
             if self._daily_reset_date is not None:

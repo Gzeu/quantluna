@@ -29,6 +29,9 @@ Risc real:
 - check_interval_s prea mare → latență în detectare stale
 - stale_warn_s prea mic → false positives la exchange downtime scurt (< 10s normal)
   Bybit WebSocket poate avea hiccup-uri de 2-5s la rollover de funding
+
+FIX-BUS: toate apelurile bus.update() guard-ate cu `if self.bus` pentru a suporta
+  run fără StateBus (ex: run_live.py standalone fără dashboard)
 """
 from __future__ import annotations
 
@@ -51,7 +54,7 @@ class WsWatchdog:
     Monitorizare health WebSocket.
 
     Usage:
-        watchdog = WsWatchdog(WatchdogConfig(), bus)
+        watchdog = WsWatchdog(WatchdogConfig(), bus)  # bus poate fi None
         # în LiveTrader.run():
         asyncio.create_task(watchdog.run())
         # în LiveTrader._process_tick():
@@ -60,7 +63,7 @@ class WsWatchdog:
 
     def __init__(self, cfg: WatchdogConfig, bus) -> None:
         self.cfg = cfg
-        self.bus = bus
+        self.bus = bus  # poate fi None când rulează fără dashboard
         self._last_ping: float = time.monotonic()
         self._state: str = "LIVE"   # LIVE | STALE | CRITICAL
 
@@ -73,11 +76,12 @@ class WsWatchdog:
         # Reset imediat la LIVE fără a aștepta check loop
         if self._state != "LIVE":
             self._state = "LIVE"
-            self.bus.update({
-                "ws_stale": False,
-                "ws_stale_alert": False,
-                "ws_last_tick_age_s": 0.0,
-            })
+            if self.bus:  # FIX-BUS: guard pentru bus=None
+                self.bus.update({
+                    "ws_stale": False,
+                    "ws_stale_alert": False,
+                    "ws_last_tick_age_s": 0.0,
+                })
             logger.info("WsWatchdog: feed RECOVERED — back to LIVE")
 
     async def run(self) -> None:
@@ -101,20 +105,22 @@ class WsWatchdog:
         """Single health check cycle."""
         age = time.monotonic() - self._last_ping
 
-        # Publish age always (for dashboard sparkline / metric)
-        self.bus.update({"ws_last_tick_age_s": round(age, 1)})
+        # FIX-BUS: toate apelurile bus.update() guard-ate cu `if self.bus`
+        if self.bus:
+            self.bus.update({"ws_last_tick_age_s": round(age, 1)})
 
         if age < self.cfg.stale_warn_s:
             if self._state != "LIVE":
-                # Tranziție STALE/CRITICAL → LIVE
                 self._state = "LIVE"
-                self.bus.update({"ws_stale": False, "ws_stale_alert": False})
+                if self.bus:
+                    self.bus.update({"ws_stale": False, "ws_stale_alert": False})
                 logger.info(f"WsWatchdog: RECOVERED after {age:.1f}s stale")
 
         elif age < self.cfg.stale_critical_s:
             if self._state != "STALE":
                 self._state = "STALE"
-                self.bus.update({"ws_stale": True, "ws_stale_alert": False})
+                if self.bus:
+                    self.bus.update({"ws_stale": True, "ws_stale_alert": False})
                 logger.warning(
                     f"WsWatchdog: STALE — no tick for {age:.1f}s "
                     f"(threshold={self.cfg.stale_warn_s}s) — "
@@ -124,7 +130,8 @@ class WsWatchdog:
         else:  # age >= stale_critical_s
             if self._state != "CRITICAL":
                 self._state = "CRITICAL"
-                self.bus.update({"ws_stale": True, "ws_stale_alert": True})
+                if self.bus:
+                    self.bus.update({"ws_stale": True, "ws_stale_alert": True})
                 logger.error(
                     f"WsWatchdog: CRITICAL — no tick for {age:.1f}s — "
                     f"RECOMMEND halting new entries until feed recovered"
