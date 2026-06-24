@@ -83,6 +83,11 @@ class FundingMonitor:
 
         net = self._last_y - self._last_x
 
+        # FIX-BUS: guard — bus poate fi None în primele secunde de inițializare
+        if self.bus is None:
+            logger.debug("FundingMonitor: bus not ready yet, skipping publish")
+            return
+
         self.bus.update({
             "funding_y": self._last_y,
             "funding_x": self._last_x,
