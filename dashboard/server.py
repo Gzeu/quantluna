@@ -6,10 +6,13 @@ FastAPI app:
   GET  /state   — current snapshot (debug / bootstrap)
   WS   /ws      — live push stream (JSON snapshots from StateBus)
 
-Run:
+Run (recomandat — din root-ul proiectului):
   uvicorn dashboard.server:app --host 0.0.0.0 --port 8765 --reload
 
-For production:
+Sau direct (funcționează și din dashboard/):
+  python dashboard/server.py
+
+Pentru producție:
   uvicorn dashboard.server:app --host 0.0.0.0 --port 8765 --workers 1
 """
 
@@ -17,7 +20,17 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Path fix: garantează că root-ul proiectului e în sys.path indiferent
+# de directorul din care e pornit scriptul.
+# Necesar când rulezi `py server.py` din dashboard/ pe Windows.
+# ---------------------------------------------------------------------------
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
@@ -93,3 +106,8 @@ async def start_dashboard(host: str = "0.0.0.0", port: int = 8765):
     )
     server = uvicorn.Server(config)
     await server.serve()
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8765, reload=False)
