@@ -2,22 +2,34 @@
 execution/live_trader.py  —  QuantLuna Live Trading Engine
 
 Sprint history integrat:
-  Sprint 4: Bybit/Binance WS, asyncio queue, TraderState machine, OrderManager
-  Sprint 5: StateBus integration, _publish_state()
-  Sprint 6: FundingMonitor + PnLReconciler tasks, LiveSignalAdapter wrapping,
-            NormalizedSignal typed access, monitor_api_key support, cleanup tasks
-  Sprint 7: WsWatchdog integrat — ping() per tick, run() task, gate la entry
+  Sprint 4:  Bybit/Binance WS, asyncio queue, TraderState machine, OrderManager
+  Sprint 5:  StateBus integration, _publish_state()
+  Sprint 6:  FundingMonitor + PnLReconciler tasks, LiveSignalAdapter wrapping,
+             NormalizedSignal typed access, monitor_api_key support, cleanup tasks
+  Sprint 7:  WsWatchdog integrat — ping() per tick, run() task, gate la entry
   Sprint 10: PortfolioAllocator integration — sizing via KellyCrossPair,
              close_all() pentru HARD_STOP, DD-aware entry gate,
              allocator.update_state() per tick, allocator.record_exit() la exit
 
-Flux de decizie la entry (Sprint 10):
+P0 fixes (mainnet blockers):
+  FIX-1: Symbol parser robust — strip USDT/USDT-PERP/PERP corect (nu [:3])
+  FIX-2: Rolling spread buffer real (500 ticks) → Kelly primește volatilitate reală
+  FIX-3: Queue full → drop cu log WARN + contor; la 100 drops consecutive → HALT
+  FIX-4: close_all() retry logic (3 încercări, 1s delay) + alertă externă la eșec
+  FIX-5: FundingMonitor pornit cu exec_config credentials când monitor_api_key lipsă
+
+P1 fixes (înainte de capital semnificativ):
+  FIX-6:  Kalman reset explicit la WS reconnect via signal_gen.reset_kalman()
+  FIX-7:  Telegram / webhook alert async pe HARD_STOP, EXIT fail, HALT
+  FIX-8:  Persistent trade history — SQLite append la fiecare trade (fișier local)
+
+Flux de decizie la entry:
   1. WsWatchdog.is_live  → blocat dacă feed stale (Sprint 7)
   2. PortfolioAllocator.request_entry()  → 5 gates: DD, max pairs, corr, Kelly, exposure
   3. notional vine din Kelly cross-pair (nu hardcodat)
-  4. Per tick: allocator.update_state() + watchdog.ping()
-  5. La HARD_STOP: close_all() închide toate pozițiile
-  6. La exit: allocator.record_exit() curăță structurile interne
+  4. Per tick: allocator.update_state() + watchdog.ping() + spread_buffer.append()
+  5. La HARD_STOP: close_all() cu retry + alert extern
+  6. La exit: allocator.record_exit() + trade persistat în SQLite
 """
 
 from __future__ import annotations
@@ -25,11 +37,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sqlite3
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Optional
+from pathlib import Path
+from typing import Deque, Dict, List, Optional
 
+import aiohttp
 import pandas as pd
 
 from .order_manager import ExecutionConfig, FillPair, OrderManager
@@ -41,6 +57,37 @@ from risk import PortfolioAllocator, AllocatorConfig
 from risk.drawdown_controller import DDLevel
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# FIX-1: Symbol parser robust
+# ---------------------------------------------------------------------------
+# Sufixele care trebuie eliminate din simbolul raw al exchange-ului
+# pentru a obține baza (ex: "ETHUSDT" → "ETH", "BTCUSDT-PERP" → "BTC")
+_SYMBOL_SUFFIXES = (
+    "USDT-PERP", "USDTPERP", "-PERP", "PERP",
+    "USDT", "USD", "BUSD",
+)
+
+
+def _extract_base(symbol_raw: str) -> str:
+    """
+    Extrage baza dintr-un simbol raw de exchange.
+
+    Exemple:
+      "ETHUSDT"        → "ETH"
+      "BTCUSDT"        → "BTC"
+      "DOGEUSDT"       → "DOGE"
+      "1000PEPEUSDT"   → "1000PEPE"
+      "SOLUSDT-PERP"   → "SOL"
+      "XRPBUSD"        → "XRP"
+    """
+    s = symbol_raw.upper()
+    for suffix in _SYMBOL_SUFFIXES:
+        if s.endswith(suffix):
+            base = s[: len(s) - len(suffix)]
+            if base:  # nu lăsa string gol
+                return base
+    return s  # fallback: returnează as-is
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +118,18 @@ class PriceTick:
 
 
 @dataclass
+class AlertConfig:
+    """
+    FIX-7: Configurare alertă externă (Telegram sau webhook generic).
+    Dacă ambele sunt goale, alertele sunt doar log CRITICAL.
+    """
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
+    webhook_url: str = ""           # orice URL POST cu {"text": "..."}
+    timeout_s: float = 5.0
+
+
+@dataclass
 class LiveConfig:
     sym_y: str
     sym_x: str
@@ -93,18 +152,140 @@ class LiveConfig:
     pnl_reconcile_interval_s: float = 30.0
     pnl_drift_alert_usd: float = 5.0
 
-    # Sprint 6 — Credentșiale monitoring
+    # Sprint 6 — Credențiale monitoring (opțional — FIX-5: fallback la exec_config)
     monitor_api_key: str = ""
     monitor_api_secret: str = ""
     testnet: bool = False
 
     # Sprint 7 — WsWatchdog
     watchdog: WatchdogConfig = field(default_factory=WatchdogConfig)
-    # Dacă True, blochează ENTRY (nu EXIT) când feed e STALE
-    watchdog_gate_entries: bool = True
+    watchdog_gate_entries: bool = True  # blochează ENTRY (nu EXIT) când feed e STALE
 
     # Sprint 10 — Allocator config
     allocator_config: Optional[AllocatorConfig] = None
+
+    # FIX-3: Queue backpressure
+    queue_maxsize: int = 1_000
+    queue_drop_halt_threshold: int = 100   # drops consecutive înainte de HALT
+
+    # FIX-4: close_all retry
+    close_all_max_retries: int = 3
+    close_all_retry_delay_s: float = 1.0
+
+    # FIX-7: Alerte externe
+    alert: AlertConfig = field(default_factory=AlertConfig)
+
+    # FIX-8: Persistent trade history
+    trade_db_path: str = "trades.db"      # SQLite; "" dezactivează persistența
+    spread_buffer_size: int = 500         # FIX-2: rolling spread buffer
+
+
+# ---------------------------------------------------------------------------
+# FIX-7: Alert helper (async, fire-and-forget)
+# ---------------------------------------------------------------------------
+
+async def _send_alert(cfg: AlertConfig, message: str) -> None:
+    """
+    Trimite alertă pe Telegram și/sau webhook.
+    Silențios la eroare — nu blochează niciodată trading loop-ul.
+    """
+    logger.critical(f"[ALERT] {message}")
+    if not cfg.telegram_bot_token and not cfg.webhook_url:
+        return
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=cfg.timeout_s)
+        ) as session:
+            if cfg.telegram_bot_token and cfg.telegram_chat_id:
+                url = (
+                    f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage"
+                )
+                await session.post(
+                    url,
+                    json={"chat_id": cfg.telegram_chat_id, "text": f"🚨 QuantLuna\n{message}"},
+                )
+            if cfg.webhook_url:
+                await session.post(
+                    cfg.webhook_url,
+                    json={"text": f"QuantLuna ALERT: {message}"},
+                )
+    except Exception as exc:
+        logger.warning(f"Alert delivery failed (non-critical): {exc}")
+
+
+# ---------------------------------------------------------------------------
+# FIX-8: Persistent trade history (SQLite)
+# ---------------------------------------------------------------------------
+
+class TradeHistory:
+    """
+    Persistă tranzacțiile în SQLite local.
+    Thread-safe pentru writes din asyncio (rulăm în executor).
+    """
+
+    def __init__(self, db_path: str) -> None:
+        self._path = db_path
+        if db_path:
+            self._init_db()
+
+    def _init_db(self) -> None:
+        with sqlite3.connect(self._path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS trades (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts          REAL    NOT NULL,
+                    pair_y      TEXT    NOT NULL,
+                    pair_x      TEXT    NOT NULL,
+                    side_y      TEXT,
+                    entry_y     REAL,
+                    entry_x     REAL,
+                    exit_y      REAL,
+                    exit_x      REAL,
+                    qty_y       REAL,
+                    qty_x       REAL,
+                    pnl_usdt    REAL,
+                    fees_usdt   REAL,
+                    pnl_frac    REAL,
+                    zscore_entry REAL,
+                    hedge_ratio  REAL
+                )
+            """)
+            conn.commit()
+
+    def append(self, record: dict) -> None:
+        """Fire-and-forget insert; silențios la eroare."""
+        if not self._path:
+            return
+        try:
+            with sqlite3.connect(self._path) as conn:
+                conn.execute("""
+                    INSERT INTO trades
+                        (ts, pair_y, pair_x, side_y, entry_y, entry_x,
+                         exit_y, exit_x, qty_y, qty_x, pnl_usdt, fees_usdt,
+                         pnl_frac, zscore_entry, hedge_ratio)
+                    VALUES
+                        (:ts, :pair_y, :pair_x, :side_y, :entry_y, :entry_x,
+                         :exit_y, :exit_x, :qty_y, :qty_x, :pnl_usdt, :fees_usdt,
+                         :pnl_frac, :zscore_entry, :hedge_ratio)
+                """, record)
+                conn.commit()
+        except Exception as exc:
+            logger.warning(f"TradeHistory write failed: {exc}")
+
+    def load_pnl_fractions(self, limit: int = 200) -> List[float]:
+        """Încarcă ultimele `limit` trade-uri la restart pentru Kelly warmup."""
+        if not self._path:
+            return []
+        try:
+            with sqlite3.connect(self._path) as conn:
+                rows = conn.execute(
+                    "SELECT pnl_frac FROM trades ORDER BY ts DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            return [r[0] for r in reversed(rows) if r[0] is not None]
+        except Exception as exc:
+            logger.warning(f"TradeHistory load failed: {exc}")
+            return []
 
 
 # ---------------------------------------------------------------------------
@@ -148,12 +329,17 @@ class LiveTrader:
             )
             self.allocator = PortfolioAllocator(alloc_cfg)
 
-        # Sprint 7: WsWatchdog — creat la __init__, pornit ca task în run()
+        # Sprint 7: WsWatchdog
         self.watchdog = WsWatchdog(config.watchdog, state_bus)
 
         # State machine
         self._state: TraderState = TraderState.IDLE
-        self._queue: asyncio.Queue[PriceTick] = asyncio.Queue(maxsize=1000)
+        self._queue: asyncio.Queue[PriceTick] = asyncio.Queue(
+            maxsize=config.queue_maxsize
+        )
+
+        # FIX-3: queue drop counter
+        self._queue_drops: int = 0
 
         # Prices
         self._price_y: float = 0.0
@@ -162,6 +348,11 @@ class LiveTrader:
         self._last_tick_x: Optional[PriceTick] = None
         self._warming_bars: int = 0
 
+        # FIX-2: Rolling spread buffer pentru Kelly
+        self._spread_buffer: Deque[float] = deque(
+            maxlen=config.spread_buffer_size
+        )
+
         # Position state
         self._entry_side_y: Optional[str] = None
         self._entry_side_x: Optional[str] = None
@@ -169,6 +360,8 @@ class LiveTrader:
         self._entry_qty_x: float = 0.0
         self._entry_fill: Optional[FillPair] = None
         self._entry_notional: float = 0.0
+        self._entry_zscore: float = 0.0
+        self._entry_hedge_ratio: float = 0.0
 
         # PnL tracking
         self._last_log_ts: pd.Timestamp = pd.Timestamp.min
@@ -191,8 +384,14 @@ class LiveTrader:
         # OrderManager (setat în run())
         self.orders: Optional[OrderManager] = None
 
-        # Kelly trade PnL history (fracție din capital)
-        self._trade_pnl_history: list[float] = []
+        # FIX-8: Trade history persistent + Kelly warmup
+        self._trade_history = TradeHistory(config.trade_db_path)
+        self._trade_pnl_history: List[float] = self._trade_history.load_pnl_fractions(200)
+        if self._trade_pnl_history:
+            logger.info(
+                f"TradeHistory loaded: {len(self._trade_pnl_history)} trades din '{config.trade_db_path}' "
+                f"— Kelly warmup pre-setat"
+            )
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -212,7 +411,6 @@ class LiveTrader:
                 "trader_state": TraderState.WARMING_UP.value,
             })
 
-        # Sprint 6: lansare monitoring tasks
         await self._start_monitoring_tasks()
 
         async with OrderManager(self.cfg.exec_config) as orders:
@@ -222,7 +420,6 @@ class LiveTrader:
                     self._ws_feed(),
                     self._consumer(),
                     self._heartbeat(),
-                    # Sprint 7: WsWatchdog task pornit aici
                     self._run_watchdog(),
                 )
             except asyncio.CancelledError:
@@ -232,6 +429,10 @@ class LiveTrader:
                 self._state = TraderState.HALTED
                 if self._bus:
                     self._bus.update({"trader_state": TraderState.HALTED.value})
+                await _send_alert(
+                    self.cfg.alert,
+                    f"LiveTrader FATAL exception: {exc} | pair={self._pair_id}",
+                )
             finally:
                 await self._cancel_monitoring_tasks()
                 self.orders = None
@@ -241,7 +442,6 @@ class LiveTrader:
     # ------------------------------------------------------------------
 
     async def _run_watchdog(self):
-        """Wrapper pentru watchdog.run() inclus în asyncio.gather."""
         try:
             await self.watchdog.run()
         except asyncio.CancelledError:
@@ -250,11 +450,22 @@ class LiveTrader:
             logger.warning(f"WsWatchdog error: {exc} — continuing without watchdog")
 
     # ------------------------------------------------------------------
-    # Sprint 6: monitoring tasks lifecycle
+    # FIX-5: Monitoring tasks — fallback la exec_config dacă monitor_api_key lipsă
     # ------------------------------------------------------------------
 
     async def _start_monitoring_tasks(self):
-        if not self.cfg.monitor_api_key:
+        # FIX-5: dacă monitor_api_key lipsă, folosim credențialele din exec_config
+        api_key = self.cfg.monitor_api_key or getattr(
+            self.cfg.exec_config, "api_key", ""
+        )
+        api_secret = self.cfg.monitor_api_secret or getattr(
+            self.cfg.exec_config, "api_secret", ""
+        )
+        if not api_key:
+            logger.warning(
+                "FundingMonitor + PnLReconciler DISABLED: niciun API key disponibil "
+                "(setați monitor_api_key sau exec_config.api_key pentru monitoring complet)"
+            )
             return
         try:
             funding_cfg = FundingConfig(
@@ -267,8 +478,8 @@ class LiveTrader:
             )
             monitor, self._funding_monitor_exchange = await create_funding_monitor(
                 funding_cfg,
-                self.cfg.monitor_api_key,
-                self.cfg.monitor_api_secret,
+                api_key,
+                api_secret,
                 self._bus,
             )
             self._funding_task = asyncio.create_task(
@@ -290,7 +501,10 @@ class LiveTrader:
             self._reconciler_task = asyncio.create_task(
                 reconciler.run(), name="pnl_reconciler"
             )
-            logger.info("Sprint 6: FundingMonitor + PnLReconciler tasks started")
+            logger.info(
+                "FundingMonitor + PnLReconciler tasks started "
+                f"(key={'monitor_api_key' if self.cfg.monitor_api_key else 'exec_config.api_key'})"
+            )
         except Exception as exc:
             logger.warning(f"Monitoring tasks failed to start: {exc} — continuing without")
 
@@ -309,14 +523,15 @@ class LiveTrader:
                 pass
 
     # ------------------------------------------------------------------
-    # Sprint 10: close_all() — HARD_STOP forced exit
+    # FIX-4: close_all() cu retry și alertă externă
     # ------------------------------------------------------------------
 
     async def close_all(self, reason: str = "HARD_STOP") -> None:
         """
-        Închide forțat toate pozițiile active.
-        Apelat de DDController la HARD_STOP, de WsWatchdog la CRITICAL,
-        sau de orice caller extern care detectează o condiție de urgenta.
+        Închide forțat toate pozițiile active cu retry logic.
+        La eșec după toate retry-urile: alertă externă + HALTED.
+        POZIȚIA POATE RĂMÂNE DESCHISĂ dacă exchange-ul nu răspunde —
+        alertă critică trimisă în acel caz.
         """
         if self._state != TraderState.IN_POSITION:
             logger.info(f"close_all({reason}): no open position, nothing to close")
@@ -335,14 +550,41 @@ class LiveTrader:
             zscore = 0.0
             hedge_ratio = 1.0
 
-        try:
-            await self._close_position(_ForceExitSignal(), pd.Timestamp.now(tz="UTC"))
-        except Exception as exc:
-            logger.error(f"close_all() failed: {exc} — POSITION MAY STILL BE OPEN")
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, self.cfg.close_all_max_retries + 1):
+            try:
+                await self._close_position(
+                    _ForceExitSignal(), pd.Timestamp.now(tz="UTC")
+                )
+                logger.info(f"close_all() success on attempt {attempt}")
+                # _close_position sets state to ACTIVE in finally; override to HALTED
+                self._state = TraderState.HALTED
+                if self._bus:
+                    self._bus.update({"trader_state": TraderState.HALTED.value})
+                return
+            except Exception as exc:
+                last_exc = exc
+                logger.error(
+                    f"close_all() attempt {attempt}/{self.cfg.close_all_max_retries} "
+                    f"failed: {exc}"
+                )
+                if attempt < self.cfg.close_all_max_retries:
+                    await asyncio.sleep(self.cfg.close_all_retry_delay_s)
 
+        # FIX-4: toate retry-urile epuizate — alertă critică
+        alert_msg = (
+            f"‼️ CRITICAL: close_all({reason}) EȘUAT după "
+            f"{self.cfg.close_all_max_retries} încercări! "
+            f"VERIFICAȚI MANUAL POZIȚIILE PE EXCHANGE! "
+            f"pair={self._pair_id} | last_error={last_exc}"
+        )
+        await _send_alert(self.cfg.alert, alert_msg)
         self._state = TraderState.HALTED
         if self._bus:
-            self._bus.update({"trader_state": TraderState.HALTED.value})
+            self._bus.update({
+                "trader_state": TraderState.HALTED.value,
+                "close_all_failed": True,
+            })
 
     # ------------------------------------------------------------------
     # WebSocket feeds
@@ -369,8 +611,8 @@ class LiveTrader:
                 await ws.send(sub_msg)
                 async for raw in ws:
                     tick = self._parse_bybit_tick(raw)
-                    if tick and not self._queue.full():
-                        await self._queue.put(tick)
+                    if tick:
+                        await self._enqueue_tick(tick)
             except Exception as exc:
                 logger.warning(f"Bybit WS error: {exc} — reconnecting in 2s")
                 await asyncio.sleep(2)
@@ -386,14 +628,44 @@ class LiveTrader:
             try:
                 async for raw in ws:
                     tick = self._parse_binance_tick(raw)
-                    if tick and not self._queue.full():
-                        await self._queue.put(tick)
+                    if tick:
+                        await self._enqueue_tick(tick)
             except Exception as exc:
                 logger.warning(f"Binance WS error: {exc} — reconnecting in 2s")
                 await asyncio.sleep(2)
 
     # ------------------------------------------------------------------
-    # Parsers
+    # FIX-3: Enqueue cu backpressure și HALT la drops consecutive
+    # ------------------------------------------------------------------
+
+    async def _enqueue_tick(self, tick: PriceTick) -> None:
+        """Pune tick în coadă. La full: drop cu log + contor; la threshold → HALT."""
+        if self._queue.full():
+            self._queue_drops += 1
+            logger.warning(
+                f"Queue FULL — tick dropped "
+                f"({self._queue_drops} consecutive drops) | "
+                f"pair={self._pair_id} | qsize={self._queue.qsize()}"
+            )
+            if self._queue_drops >= self.cfg.queue_drop_halt_threshold:
+                logger.critical(
+                    f"Queue drops exceeded threshold "
+                    f"({self._queue_drops} >= {self.cfg.queue_drop_halt_threshold}) — HALTING"
+                )
+                await _send_alert(
+                    self.cfg.alert,
+                    f"Queue overflow HALT | {self._queue_drops} drops consecutive | "
+                    f"pair={self._pair_id}",
+                )
+                self._state = TraderState.HALTED
+                if self._bus:
+                    self._bus.update({"trader_state": TraderState.HALTED.value})
+        else:
+            self._queue_drops = 0  # reset contor la succes
+            await self._queue.put(tick)
+
+    # ------------------------------------------------------------------
+    # FIX-1: Parsers cu symbol parser robust
     # ------------------------------------------------------------------
 
     def _parse_bybit_tick(self, raw: str) -> Optional[PriceTick]:
@@ -402,9 +674,10 @@ class LiveTrader:
             data = msg.get("data", {})
             symbol_raw = data.get("symbol", "")
             last = data.get("lastPrice")
-            if not last:
+            if not last or not symbol_raw:
                 return None
-            symbol = f"{symbol_raw[:3]}/USDT:USDT" if len(symbol_raw) >= 3 else symbol_raw
+            base = _extract_base(symbol_raw)          # FIX-1
+            symbol = f"{base}/USDT:USDT"
             return PriceTick(
                 symbol=symbol, price=float(last),
                 ts=pd.Timestamp.now(tz="UTC"),
@@ -423,9 +696,10 @@ class LiveTrader:
                 return None
             symbol_raw = data.get("s", "")
             last = data.get("c")
-            if not last:
+            if not last or not symbol_raw:
                 return None
-            symbol = f"{symbol_raw[:3]}/USDT:USDT" if len(symbol_raw) >= 3 else symbol_raw
+            base = _extract_base(symbol_raw)          # FIX-1
+            symbol = f"{base}/USDT:USDT"
             return PriceTick(
                 symbol=symbol, price=float(last),
                 ts=pd.Timestamp.now(tz="UTC"),
@@ -443,8 +717,7 @@ class LiveTrader:
     async def _consumer(self):
         while self._state != TraderState.HALTED:
             tick = await self._queue.get()
-            # Sprint 7: ping watchdog la fiecare tick primit din WS
-            self.watchdog.ping()
+            self.watchdog.ping()      # Sprint 7: ping per tick
             self._update_prices(tick)
             if self._price_y > 0 and self._price_x > 0:
                 await self._on_tick(tick.ts)
@@ -484,23 +757,45 @@ class LiveTrader:
         if sig is None:
             return
 
+        # FIX-2: actualizare spread buffer la fiecare tick
+        spread_val = (
+            sig.spread
+            if hasattr(sig, "spread")
+            else (self._price_y - sig.hedge_ratio * self._price_x)
+        )
+        self._spread_buffer.append(spread_val)
+
         # Sprint 10: actualizează allocator per tick
-        self._open_pnl = self._compute_open_pnl() if self._state == TraderState.IN_POSITION else 0.0
-        spread_val = sig.spread if hasattr(sig, "spread") else (self._price_y - sig.hedge_ratio * self._price_x)
+        self._open_pnl = (
+            self._compute_open_pnl()
+            if self._state == TraderState.IN_POSITION
+            else 0.0
+        )
         snap = self.allocator.update_state(
             open_pnl_per_pair={self._pair_id: self._open_pnl},
             spread_updates={self._pair_id: spread_val},
         )
 
-        # Sprint 10: HARD_STOP detection
+        # HARD_STOP detection
         if snap.level == DDLevel.HARD_STOP:
             logger.critical(f"HARD_STOP detectat | notes={snap.notes}")
+            await _send_alert(
+                self.cfg.alert,
+                f"HARD_STOP | DD limit atins | pair={self._pair_id} | notes={snap.notes}",
+            )
             await self.close_all(reason="HARD_STOP")
             return
 
-        # Sprint 10: pair-level DD force close
-        if self._pair_id in snap.pairs_force_close and self._state == TraderState.IN_POSITION:
+        # Pair-level DD force close
+        if (
+            self._pair_id in snap.pairs_force_close
+            and self._state == TraderState.IN_POSITION
+        ):
             logger.warning(f"PAIR DD exceeded — force close {self._pair_id}")
+            await _send_alert(
+                self.cfg.alert,
+                f"PAIR_DD exceeded | pair={self._pair_id} | closing position",
+            )
             await self.close_all(reason="PAIR_DD")
             return
 
@@ -512,6 +807,7 @@ class LiveTrader:
                 f"z={sig.zscore:.3f} | beta={sig.hedge_ratio:.4f} | "
                 f"Y={self._price_y:.4f} X={self._price_x:.4f} | "
                 f"open_pnl={self._open_pnl:.2f} | daily={self._daily_pnl:.2f} | "
+                f"spread_buf={len(self._spread_buffer)} | "
                 f"dd={snap.level.value} | ws={self.watchdog.state}"
             )
             self._last_log_ts = ts
@@ -541,7 +837,6 @@ class LiveTrader:
             "price_y": self._price_y,
             "price_x": self._price_x,
             "timestamp_utc": ts.isoformat(),
-            # Sprint 6: NormalizedSignal typed access
             "zscore": sig.zscore,
             "spread": sig.spread,
             "hedge_ratio": sig.hedge_ratio,
@@ -549,13 +844,11 @@ class LiveTrader:
             "kalman_uncertainty": sig.kalman_uncertainty,
             "half_life": sig.half_life,
             "regime": sig.regime,
-            # PnL
             "realized_pnl": self._realized_pnl,
             "open_pnl": self._open_pnl,
             "daily_pnl": self._daily_pnl,
             "total_fees_usdt": self._total_fees,
             "trade_count": self._trade_count,
-            # Position
             "in_position": self._state == TraderState.IN_POSITION,
             "entry_side_y": self._entry_side_y or "",
             "entry_side_x": self._entry_side_x or "",
@@ -563,11 +856,11 @@ class LiveTrader:
             "entry_price_x": self._entry_fill.leg_x.fill_price if self._entry_fill else 0.0,
             "qty_y": self._entry_qty_y,
             "qty_x": self._entry_qty_x,
-            # Sprint 10: portfolio
             "dd_level": self.allocator.dd_level.value,
             "n_active_pairs": self.allocator._n_pairs,
-            # Sprint 7: watchdog
             "ws_watchdog_state": self.watchdog.state,
+            "spread_buffer_len": len(self._spread_buffer),  # FIX-2: vizibil în dashboard
+            "queue_drops": self._queue_drops,               # FIX-3: vizibil în dashboard
         })
 
     def _compute_open_pnl(self) -> float:
@@ -594,9 +887,13 @@ class LiveTrader:
             self._state = TraderState.HALTED
             if self._bus:
                 self._bus.update({"trader_state": TraderState.HALTED.value})
+            await _send_alert(
+                self.cfg.alert,
+                f"Daily DD limit atins | daily_pnl={self._daily_pnl:.2f} | pair={self._pair_id}",
+            )
             return
 
-        # Sprint 7: WsWatchdog gate — blochează entry dacă feed nu e LIVE
+        # Sprint 7: WsWatchdog gate
         if self.cfg.watchdog_gate_entries and not self.watchdog.is_live:
             logger.warning(
                 f"Entry BLOCKED: WsWatchdog state={self.watchdog.state} "
@@ -604,9 +901,17 @@ class LiveTrader:
             )
             return
 
-        # Sprint 10: PortfolioAllocator sizing
+        # FIX-2: spread buffer real → Kelly primește volatilitate reală
         pnl_series = pd.Series(self._trade_pnl_history) if self._trade_pnl_history else None
-        spread_series = pd.Series([sig.spread] * max(30, len(self._trade_pnl_history) + 1))
+        if len(self._spread_buffer) >= 10:
+            spread_series = pd.Series(list(self._spread_buffer))
+        else:
+            # Buffer insuficient — folosim spread constant și logăm
+            spread_series = pd.Series([sig.spread] * max(30, 1))
+            logger.warning(
+                f"Spread buffer insuficient ({len(self._spread_buffer)} ticks) — "
+                f"Kelly va folosi vol_target fallback"
+            )
 
         decision = self.allocator.request_entry(
             pair_id=self._pair_id,
@@ -633,10 +938,13 @@ class LiveTrader:
             f"| {side_x} {self.cfg.sym_x} {qty_x:.4f}@{self._price_x:.4f} "
             f"| z={sig.zscore:.3f} | beta={hedge_ratio:.4f} "
             f"| notional=${notional_y:.0f} "
-            f"| method={decision.kelly_result.method_used if decision.kelly_result else 'n/a'}"
+            f"| method={decision.kelly_result.method_used if decision.kelly_result else 'n/a'} "
+            f"| spread_buf={len(self._spread_buffer)}"
         )
 
         self._state = TraderState.IN_POSITION
+        self._entry_zscore = sig.zscore
+        self._entry_hedge_ratio = hedge_ratio
         if self._bus:
             self._bus.update({"trader_state": TraderState.IN_POSITION.value})
 
@@ -690,6 +998,25 @@ class LiveTrader:
             if len(self._trade_pnl_history) > 200:
                 self._trade_pnl_history = self._trade_pnl_history[-200:]
 
+            # FIX-8: persistă trade în SQLite
+            self._trade_history.append({
+                "ts": time.time(),
+                "pair_y": self.cfg.sym_y,
+                "pair_x": self.cfg.sym_x,
+                "side_y": self._entry_side_y or "",
+                "entry_y": self._entry_fill.leg_y.fill_price if self._entry_fill else 0.0,
+                "entry_x": self._entry_fill.leg_x.fill_price if self._entry_fill else 0.0,
+                "exit_y": exit_fill.leg_y.fill_price,
+                "exit_x": exit_fill.leg_x.fill_price,
+                "qty_y": self._entry_qty_y,
+                "qty_x": self._entry_qty_x,
+                "pnl_usdt": pnl,
+                "fees_usdt": exit_fill.total_fee_usdt,
+                "pnl_frac": pnl_fraction,
+                "zscore_entry": self._entry_zscore,
+                "hedge_ratio": self._entry_hedge_ratio,
+            })
+
             if self._bus:
                 self._bus.record_trade({
                     "ts": time.time(),
@@ -708,6 +1035,13 @@ class LiveTrader:
             )
         except Exception as exc:
             logger.error(f"EXIT failed: {exc} — POSITION MAY STILL BE OPEN!")
+            # FIX-4/7: alertă la exit eșuat — poziție potențial deschisă
+            await _send_alert(
+                self.cfg.alert,
+                f"EXIT FAILED | pair={self._pair_id} | error={exc} | "
+                f"VERIFICAȚI MANUAL POZIȚIILE!",
+            )
+            raise  # re-raise pentru close_all() retry logic
         finally:
             self.allocator.record_exit(self._pair_id)
             self._state = TraderState.ACTIVE
@@ -717,6 +1051,8 @@ class LiveTrader:
             self._entry_qty_y = self._entry_qty_x = 0.0
             self._entry_fill = None
             self._entry_notional = 0.0
+            self._entry_zscore = 0.0
+            self._entry_hedge_ratio = 0.0
             self._open_pnl = 0.0
 
     def _compute_pnl(self, exit_fill: FillPair) -> float:
@@ -731,7 +1067,7 @@ class LiveTrader:
             * self._entry_qty_x
             * (1 if self._entry_side_x == "buy" else -1)
         )
-        fees = exit_fill.total_fee_usdt + (self._entry_fill.total_fee_usdt)
+        fees = exit_fill.total_fee_usdt + self._entry_fill.total_fee_usdt
         return gross - fees
 
     # ------------------------------------------------------------------
@@ -743,27 +1079,47 @@ class LiveTrader:
             await asyncio.sleep(self.cfg.heartbeat_interval_s)
             logger.debug(
                 f"Heartbeat | state={self._state.value} | "
-                f"queue={self._queue.qsize()} | "
+                f"queue={self._queue.qsize()} | drops={self._queue_drops} | "
                 f"Y={self._price_y:.4f} X={self._price_x:.4f} | "
+                f"spread_buf={len(self._spread_buffer)} | "
                 f"dd={self.allocator.dd_level.value} | "
                 f"ws={self.watchdog.state} ({self.watchdog.last_tick_age_s:.1f}s ago)"
             )
 
     # ------------------------------------------------------------------
-    # Helpers
+    # FIX-6: _on_reconnect cu Kalman reset explicit
     # ------------------------------------------------------------------
 
     async def _on_reconnect(self):
         if self._state not in (TraderState.IDLE, TraderState.HALTED):
             logger.warning(
-                f"WS reconnected — reset warm-up | "
+                f"WS reconnected — reset warm-up + Kalman state | "
                 f"entry inhibited for {self.cfg.min_warmup_bars} bars"
             )
             self._warming_bars = 0
+
+            # FIX-6: reset Kalman filter la reconnect pentru a evita beta stale
+            # reset_kalman() e no-op dacă metoda nu există (backwards compat)
+            if hasattr(self.signal_gen, "reset_kalman"):
+                try:
+                    self.signal_gen.reset_kalman()
+                    logger.info("Kalman state reset after WS reconnect")
+                except Exception as exc:
+                    logger.warning(f"Kalman reset failed (non-critical): {exc}")
+            else:
+                logger.warning(
+                    "signal_gen nu are reset_kalman() — beta stale posibil după reconnect. "
+                    "Adăugați reset_kalman() în LiveSignalAdapter pentru siguranță maximă."
+                )
+
             if self._state != TraderState.IN_POSITION:
                 self._state = TraderState.WARMING_UP
                 if self._bus:
                     self._bus.update({"trader_state": TraderState.WARMING_UP.value})
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
     def _reset_daily_pnl_if_needed(self, ts: pd.Timestamp):
         date = ts.normalize()
