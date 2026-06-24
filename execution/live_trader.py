@@ -22,6 +22,9 @@ P1 fixes (înainte de capital semnificativ):
   FIX-6:  Kalman reset explicit la WS reconnect via signal_gen.reset_kalman()
   FIX-7:  Telegram / webhook alert async pe HARD_STOP, EXIT fail, HALT
   FIX-8:  Persistent trade history — SQLite append la fiecare trade (fișier local)
+  FIX-P1: spread_buffer threshold = min_warmup_bars (nu hardcodat 10)
+          Kelly vol estimate necesita cel puțin min_warmup_bars samples reale.
+          Pragul 10 producea Kelly oversizing la primul entry prin serie artificială.
 
 Flux de decizie la entry:
   1. WsWatchdog.is_live  → blocat dacă feed stale (Sprint 7)
@@ -696,13 +699,19 @@ class LiveTrader:
             )
             return
         pnl_series = pd.Series(self._trade_pnl_history) if self._trade_pnl_history else None
-        if len(self._spread_buffer) >= 10:
+
+        # FIX-P1: threshold = min_warmup_bars (configurabil) în loc de 10 hardcodat.
+        # Kelly vol estimate necesita cel puțin min_warmup_bars samples reale pentru
+        # a evita oversizing prin serie artificială plată ([spread] * 30).
+        if len(self._spread_buffer) >= self.cfg.min_warmup_bars:
             spread_series = pd.Series(list(self._spread_buffer))
         else:
-            spread_series = pd.Series([sig.spread] * max(30, 1))
+            spread_series = pd.Series([sig.spread] * max(self.cfg.min_warmup_bars, 1))
             logger.warning(
-                f"Spread buffer insuficient ({len(self._spread_buffer)} ticks) — Kelly va folosi vol_target fallback"
+                f"Spread buffer insuficient ({len(self._spread_buffer)}/{self.cfg.min_warmup_bars} ticks) "
+                f"— Kelly va folosi vol_target fallback"
             )
+
         decision = self.allocator.request_entry(
             pair_id=self._pair_id,
             candidate_spread=spread_series,
