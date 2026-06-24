@@ -14,9 +14,16 @@ Features:
 - Regime-aware: sărit bareme de cointegration în folds cu breakdown
 - Reproducibil: seed fix pentru orice rezultat
 
+Fixes aplicate:
+  FIX-BT-1 (P0): OOS z-score era normalizat pe statistici OOS (look-ahead bias).
+    Acum mean/std pentru z-score sunt fixate din IS tail (ultimele zscore_window bare
+    din IS) și folosite ca referință invariantă pe toată durata OOS fold-ului.
+    Kalman rulează online în OOS via update_one(), nu fit() — elimina orice leakage.
+  FIX-BT-2 (P1): bars_per_day era hardcodat la 24 (1h bars).
+    Acum BacktestConfig primește bar_freq_hours (default 1.0) și calculează
+    bars_per_day = 24 / bar_freq_hours corect pentru orice timeframe.
+
 Limite / Riscuri reale:
-- Kalman Filter nu are look-ahead bias în sine, DAR SpreadEngine.fit()
-  folosește întregul in-sample pentru warmup; purging rezolvă granitțele
 - Funding cost simulat simplist (constant per bar în holding period);
   în realitate e discontinuu la fiecare 8h
 - Slippage model linear — nu capturează impactul de preț la volume mari
@@ -46,7 +53,7 @@ class BacktestConfig:
     # Walk-forward
     n_splits: int = 5               # număr fold-uri IS/OOS
     train_ratio: float = 0.7        # fracție in-sample per fold
-    purge_bars: int = 10            # bare eliminate la granitța IS/OOS
+    purge_bars: int = 10            # bare eliminate la granița IS/OOS
     embargo_bars: int = 5           # bare adăugate după purge (anti-leakage)
 
     # Costs
@@ -62,11 +69,20 @@ class BacktestConfig:
     max_leverage: float = 3.0
     min_position_usd: float = 50.0  # sub acest nivel, nu se deschide poziție
 
+    # FIX-BT-2: bar frequency — drives bars_per_day and Sharpe annualization
+    # 1.0 = 1h bars (default), 0.25 = 15m bars, 4.0 = 4h bars, 24.0 = daily bars
+    bar_freq_hours: float = 1.0
+
     # Signal
     signal_cfg: Optional[SignalConfig] = None
 
     # Reproducibility
     seed: int = 42
+
+    @property
+    def bars_per_day(self) -> float:
+        """Number of bars in a 24h period, derived from bar_freq_hours."""
+        return 24.0 / self.bar_freq_hours
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +190,11 @@ class WalkForwardEngine:
             raise ValueError(
                 f"Dataset too short: {len(self.df)} bars. Minimum 200 required."
             )
+        if not (0.0 < self.cfg.bar_freq_hours <= 24.0):
+            raise ValueError(
+                f"bar_freq_hours must be in (0, 24], got {self.cfg.bar_freq_hours}. "
+                "Examples: 1.0=1h, 0.25=15m, 4.0=4h, 24.0=daily."
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -195,15 +216,10 @@ class WalkForwardEngine:
             )
 
             # --- In-Sample: fit Kalman, generate signals, record IS metrics ---
-            is_trades, is_metrics = self._run_fold(
-                fold_idx, is_idx, split="IS"
-            )
+            is_trades, is_metrics = self._run_is_fold(fold_idx, is_idx)
 
-            # --- Out-of-Sample: warm Kalman on IS, evaluate on OOS ---
-            oos_trades, oos_metrics = self._run_fold(
-                fold_idx, oos_idx, split="OOS",
-                warmup_idx=is_idx  # IS data pentru warmup Kalman
-            )
+            # --- Out-of-Sample: Kalman warm-started on IS, z-score anchored on IS stats ---
+            oos_trades, oos_metrics = self._run_oos_fold(fold_idx, is_idx, oos_idx)
 
             all_trades.extend(is_trades)
             all_trades.extend(oos_trades)
@@ -231,7 +247,7 @@ class WalkForwardEngine:
 
     def _build_splits(self) -> List[Tuple[np.ndarray, np.ndarray]]:
         """
-        Walk-forward splits cu purge + embargo la granitțe IS/OOS.
+        Walk-forward splits cu purge + embargo la granițe IS/OOS.
         """
         n = len(self.df)
         fold_size = n // self.cfg.n_splits
@@ -246,7 +262,7 @@ class WalkForwardEngine:
 
             is_idx = np.arange(start, train_end)
 
-            # Purge + embargo: elimină granita IS/OOS
+            # Purge + embargo: elimină granița IS/OOS
             oos_start = train_end + self.cfg.purge_bars + self.cfg.embargo_bars
             oos_idx = np.arange(oos_start, end)
 
@@ -257,69 +273,138 @@ class WalkForwardEngine:
             splits.append((is_idx, oos_idx))
 
         if not splits:
-            raise RuntimeError("Nu s-au putut construi fold-uri valide. Verifică n_splits și lungimea datelor.")
+            raise RuntimeError(
+                "Nu s-au putut construi fold-uri valide. Verifică n_splits și lungimea datelor."
+            )
 
         return splits
 
     # ------------------------------------------------------------------
-    # Fold Execution
+    # IS Fold
     # ------------------------------------------------------------------
 
-    def _run_fold(
+    def _run_is_fold(
         self,
         fold_idx: int,
-        idx: np.ndarray,
-        split: str,
-        warmup_idx: Optional[np.ndarray] = None,
+        is_idx: np.ndarray,
     ) -> Tuple[List[TradeRecord], PerformanceMetrics]:
-        """
-        Rulează un fold complet.
-        Dacă warmup_idx e furnizat, ruleză mai întâi Kalman pe warmup data
-        fără să genereze semnale (OOS fold warm-start).
-        """
+        """Run in-sample fold using standard batch fit."""
         spread_engine = self.factory()
         signal_gen = SignalGenerator(
             spread_engine,
             cfg=self.cfg.signal_cfg or SignalConfig(),
         )
+        fold_df = self.df.iloc[is_idx].copy().reset_index(drop=True)
 
-        fold_df = self.df.iloc[idx].copy().reset_index(drop=True)
-
-        # Warm-start Kalman pe IS data (pentru OOS fold)
-        if warmup_idx is not None:
-            warmup_df = self.df.iloc[warmup_idx].copy().reset_index(drop=True)
-            self._warmup_kalman(spread_engine, warmup_df)
-
-        # Fit spread pe fold data
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             spread_df = spread_engine.fit(fold_df["close_y"], fold_df["close_x"])
 
-        # Generate signals
         sig_df = signal_gen.generate_batch(spread_df)
         fold_df = pd.concat([fold_df.reset_index(drop=True), sig_df], axis=1)
-
-        # Simulate trades
-        trades = self._simulate_trades(fold_df, fold_idx, split)
-
-        # Compute metrics
-        metrics = self._compute_metrics(fold_idx, split, trades, len(fold_df))
-
+        trades = self._simulate_trades(fold_df, fold_idx, "IS")
+        metrics = self._compute_metrics(fold_idx, "IS", trades, len(fold_df))
         return trades, metrics
 
-    def _warmup_kalman(
-        self, spread_engine: SpreadEngine, warmup_df: pd.DataFrame
-    ) -> None:
-        """Run Kalman online updates on warmup data (no signal generation)."""
-        for _, row in warmup_df.iterrows():
-            try:
-                spread_engine.update_one(
-                    float(row["close_y"]),
-                    float(row["close_x"]),
-                    ts=row.get("timestamp"),
-                )
-            except Exception:  # noqa: BLE001
-                pass
+    # ------------------------------------------------------------------
+    # OOS Fold  — FIX-BT-1: no look-ahead bias
+    # ------------------------------------------------------------------
+
+    def _run_oos_fold(
+        self,
+        fold_idx: int,
+        is_idx: np.ndarray,
+        oos_idx: np.ndarray,
+    ) -> Tuple[List[TradeRecord], PerformanceMetrics]:
+        """
+        FIX-BT-1: OOS fold without z-score look-ahead bias.
+
+        Old approach (BUGGY): called spread_engine.fit() on OOS data, which
+        computed rolling mean/std using OOS observations — introducing forward-
+        looking information into the z-score normalization.
+
+        New approach (CORRECT):
+        1. Run Kalman in batch on IS to establish IS spread statistics.
+        2. Extract IS tail mean/std (last zscore_window bars) as fixed anchors.
+        3. In OOS, advance Kalman one bar at a time via update_one().
+        4. Z-score each OOS spread using the IS-anchored mean/std — no OOS
+           data is ever used to normalize itself.
+        """
+        spread_engine = self.factory()
+        zscore_window = spread_engine.zscore_window
+
+        # Step 1: Kalman batch on IS — establishes spread distribution
+        is_df = self.df.iloc[is_idx].copy().reset_index(drop=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            is_spread_df = spread_engine.fit(is_df["close_y"], is_df["close_x"])
+
+        # Step 2: Extract IS tail statistics (last zscore_window bars)
+        is_tail = is_spread_df["spread"].iloc[-zscore_window:].dropna()
+        if len(is_tail) < 5:
+            logger.warning(
+                f"Fold {fold_idx} OOS: IS tail too short ({len(is_tail)} bars) "
+                "for anchored z-score — using global IS mean/std."
+            )
+            is_tail = is_spread_df["spread"].dropna()
+
+        anchor_mean = float(is_tail.mean())
+        anchor_std = float(is_tail.std())
+        if anchor_std < 1e-10:
+            anchor_std = 1.0  # degenerate spread — will produce z~0, no trades
+
+        logger.info(
+            f"Fold {fold_idx} OOS anchor: mean={anchor_mean:.6f} std={anchor_std:.6f} "
+            f"(from {len(is_tail)} IS-tail bars)"
+        )
+
+        # Step 3: Advance Kalman online through OOS, z-score with IS anchors
+        oos_df = self.df.iloc[oos_idx].copy().reset_index(drop=True)
+        rows = []
+        for i, (_, row) in enumerate(oos_df.iterrows()):
+            cy = float(row["close_y"])
+            cx = float(row["close_x"])
+            ts = row.get("timestamp", None)
+
+            # online Kalman step (no future data touches state)
+            live_state = spread_engine.update_one(cy, cx, ts=ts)
+
+            # z-score anchored on IS statistics
+            zscore = (live_state["spread"] - anchor_mean) / anchor_std
+
+            rows.append({
+                "close_y":          cy,
+                "close_x":          cx,
+                "timestamp":        ts,
+                "beta":             live_state["beta"],
+                "alpha":            live_state["alpha"],
+                "spread":           live_state["spread"],
+                "spread_mean":      anchor_mean,
+                "spread_std":       anchor_std,
+                "zscore":           zscore,
+                "half_life_hours":  live_state.get("half_life_hours"),
+                "P_beta":           live_state["P_beta"],
+                "kalman_gain":      live_state["kalman_gain"],
+                "uncertainty":      live_state["uncertainty"],
+                "is_warm":          live_state["is_warm"],
+            })
+
+        oos_spread_df = pd.DataFrame(rows)
+
+        # Step 4: Generate signals on OOS spread (already normalized)
+        signal_gen = SignalGenerator(
+            spread_engine,
+            cfg=self.cfg.signal_cfg or SignalConfig(),
+        )
+        sig_df = signal_gen.generate_batch(oos_spread_df)
+        fold_df = pd.concat(
+            [oos_spread_df.reset_index(drop=True), sig_df.reset_index(drop=True)],
+            axis=1,
+        )
+
+        trades = self._simulate_trades(fold_df, fold_idx, "OOS")
+        metrics = self._compute_metrics(fold_idx, "OOS", trades, len(fold_df))
+        return trades, metrics
 
     # ------------------------------------------------------------------
     # Trade Simulation
@@ -337,7 +422,6 @@ class WalkForwardEngine:
         """
         trades: List[TradeRecord] = []
         in_trade = False
-        entry_bar = 0
         entry_data: Dict = {}
         capital = self.cfg.capital_usd
 
@@ -414,18 +498,16 @@ class WalkForwardEngine:
         Volatilitate-țintă + Kelly fracțional.
         Returnează (qty_y, qty_x).
         """
-        # Volatilitate spread din ultimele 30 bare
         start = max(0, bar - 30)
         spreads = df["spread"].iloc[start:bar].dropna() if "spread" in df.columns else pd.Series()
         if len(spreads) < 5:
-            spread_vol = price_y * 0.02  # fallback: 2% din prețul Y
+            spread_vol = price_y * 0.02
         else:
             spread_vol = float(spreads.std())
 
         if spread_vol < 1e-8:
             spread_vol = price_y * 0.02
 
-        # Vol target sizing
         target_notional = capital * self.cfg.vol_target / max(spread_vol / price_y, 1e-6)
         target_notional = min(target_notional, capital * self.cfg.max_leverage)
         target_notional *= self.cfg.kelly_fraction
@@ -455,29 +537,23 @@ class WalkForwardEngine:
 
         # Gross P&L
         if sig == Signal.LONG_SPREAD:
-            # Long Y / Short X
             pnl_y = (exit_price_y - entry["price_y"]) * qty_y
             pnl_x = (entry["price_x"] - exit_price_x) * qty_x
         else:
-            # Short Y / Long X
             pnl_y = (entry["price_y"] - exit_price_y) * qty_y
             pnl_x = (exit_price_x - entry["price_x"]) * qty_x
         gross_pnl = pnl_y + pnl_x
 
-        # Fees: taker at entry + exit pe ambele legs
         notional_y = qty_y * entry["price_y"]
         notional_x = qty_x * entry["price_x"]
-        fee_rate = self.cfg.fee_taker  # worst case: taker la entry + exit
-        fees = (notional_y + notional_x) * fee_rate * 2  # entry + exit
+        fee_rate = self.cfg.fee_taker
+        fees = (notional_y + notional_x) * fee_rate * 2
 
-        # Slippage: bps per side, 4 leg-crossings total (2 legs x 2 entry+exit)
         slippage_rate = self.cfg.slippage_bps / 10_000
         slippage = (notional_y + notional_x) * slippage_rate * 2
 
-        # Funding cost: simulat ca procent anual aplicat pro-rata pe bars_held
-        # Presupunem 24 bare/zi (1h bars). Ajustează dacă folosim alt timeframe.
-        bars_per_day = 24
-        holding_days = bars_held / bars_per_day
+        # FIX-BT-2: use configurable bars_per_day instead of hardcoded 24
+        holding_days = bars_held / self.cfg.bars_per_day
         funding_cost = (
             (notional_y + notional_x)
             * self.cfg.funding_rate_annual
@@ -538,23 +614,19 @@ class WalkForwardEngine:
         m.total_fees = float(sum(t.fees for t in trades))
         m.total_funding_cost = float(sum(t.funding_cost for t in trades))
 
-        # Profit Factor
         gross_profit = float(np.sum(pnls[pnls > 0])) if np.any(pnls > 0) else 0.0
         gross_loss = abs(float(np.sum(pnls[pnls < 0]))) if np.any(pnls < 0) else 1e-9
         m.profit_factor = gross_profit / gross_loss
 
-        # Daily P&L series (aggregate by day for ratio calculations)
-        # Folosim index bars ca proxy pentru timp (1 bar = 1h implicit)
-        bars_per_day = 24
+        # FIX-BT-2: bars_per_day from config (not hardcoded 24)
+        bars_per_day = self.cfg.bars_per_day
         total_days = max(n_bars / bars_per_day, 1)
 
-        # Build daily P&L array
         daily_pnl = np.zeros(int(total_days) + 1)
         for t in trades:
             day_idx = min(int(t.exit_bar / bars_per_day), len(daily_pnl) - 1)
             daily_pnl[day_idx] += t.net_pnl
 
-        # Sharpe (daily, annualized)
         daily_mean = np.mean(daily_pnl)
         daily_std = np.std(daily_pnl, ddof=1)
         if daily_std > 1e-9:
@@ -562,13 +634,11 @@ class WalkForwardEngine:
         m.ann_return = float(daily_mean * 252)
         m.ann_volatility = float(daily_std * np.sqrt(252))
 
-        # Sortino (downside deviation)
         downside = daily_pnl[daily_pnl < 0]
         downside_std = np.std(downside, ddof=1) if len(downside) > 1 else 1e-9
         if downside_std > 1e-9:
             m.sortino = float(daily_mean / downside_std * np.sqrt(252))
 
-        # Max Drawdown
         equity = np.cumsum(daily_pnl) + self.cfg.capital_usd
         peak = np.maximum.accumulate(equity)
         dd = equity - peak
@@ -576,11 +646,9 @@ class WalkForwardEngine:
         peak_nonzero = np.where(peak > 0, peak, 1.0)
         m.max_drawdown_pct = float(np.min(dd / peak_nonzero) * 100)
 
-        # Calmar
         if abs(m.max_drawdown) > 1e-9:
             m.calmar = float(m.ann_return / abs(m.max_drawdown))
 
-        # Omega Ratio (threshold = 0)
         returns_above = np.sum(daily_pnl[daily_pnl > 0])
         returns_below = abs(np.sum(daily_pnl[daily_pnl < 0]))
         if returns_below > 1e-9:
@@ -604,13 +672,11 @@ class BacktestResults:
         return [t for t in self.trades if t.split == "OOS"]
 
     def to_dataframe(self) -> pd.DataFrame:
-        """Converts all trades to DataFrame pentru analiză suplimentară."""
         if not self.trades:
             return pd.DataFrame()
         return pd.DataFrame([t.__dict__ for t in self.trades])
 
     def print_report(self) -> None:
-        """Print summary report."""
         print("\n" + "=" * 70)
         print("QUANTLUNA — BACKTEST REPORT")
         print("=" * 70)
@@ -620,7 +686,6 @@ class BacktestResults:
         print(f"AGGREGATE OOS: {self.oos_metrics.summary()}")
         print("=" * 70)
 
-        # Cost breakdown
         total_fees = sum(t.fees for t in self.trades if t.split == "OOS")
         total_slippage = sum(t.slippage for t in self.trades if t.split == "OOS")
         total_funding = sum(t.funding_cost for t in self.trades if t.split == "OOS")
@@ -633,4 +698,5 @@ class BacktestResults:
         print(f"  Slippage:     ${total_slippage:>10.2f}  ({total_slippage/max(abs(total_gross),1)*100:.1f}% of gross)")
         print(f"  Funding cost: ${total_funding:>10.2f}  ({total_funding/max(abs(total_gross),1)*100:.1f}% of gross)")
         print(f"  Net P&L:      ${total_net:>10.2f}")
+        print(f"  bar_freq_hours={self.config.bar_freq_hours} (bars_per_day={self.config.bars_per_day:.1f})")
         print("=" * 70)
