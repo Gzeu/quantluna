@@ -1,119 +1,152 @@
 """
-QuantLuna — Shared pytest fixtures.
+tests/conftest.py  —  QuantLuna Test Fixtures
 
-All test modules import fixtures from here via automatic conftest discovery.
-Design principle: fixtures use realistic log-price crypto scales.
+Shared fixtures pentru toate testele:
+  - Synthetic OHLCV data (cointegrated pair)
+  - Mock CCXT exchange
+  - Mock WebSocket feed
+  - KalmanHedgeRatio instance
+  - Sample trade list
 """
 from __future__ import annotations
+
+import asyncio
+from collections import deque
+from datetime import datetime, timezone, timedelta
+from typing import AsyncGenerator, List
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import numpy as np
 import pandas as pd
 import pytest
 
-from config.settings import SignalConfig, RiskConfig, QuantLunaConfig
-from core.kalman_filter import KalmanHedgeRatio
-from core.spread import SpreadEngine
 
-# ── Seeded RNG ─────────────────────────────────────────────────────────────────
-RNG = np.random.default_rng(0xC0FFEE)
-
-
-# ── Data generators ────────────────────────────────────────────────────────────
-
-def _log_price_pair(
-    n: int = 1000,
-    beta: float = 0.85,
-    alpha: float = 0.0,
-    rho: float = 0.95,
-    noise_std: float = 0.08,
-    freq: str = "1h",
-) -> tuple[pd.Series, pd.Series]:
-    """
-    Cointegrated log-price pair.
-    x  = log(60_000) + cumsum(N(0, 0.002))    <- BTC-like
-    spread follows AR(1) with coefficient rho
-    y  = beta*x + alpha + spread
-    Theoretical HL = -log(2)/log(rho) bars.
-    """
-    x_vals = np.log(60_000) + np.cumsum(RNG.standard_normal(n) * 0.002)
-    spread = [0.0]
-    for _ in range(n - 1):
-        spread.append(rho * spread[-1] + RNG.standard_normal() * noise_std)
-    spread = np.array(spread)
-    y_vals = beta * x_vals + alpha + spread
-    ts = pd.date_range("2024-01-01", periods=n, freq=freq)
-    return pd.Series(y_vals, index=ts, name="Y"), pd.Series(x_vals, index=ts, name="X")
-
-
-def _random_walk_pair(n: int = 600) -> tuple[pd.Series, pd.Series]:
-    """Two independent random walks — NOT cointegrated."""
-    x = np.cumsum(RNG.standard_normal(n))
-    y = np.cumsum(RNG.standard_normal(n))
-    ts = pd.date_range("2024-01-01", periods=n, freq="1h")
-    return pd.Series(y, index=ts), pd.Series(x, index=ts)
-
-
-# ── Fixtures ───────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Synthetic cointegrated price series
+# ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
-def log_pair() -> tuple[pd.Series, pd.Series]:
-    """Cointegrated log-price pair, 1000 bars, 1h."""
-    return _log_price_pair(n=1000)
+def rng() -> np.random.Generator:
+    return np.random.default_rng(seed=42)
 
 
 @pytest.fixture(scope="session")
-def random_pair() -> tuple[pd.Series, pd.Series]:
-    """Non-cointegrated random walk pair."""
-    return _random_walk_pair(n=600)
+def synthetic_prices(rng) -> tuple[pd.Series, pd.Series]:
+    """Returns (y, x) cointegrated price series, 500 bars, 1h freq."""
+    n = 500
+    idx = pd.date_range("2025-01-01", periods=n, freq="1h", tz="UTC")
+
+    # x = random walk
+    x = 100.0 + np.cumsum(rng.normal(0, 0.5, n))
+    # y = 1.5 * x + 20 + noise (cointegrated)
+    y = 1.5 * x + 20.0 + rng.normal(0, 1.5, n)
+
+    return pd.Series(y, index=idx, name="Y"), pd.Series(x, index=idx, name="X")
 
 
 @pytest.fixture(scope="session")
-def signal_cfg() -> SignalConfig:
-    return SignalConfig(
-        zscore_entry=2.0,
-        zscore_exit=0.5,
-        zscore_stop=3.5,
-    )
+def synthetic_ohlcv(synthetic_prices) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Returns (ohlcv_y, ohlcv_x) DataFrames from synthetic prices."""
+    def _to_ohlcv(prices: pd.Series) -> pd.DataFrame:
+        rng2 = np.random.default_rng(seed=99)
+        df = pd.DataFrame(index=prices.index)
+        df["close"] = prices.values
+        df["open"] = prices.values * (1 + rng2.normal(0, 0.001, len(prices)))
+        df["high"] = df[["open", "close"]].max(axis=1) * (1 + abs(rng2.normal(0, 0.001, len(prices))))
+        df["low"] = df[["open", "close"]].min(axis=1) * (1 - abs(rng2.normal(0, 0.001, len(prices))))
+        df["volume"] = rng2.uniform(100, 1000, len(prices))
+        return df
+
+    y_ser, x_ser = synthetic_prices
+    return _to_ohlcv(y_ser), _to_ohlcv(x_ser)
 
 
-@pytest.fixture(scope="session")
-def risk_cfg() -> RiskConfig:
-    return RiskConfig(
-        max_capital_usdt=10_000,
-        max_leverage=3.0,
-        risk_per_trade=0.01,
-        vol_target_annual=0.20,
-        kelly_fraction=0.25,
-        max_position_pct=0.20,
-    )
+# ---------------------------------------------------------------------------
+# KalmanHedgeRatio
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def kalman():
+    from core.kalman_filter import KalmanHedgeRatio
+    return KalmanHedgeRatio(delta=1e-4, observation_noise=1e-2, warm_up=10)
 
 
 @pytest.fixture
-def warm_kalman() -> KalmanHedgeRatio:
-    """KalmanHedgeRatio already past warm-up (50 bars fed)."""
-    y, x = _log_price_pair(n=200)
-    kf = KalmanHedgeRatio(delta=1e-4, observation_noise=1e-3, warm_up=30)
-    for yi, xi in zip(y.values, x.values):
-        kf.update(float(yi), float(xi))
-    return kf
+def fitted_kalman(kalman, synthetic_prices):
+    y, x = synthetic_prices
+    df = kalman.fit(y, x)
+    return kalman, df
+
+
+# ---------------------------------------------------------------------------
+# Sample trades
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def sample_trades():
+    """List of mock trade objects with pnl_net and fees."""
+    trades = []
+    for i in range(20):
+        t = MagicMock()
+        t.pnl_net = (1 if i % 3 != 0 else -1) * float(np.random.default_rng(i).uniform(10, 80))
+        t.fees = float(np.random.default_rng(i + 100).uniform(0.5, 2.0))
+        t.funding_paid = float(np.random.default_rng(i + 200).uniform(0, 0.5))
+        trades.append(t)
+    return trades
+
+
+# ---------------------------------------------------------------------------
+# Mock CCXT exchange
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def mock_ccxt_exchange():
+    """Mock CCXT exchange with common methods patched."""
+    ex = MagicMock()
+    ex.__version__ = "4.0.0"
+
+    # load_markets returns realistic subset
+    ex.load_markets.return_value = {
+        "BTC/USDT:USDT": {"symbol": "BTC/USDT:USDT", "active": True},
+        "ETH/USDT:USDT": {"symbol": "ETH/USDT:USDT", "active": True},
+    }
+
+    # fetch_ohlcv returns 10 bars then empty (simulates pagination end)
+    ts_base = int(datetime(2025, 1, 1, tzinfo=timezone.utc).timestamp() * 1000)
+    bars = [[ts_base + i * 3_600_000, 100.0 + i, 101.0 + i, 99.0 + i, 100.5 + i, 500.0] for i in range(10)]
+    ex.fetch_ohlcv.side_effect = [bars, []]  # first call returns data, second empty
+
+    # fetch_balance
+    ex.fetch_balance.return_value = {"USDT": {"free": 5000.0, "total": 5000.0}}
+
+    # create_order
+    ex.create_order.return_value = {"id": "order_123", "status": "filled", "average": 100.5}
+
+    return ex
+
+
+# ---------------------------------------------------------------------------
+# Mock WebSocket
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def mock_websocket():
+    ws = AsyncMock()
+    ws.recv = AsyncMock(return_value='{"topic":"tickers","data":{"lastPrice":"100.5"}}')
+    ws.send = AsyncMock()
+    ws.close = AsyncMock()
+    return ws
+
+
+# ---------------------------------------------------------------------------
+# Temporary SQLite DB path
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def tmp_db(tmp_path):
+    return str(tmp_path / "test_trades.db")
 
 
 @pytest.fixture
-def fitted_spread_df(log_pair) -> pd.DataFrame:
-    """SpreadEngine.fit() output on the 1000-bar log pair."""
-    y, x = log_pair
-    kf = KalmanHedgeRatio(delta=1e-4, observation_noise=1e-3, warm_up=30)
-    engine = SpreadEngine(kf, zscore_window=100, min_warm_periods=30)
-    return engine.fit(y, x)
-
-
-@pytest.fixture
-def spread_series(fitted_spread_df) -> pd.Series:
-    """Spread (innovation) series from fitted engine."""
-    return fitted_spread_df["spread"]
-
-
-@pytest.fixture
-def zscore_series(fitted_spread_df) -> pd.Series:
-    """Z-score series from fitted engine."""
-    return fitted_spread_df["zscore"]
+def tmp_cache_dir(tmp_path):
+    return str(tmp_path / "cache")
