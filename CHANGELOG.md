@@ -1,5 +1,114 @@
 # QuantLuna — Changelog
 
+## Sprint 12 — 2026-07-01
+
+### Added
+
+**`strategy/optimizer.py` — Optuna Hyperparameter Optimizer**
+
+- `QuantLunaOptimizer` cu TPE sampler (Tree-structured Parzen Estimator)
+- `SearchSpace` dataclass — bounds configurabile pentru toți parametrii
+- `OptimizerConfig` — n_trials, n_jobs, objective, train_ratio, seed, storage, pruning
+- `OptimizationResult` — best params + metrici train + out-of-sample (Sharpe, Sortino, Calmar, win rate, max DD, profit factor)
+- Walk-forward aware: split strict 70/30 fără leakage
+- MedianPruner — taie trial-uri slabe devreme
+- Obiective suportate: `sharpe`, `sortino`, `calmar`, `profit_factor`
+- Parametrii optimizați: `delta`, `R`, `zscore_entry`, `zscore_exit`, `kelly_fraction`, `vol_target`, `half_life_min_h`, `half_life_max_h`, `min_warmup_bars`
+- Constraints automate: `zscore_exit < zscore_entry`, `half_life_min < half_life_max`
+- Optuna SQLite storage — resume study după întrerupere
+- `result.save_json()` + `result.print_summary()`
+
+**`data/market_data_cache.py` — Local Parquet Cache**
+
+- `MarketDataCache` — download OHLCV via CCXT + cache local Parquet (Apache Arrow, snappy)
+- `load()` — load din cache sau download dacă lipsă/stale
+- `refresh()` — incremental merge (descarcă doar barele noi de la ultima bară cached)
+- `exists()`, `info()`, `list_cached()`, `clear()`
+- Cache dir: `~/.quantluna/cache/<exchange>/<symbol>/<timeframe>.parquet`
+- Stale detection configurabilă (default: 4h)
+- Deduplicare automată și sortare cronologică
+- Pagination automată la CCXT (descarcă tot istoricul cu limit=1000 per request)
+
+**`execution/rate_limiter.py` — Async Token Bucket Rate Limiter**
+
+- `RateLimiter` cu bucket-uri separate per endpoint type: `order`, `query`, `market`
+- Limite default per exchange: Bybit (10/20/50 rps), Binance (10/20/20 rps)
+- `burst_factor` configurabil — permite burst scurt
+- Warning log la wait > `warn_wait_s`
+- `acquire()`, `acquire_order()`, `acquire_market()`, `acquire_query()` shortcuts
+
+**`execution/health_check.py` — Pre-flight Health Check**
+
+- `HealthCheck` cu 7 checks: ccxt import, API credentials, exchange connectivity, symbols tradeable, account balance, config constraints, cache freshness
+- `HealthReport` cu `all_passed`, `critical_failures`, `print_report()` Rich table
+- `critical=False` pentru checks non-blocante (balance, cache)
+- `CheckResult` per check cu pass/fail/message/critical
+
+**`scripts/optimize_params.py` — CLI Optimizer Runner**
+
+- Full CLI cu argparse: pair, exchange, timeframe, days, trials, jobs, objective, train-ratio, seed, storage, output
+- Auto-load din MarketDataCache
+- Index alignment automat pe barele comune
+- Print LiveConfig patch după optimizare
+
+**`scripts/run_paper.py` — CLI Paper Trading Dedicated Runner**
+
+- CLI cu argparse: pair, exchange, capital, slippage, latency, warmup, zscore params
+- `--params best_params.json` — încarcă automat parametrii din optimizer
+- `--health-check` flag — rulează HealthCheck înainte de start
+- Telegram integration din CLI flags
+- Summary la oprire (Ctrl+C)
+
+**`.github/workflows/ci.yml` — GitHub Actions CI**
+
+- Test suite pe Python 3.10, 3.11, 3.12 (matrix)
+- Coverage upload la Codecov (Python 3.11)
+- Ruff lint check
+- TruffleHog secret scan pe fiecare push/PR
+
+**`Dockerfile` + `docker-compose.yml` — Containerizare**
+
+- Multi-stage build (builder + runtime)
+- Non-root user pentru securitate
+- 4 services: `paper`, `live` (profile), `optimize` (profile), `dashboard`
+- Volume persistent pentru data și cache
+- Live service cu `restart: "no"` — restart manual intentionat pentru siguranță
+
+---
+
+## Sprint 11 — 2026-07-01
+
+### Added
+
+**`notifications/telegram_notifier.py`**
+
+- `TelegramNotifier` — async, non-blocking, fail-safe
+- `send_trade_entry()`, `send_trade_exit()`, `send_halt()`, `send_daily_summary()`
+- `send_watchdog_alert()`, `send_queue_overflow()`, `send_custom()`
+- Rate limiting (1 msg/s), retry exponential backoff (3x)
+- `NotifierConfig` cu filtre granulare per tip de alert
+- `AlertLevel` enum cu emoji per severitate
+
+**`execution/paper_trader.py`**
+
+- `PaperTrader` — drop-in replacement pentru LiveTrader
+- WebSocket feed real (Bybit + Binance), fills simulate
+- Slippage model: `ask + slippage_pct/2 * mid` pentru buy, invers pentru sell
+- Fee model per exchange: Bybit taker 0.055%, Binance taker 0.04%
+- Latency simulation (asyncio.sleep)
+- Același PortfolioAllocator pipeline ca LiveTrader
+- SQLite persistence (`paper_trades.db`)
+- `summary()` dict, `send_daily_summary()` via Telegram
+
+**`CONTRIBUTING.md`**
+
+- Getting started, project structure table, development workflow
+- Code standards: PEP 8, type hints, async, logging levels, error handling
+- Testing requirements: mock APIs, no leakage, pytest-asyncio
+- Commit message format + PR checklist
+
+---
+
 ## fix(integration) — 2026-06-24
 
 ### Fixed — Integration Commit (Sprint 4-10 Consolidation)
@@ -7,44 +116,16 @@
 **`execution/live_trader.py` — rescris complet**
 
 - `PortfolioRisk.record_trade()` lipsea — adăugat în `risk/portfolio_risk.py`
-- `PortfolioAllocator` Sprint 10 neintegrat — integrat complet:
-  - `__init__` acceptă `allocator: Optional[PortfolioAllocator]`; creat intern dacă lipsă
-  - `_open_position()`: sizing via `allocator.request_entry()` + Kelly `notional_usd`;
-    eliminat sizing manual hardcodat
-  - Per tick: `allocator.update_state()` — correlation matrix + DD update
-  - La exit: `allocator.record_exit()` în `finally` block
+- `PortfolioAllocator` Sprint 10 neintegrat — integrat complet
 - `close_all(reason)` — metodă async nouă pentru HARD_STOP / PAIR_DD / urgenta externă
-- Sprint 6 patch (`live_trader_sprint6_patch.py`) aplicat direct în cod:
-  - `FundingMonitor` + `PnLReconciler` tasks pornite în `run()`
-  - `LiveSignalAdapter` wrap automat pentru `SignalGenerator` raw
-  - Acces direct pe `NormalizedSignal` (eliminat `getattr` fragil)
-  - `LiveConfig` câmpuri Sprint 6 (`monitor_api_key`, `funding_poll_interval_s` etc.)
+- Sprint 6 patch (`live_trader_sprint6_patch.py`) aplicat direct în cod
 - `live_trader_sprint6_patch.py` — marcat deprecat cu `ImportError` explicit
 
 **`execution/live_trader.py` — WsWatchdog integrat (Sprint 7)**
 
-- `WsWatchdog` importat și creat în `__init__` (`self.watchdog`)
-- `watchdog.ping()` apelat în `_consumer()` la fiecare tick din WS
-- `_run_watchdog()` pornit ca task în `asyncio.gather()` alături de `_ws_feed`, `_consumer`, `_heartbeat`
+- `WsWatchdog` importat și creat în `__init__`
+- `watchdog.ping()` apelat în `_consumer()` la fiecare tick
 - Gate entry: `watchdog_gate_entries=True` blochează `_open_position()` când `watchdog.state != LIVE`
-- `LiveConfig.watchdog: WatchdogConfig` — câmp nou configurable
-- `is_trading_allowed` include `watchdog.is_live` în condiție
-- Heartbeat log include `ws=watchdog.state` + `last_tick_age_s`
-
-**`tests/test_live_trader.py` — fișier nou**
-
-- 9 clase de test, 25+ cazuri acoperind:
-  - Construcție și injectare allocator/watchdog
-  - `close_all()`: no-op, path normal, eșec order (HALTED indiferent)
-  - Entry: blocare DD zilnic, blocare watchdog STALE, blocare allocator,
-    sizing corect din Kelly `notional_usd`, revert la eșec order
-  - Exit: calcul PnL, `record_exit()` apelat, `trade_pnl_history`, cleanup state,
-    `record_exit()` apelat și la eșec order (finally block)
-  - HARD_STOP și PAIR_DD path în `_on_tick`
-  - `watchdog.ping()` apelat per tick
-  - `_compute_pnl()` long/short/no-entry-fill
-  - Daily PnL reset
-  - `is_trading_allowed` property
 
 ---
 
@@ -52,117 +133,17 @@
 
 ### Added
 
-**`risk/` — pachet extins cu 4 module noi**
-
-- `risk/correlation_matrix.py` — `SpreadCorrelationMatrix`
-  - Buffer rolling per pair (default 120 bare)
-  - `check_new_pair()` — blocare candidat dacă |corr| > threshold cu oricare activ
-  - `diversification_discount()` — factor [0,1] pentru penalizare Kelly
-  - `get_correlation_matrix()` — DataFrame complet, cu Ledoit-Wolf shrinkage opțional
-  - Ledoit-Wolf via scikit-learn (dezactivabil dacă sklearn nu e instalat)
-
+- `risk/correlation_matrix.py` — `SpreadCorrelationMatrix` cu Ledoit-Wolf shrinkage
 - `risk/kelly.py` — `KellyCrossPair` + `KellyConfig` + `KellyResult`
-  - Kelly continuu Thorp: f* = E[R] / E[R²]
-  - Fractional Kelly configurable (default 0.25)
-  - Vol target sizing ca fallback (< 20 trades sau E[R] <= 0)
-  - Correlation discount din `SpreadCorrelationMatrix`
-  - Portfolio cap: min(kelly_adj, vol_target, max_pair_cap, spațiu_rămas)
-
-- `risk/drawdown_controller.py` — `DrawdownController` + `DDConfig` + `DDSnapshot`
-  - NORMAL → SOFT_LIMIT (8% DD) → HARD_STOP (15% DD)
-  - Pair-level force close la 5% pair DD
-  - HWM tracking (high-water mark, nu capital inițial)
-  - `manual_resume()` cu reset HWM opțional — re-activare explicită
-
-- `risk/multi_pair_allocator.py` — `PortfolioAllocator` + `AllocatorConfig` + `AllocationDecision`
-  - Orchestrator cu 5 gates secvențiale per entry request:
-    1. DD level check
-    2. Max concurrent pairs check
-    3. Correlation check
-    4. Kelly sizing cu discount
-    5. PortfolioRisk exposure check
-  - `update_state()` — per-tick: correlation matrix + DD controller + PnL sync
-  - `record_exit()` — curăță toate structurile la exit
-  - `manual_resume()` — re-activare după HARD_STOP
-  - `portfolio_summary()` — snapshot complet incluzând correlation matrix
-
-- `risk/__init__.py` — updatat cu toate exports Sprint 10
-
-### Architecture Sprint 10
-
-Pipeline complet:
-```
-LivePairScanner (S8)
-    → CointegrationValidator (S9)
-    → PortfolioAllocator.request_entry() (S10)  ← NOU
-        ├─ DD level gate
-        ├─ Max pairs gate
-        ├─ Correlation gate
-        ├─ Kelly cross-pair sizing
-        └─ PortfolioRisk exposure gate
-    → SpreadEngine / Kalman Filter
-    → LiveTrader (S5-S7)
-        └─ per tick: allocator.update_state()
-    → Dashboard (S5)
-```
-
-### Utilizare rapidă Sprint 10
-
-```python
-from risk import PortfolioAllocator, AllocatorConfig
-from risk.kelly import KellyConfig
-from risk.drawdown_controller import DDConfig
-
-cfg = AllocatorConfig(
-    capital_usd=10_000,
-    max_concurrent_pairs=4,
-    kelly=KellyConfig(kelly_fraction=0.25, vol_target=0.01),
-    drawdown=DDConfig(
-        pair_soft_dd=0.05,
-        portfolio_soft_dd=0.08,
-        portfolio_hard_dd=0.15,
-    ),
-)
-allocator = PortfolioAllocator(cfg)
-
-# La semnal de intrare:
-decision = allocator.request_entry(
-    pair_id="ETH/BTC_perp",
-    candidate_spread=spread_series,
-    trade_pnl_history=oos_pnl_series,
-    current_zscore=-2.3,
-    entry_beta=0.0534,
-)
-if decision.allowed:
-    notional = decision.notional_usd  # → trimite ordin
-
-# Per tick:
-snap = allocator.update_state(
-    open_pnl_per_pair={"ETH/BTC_perp": 45.2},
-    spread_updates={"ETH/BTC_perp": 0.0118},
-)
-if snap.level.value == "HARD_STOP":
-    await live_trader.close_all()
-
-# La exit:
-allocator.record_exit("ETH/BTC_perp")
-```
-
-### Risk Notes Sprint 10
-
-- Ledoit-Wolf shrinkage necesită `scikit-learn`. Fără el, fallback automat la numpy `corrcoef`.
-- Kelly pe sample mic (< 20 trades) folosește `vol_target_only`. Pe pair nou, sizing conservativ.
-- HARD_STOP nu se auto-resetează. `manual_resume()` trebuie apelat explicit.
-- `max_concurrent_pairs=4-5` pentru capital 10-50k USD.
-- Correlation matrix se actualizează per tick. Primele 30 bare — verificați manual.
+- `risk/drawdown_controller.py` — `DrawdownController` NORMAL → SOFT_LIMIT → HARD_STOP
+- `risk/multi_pair_allocator.py` — `PortfolioAllocator` cu 5 gates secvențiale
 
 ---
 
 ## Sprint 9 — 2026-06-24
 
 ### Added
-- `strategy/cointegration/` — pachet complet
-- `EngleGrangerTest`, `JohansenTest`, `ResidualDiagnostics`, `CointegrationValidator`
+- `strategy/cointegration/` — pachet complet: EngleGrangerTest, JohansenTest, ResidualDiagnostics, CointegrationValidator
 
 ---
 

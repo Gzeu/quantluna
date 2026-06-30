@@ -1,0 +1,104 @@
+# QuantLuna — Docker Compose
+# Sprint 12
+#
+# Services:
+#   paper    — Paper trader (safe, no real orders)
+#   live     — Live trader (real orders — use with caution)
+#   optimize — Hyperparameter optimizer (Optuna)
+#   dashboard — Monitoring dashboard
+#
+# Quick start:
+#   cp .env.example .env  # fill in your API keys
+#   docker-compose up paper  # start paper trading
+#   docker-compose up dashboard  # open http://localhost:8000
+
+version: "3.9"
+
+services:
+
+  # -----------------------------------------------------------------------
+  paper:
+    build: .
+    image: quantluna:latest
+    container_name: quantluna_paper
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - quantluna_cache:/root/.quantluna/cache
+    command: >
+      python scripts/run_paper.py
+      --pair ${SYM_Y:-BTCUSDT} ${SYM_X:-ETHUSDT}
+      --exchange ${EXCHANGE:-bybit}
+      --capital ${CAPITAL_USD:-10000}
+      --slippage ${SLIPPAGE:-0.0005}
+      --telegram-token ${TELEGRAM_BOT_TOKEN:-}
+      --telegram-chat ${TELEGRAM_CHAT_ID:-}
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # -----------------------------------------------------------------------
+  live:
+    build: .
+    image: quantluna:latest
+    container_name: quantluna_live
+    restart: "no"  # Manual restart required for live — intentional
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - quantluna_cache:/root/.quantluna/cache
+    command: >
+      python scripts/run_live.py
+      --pair ${SYM_Y:-BTCUSDT} ${SYM_X:-ETHUSDT}
+      --mode live
+    logging:
+      driver: json-file
+      options:
+        max-size: "100m"
+        max-file: "10"
+    profiles:
+      - live  # Only starts with: docker-compose --profile live up
+
+  # -----------------------------------------------------------------------
+  optimize:
+    build: .
+    image: quantluna:latest
+    container_name: quantluna_optimizer
+    restart: "no"
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - quantluna_cache:/root/.quantluna/cache
+    command: >
+      python scripts/optimize_params.py
+      --pair ${SYM_Y:-BTCUSDT} ${SYM_X:-ETHUSDT}
+      --exchange ${EXCHANGE:-bybit}
+      --trials ${OPT_TRIALS:-200}
+      --objective ${OPT_OBJECTIVE:-sharpe}
+      --output /app/data/best_params.json
+      --storage sqlite:////app/data/optuna.db
+    profiles:
+      - optimize
+
+  # -----------------------------------------------------------------------
+  dashboard:
+    build: .
+    image: quantluna:latest
+    container_name: quantluna_dashboard
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file: .env
+    command: uvicorn dashboard.server:app --host 0.0.0.0 --port 8000
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+volumes:
+  quantluna_cache:
+    driver: local

@@ -2,57 +2,73 @@ name: CI
 
 on:
   push:
-    branches: ["main", "develop"]
+    branches: [main, develop]
   pull_request:
-    branches: ["main"]
+    branches: [main]
 
 jobs:
   test:
-    name: Test & Coverage
+    name: Test Suite (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+      fail-fast: false
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: ${{ runner.os }}-pip-
+          python-version: ${{ matrix.python-version }}
+          cache: pip
 
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest pytest-cov ruff
+          pip install pytest pytest-asyncio pytest-cov
 
-      - name: Lint with ruff
+      - name: Run test suite
         run: |
-          ruff check . --select E,F,W,I --ignore E501 --exclude .venv
+          pytest tests/ -x --tb=short -q --cov=. --cov-report=xml --cov-report=term-missing
 
-      - name: Run tests with coverage
-        run: |
-          pytest tests/ -v \
-            --cov=core \
-            --cov=strategy \
-            --cov=risk \
-            --cov=backtest \
-            --cov=config \
-            --cov-report=term-missing \
-            --cov-report=xml:coverage.xml \
-            --tb=short
-
-      - name: Upload coverage to Codecov
+      - name: Upload coverage
         uses: codecov/codecov-action@v4
+        if: matrix.python-version == '3.11'
         with:
           file: ./coverage.xml
-          flags: unittests
-          name: quantluna-coverage
           fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install linters
+        run: pip install ruff
+
+      - name: Ruff lint
+        run: ruff check . --select E,W,F --ignore E501,W503
+
+  security:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect secrets
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --only-verified
