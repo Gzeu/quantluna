@@ -92,6 +92,11 @@ services:
     ports:
       - "8000:8000"
     env_file: .env
+    volumes:
+      - ./data:/app/data
+      - quantluna_cache:/root/.quantluna/cache
+    environment:
+      - QUANTLUNA_DB_PATH=/app/data/quantluna_jobs.db
     command: uvicorn dashboard.server:app --host 0.0.0.0 --port 8000
     logging:
       driver: json-file
