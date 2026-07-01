@@ -3,6 +3,7 @@
 > Adaptive Kalman Filter Pairs Trading Engine for Crypto Markets
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://python.org)
+[![CI](https://github.com/Gzeu/quantluna/actions/workflows/ci.yml/badge.svg)](https://github.com/Gzeu/quantluna/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-Prod--Ready-brightgreen)]()
 [![Tests](https://img.shields.io/badge/Tests-264%2B-brightgreen)]()
@@ -28,6 +29,7 @@ QuantLuna is a **production-grade statistical arbitrage engine** built around a 
 - [Dashboard](#dashboard)
 - [Risk Management](#risk-management)
 - [Testing](#testing)
+- [CI/CD](#cicd)
 - [Fix Log](#fix-log)
 - [Prod Checklist](#prod-checklist)
 - [Roadmap](#roadmap)
@@ -50,6 +52,8 @@ QuantLuna is a **production-grade statistical arbitrage engine** built around a 
 - **HALT logic** — queue overflow (100 consecutive drops) triggers system halt + external alert
 - **Signal v4** — volatility-adjusted thresholds, delta-z momentum filter, dynamic cooldown, partial exit at z=0, cointegration validity gate
 - **Startup orchestration (S19)** — `WorkflowOrchestrator` scans, reconciles and adopts orphan positions before `LiveTrader.run()`
+- **CI/CD (S21)** — GitHub Actions: lint (ruff) + pytest (3.10/3.11 matrix) + Docker build + Gitleaks secret scan
+- **Compare UI (S22)** — dashboard page cu radar chart, diff matrix, metrics table si param diff pentru backtest jobs
 
 ---
 
@@ -98,15 +102,15 @@ quantluna/
 │   ├── backoff.py                # Exponential backoff for retries
 │   ├── position_scanner.py       # PositionScanner — detect orphan/managed positions  [S19]
 │   ├── adoption_engine.py        # AdoptionEngine — ADOPT / CLOSE_NOW / MONITOR_ONLY  [S19]
-│   ├── profit_optimizer.py       # ProfitOptimizer — TP/SL/trailing/ladder for adopted pos [S19]
-│   ├── workflow_orchestrator.py  # WorkflowOrchestrator — startup phases 1-4             [S19]
-│   └── partial_exit_handler.py  # PartialExitHandler — Signal.PARTIAL_EXIT execution    [S19]
+│   ├── profit_optimizer.py       # ProfitOptimizer — TP/SL/trailing/ladder              [S19]
+│   ├── workflow_orchestrator.py  # WorkflowOrchestrator — startup phases 1-4            [S19]
+│   └── partial_exit_handler.py   # PartialExitHandler — Signal.PARTIAL_EXIT execution   [S19]
 │
 ├── backtest/
 │   ├── engine.py                 # Vectorised backtest, bar_freq support
 │   ├── walk_forward.py           # Walk-forward, purged K-fold, non-leakage splits
 │   ├── monte_carlo.py            # Monte Carlo simulation — path sampling, confidence bands
-│   └── analytics.py             # Sharpe, Sortino, Calmar, max DD, win rate
+│   └── analytics.py              # Sharpe, Sortino, Calmar, max DD, win rate
 │
 ├── data/
 │   ├── loaders.py                # OHLCV loaders, CCXT wrappers
@@ -120,11 +124,12 @@ quantluna/
 │
 ├── dashboard/                    # Real-time monitoring dashboard (FastAPI + WebSocket)
 │   ├── server.py
-│   └── index.html
+│   ├── index.html                # Main dashboard
+│   └── compare.html              # Compare UI — radar, diff matrix, metrics [S22]
 │
 ├── api/                          # REST API (FastAPI) — backtest jobs, compare, radar
-│   ├── backtest.py               # /backtest, /status, /results, /compare endpoints
-│   └── schemas.py                # Pydantic models: BacktestRequest, CompareResponse
+│   ├── backtest.py               # /backtest, /status, /results, /compare  [S20 fixes]
+│   └── schemas.py                # Pydantic models cu __all__ exports        [S21]
 │
 ├── scripts/
 │   ├── run_backtest.py
@@ -140,7 +145,7 @@ quantluna/
 │   ├── test_spread.py
 │   ├── test_cointegration.py
 │   ├── test_signal.py / test_signal_full.py
-│   ├── test_signal_v4.py         # P0+P1 features: vol_adj, dz_filter, partial_exit  [NEW]
+│   ├── test_signal_v4.py         # P0+P1: vol_adj, dz_filter, partial_exit  [S19]
 │   ├── test_regime.py
 │   ├── test_pair_selector.py
 │   ├── test_risk.py
@@ -149,7 +154,7 @@ quantluna/
 │   ├── test_backtest.py / test_sprint15_backtest.py
 │   ├── test_walk_forward.py
 │   ├── test_sprint16_api.py / test_sprint18.py
-│   ├── test_adoption_workflow.py # PositionScanner, AdoptionEngine, ProfitOptimizer [NEW]
+│   ├── test_adoption_workflow.py # PositionScanner, AdoptionEngine, ProfitOptimizer [S19]
 │   ├── test_smoke_s15_s17.py
 │   ├── test_health_check.py
 │   ├── test_rate_limiter.py
@@ -157,8 +162,13 @@ quantluna/
 │   ├── test_data.py
 │   └── test_telegram_notifier.py
 │
+├── .github/
+│   └── workflows/
+│       └── ci.yml                # CI: lint + pytest matrix + docker + gitleaks [S21]
+│
 ├── state_bus.py                  # Internal async event bus
 ├── .env.example                  # Environment variable template (updated S19)
+├── requirements.in               # pip-compile source cu version pins          [S21]
 ├── Dockerfile / docker-compose.yml
 ├── CHANGELOG.md
 ├── CONTRIBUTING.md
@@ -215,7 +225,6 @@ cooldown = clamp(ceil(half_life × cooldown_hl_factor), cooldown_min, cooldown_m
 La primul crossing al z=0 in timp ce suntem in trade, `PARTIAL_EXIT` inchide `partial_exit_pct`% din pozitie pe ambele legs via `reduceOnly` orders. Se executa **o singura data per trade**.
 
 ```python
-# In LiveTrader._handle_signal:
 from execution.partial_exit_handler import handle_partial_exit
 
 if signal.signal == Signal.PARTIAL_EXIT:
@@ -246,7 +255,7 @@ Faza 2: ResumeManager.reconcile()
     └─> actualizeaza qty daca fill-uri au venit cat timp bot-ul era oprit
 
 Faza 3: AdoptionEngine.process(orphans)
-    ├─> ADOPT   — PnL > adopt_min_pnl_pct: salveaza in checkpoint + seteaza TP/SL
+    ├─> ADOPT     — PnL > adopt_min_pnl_pct: salveaza in checkpoint + seteaza TP/SL
     ├─> CLOSE_NOW — PnL < close_loss_pct OR distanta_liq < min_liq_distance_pct
     └─> MONITOR_ONLY — notional prea mic sau conditii incerte
 
@@ -363,16 +372,19 @@ python scripts/run_live.py --pair BTCUSDT ETHUSDT --mode live --skip-orphan-scan
 ```bash
 uvicorn dashboard.server:app --host 0.0.0.0 --port 8000
 open http://localhost:8000
+
+# Compare UI (S22)
+open http://localhost:8000/compare
 ```
 
 ### 7. API REST (backtest jobs)
 
 ```bash
 uvicorn api.backtest:app --host 0.0.0.0 --port 8001
-# POST /backtest   → porneste job async
-# GET  /status/{id} → polling status
-# GET  /results/{id} → rezultate complete
-# POST /compare   → radar chart + diff matrix intre doua job-uri
+# POST /api/backtest/run            → porneste job async
+# GET  /api/backtest/jobs/{id}      → polling status
+# GET  /api/backtest/jobs/{id}/trades.csv → download CSV
+# GET  /api/backtest/compare        → radar + diff matrix intre job-uri
 ```
 
 ---
@@ -466,9 +478,9 @@ engine = BacktestEngine(config)
 results = engine.run(ohlcv_a, ohlcv_b, bar_freq="1h")
 
 analytics = BacktestAnalytics(results)
-print(analytics.sharpe())       # Sharpe ratio
-print(analytics.sortino())      # Sortino ratio
-print(analytics.calmar())       # Calmar ratio
+print(analytics.sharpe())
+print(analytics.sortino())
+print(analytics.calmar())
 print(analytics.max_drawdown())
 print(analytics.win_rate())
 ```
@@ -550,9 +562,14 @@ LIVE ──(no tick > timeout)──> STALE ──(reconnect ok)──> LIVE
 uvicorn dashboard.server:app --host 0.0.0.0 --port 8000
 ```
 
-**Disponibil la:** `http://localhost:8000`
+**Pagini disponibile:**
 
-**Afiseaza:**
+| URL | Descriere |
+|-----|-----------|
+| `http://localhost:8000` | Dashboard principal — live metrics, pozitii, PnL |
+| `http://localhost:8000/compare` | Compare UI — compara backtest jobs [S22] |
+
+**Dashboard principal afiseaza:**
 - Perechi active + z-scores curente
 - Pozitii deschise cu PnL nerealizat
 - Drawdown level si state (NORMAL / SOFT_LIMIT / HARD_STOP)
@@ -560,7 +577,15 @@ uvicorn dashboard.server:app --host 0.0.0.0 --port 8000
 - Funding rates per pereche activa
 - Trade history + PnL realizat
 - Correlation matrix heatmap
-- **Pozitii adoptate** (S19) + status optimizer (TP/SL/trailing)
+- Pozitii adoptate (S19) + status optimizer (TP/SL/trailing)
+
+**Compare UI (`/compare`) afiseaza [S22]:**
+- Input job IDs + dropdown rank_by
+- **Radar chart** — metrici normalizate 0–1, Chart.js, culori distincte per job
+- **Diff matrix** — verde/rosu pe metrica selectata (row − col)
+- **Metrics table** — 9 metrici cu cel mai bun highlighted 🏆
+- **Param diff** — parametrii diferiți highlighted in galben
+- **Download CSV** — trades combinate din toate job-urile
 
 ---
 
@@ -615,6 +640,29 @@ pytest tests/test_smoke_s15_s17.py -v
 
 ---
 
+## CI/CD
+
+Pipeline activ pe fiecare push/PR catre `main` — vezi [`.github/workflows/ci.yml`](.github/workflows/ci.yml).
+
+| Job | Tool | Descriere |
+|-----|------|-----------|
+| **lint** | `ruff 0.4.4` | E/F/W/I rules, ignore E501 |
+| **test** | `pytest` | Matrix Python 3.10 + 3.11, `PYTHONPATH` setat automat |
+| **docker** | `docker/build-push-action` | Build imagine fara push, GitHub Actions cache |
+| **security** | `gitleaks` | Secret scan pe fiecare commit |
+
+```bash
+# Ruleaza local inainte de push
+ruff check . --select E,F,W,I --ignore E501
+pytest tests/ -x --tb=short -q
+
+# Genereaza requirements.txt cu hash-uri (reproducibilitate)
+pip install pip-tools
+pip-compile requirements.in --generate-hashes -o requirements.txt
+```
+
+---
+
 ## Fix Log
 
 | ID | File | Description |
@@ -628,7 +676,15 @@ pytest tests/test_smoke_s15_s17.py -v
 | FIX-P1 | `execution/live_trader.py` | Spread buffer threshold: `10` → `min_warmup_bars` |
 | FIX-S19-1 | `scripts/run_live.py` | Integrat `WorkflowOrchestrator` faze 1-4 la startup |
 | FIX-S19-2 | `execution/partial_exit_handler.py` | Handler `Signal.PARTIAL_EXIT` — `reduceOnly` orders + checkpoint update |
-| FIX-S19-3 | `execution/live_trader_sprint6_patch.py` | Marcat deprecated — 0 bytes, zero import risk |
+| FIX-S19-3 | `execution/live_trader_sprint6_patch.py` | Marcat deprecated — zero import risk |
+| FIX-S20-1 | `api/backtest.py` | SQLite WAL persistence pentru `_JOBS` (zero extra deps) |
+| FIX-S20-2 | `api/backtest.py` | `sync=True` → `ThreadPoolExecutor` — nu mai blocheaza Uvicorn worker |
+| FIX-S20-3 | `api/backtest.py` | Evictie FIFO sigura — sterge NUMAI `done/error`, niciodata `queued/running` |
+| FIX-S20-4 | `api/backtest.py` | `/compare` OOM cap: 50k rows/job + 422 explicit |
+| FIX-S21-1 | `.github/workflows/ci.yml` | CI pipeline: lint + pytest 3.10/3.11 + docker + gitleaks |
+| FIX-S21-2 | `requirements.in` | pip-compile source cu version ranges pinned |
+| FIX-S21-3 | `api/schemas.py` | `__all__` exports explicit |
+| FIX-S22-1 | `dashboard/compare.html` | Compare UI: radar + diff matrix + metrics + param diff + CSV |
 
 ---
 
@@ -670,10 +726,14 @@ pytest tests/test_smoke_s15_s17.py -v
 | `backtest/walk_forward.py` | ✅ Prod-ready |
 | `backtest/monte_carlo.py` | ✅ Prod-ready |
 | `backtest/analytics.py` | ✅ Prod-ready |
-| `api/backtest.py` | ✅ Prod-ready |
+| `api/backtest.py` | ✅ Prod-ready [S20 fixes] |
+| `api/schemas.py` | ✅ Prod-ready — `__all__` exports [S21] |
 | `dashboard/server.py` | ✅ Operational |
+| `dashboard/compare.html` | ✅ Operational [S22] |
+| `.github/workflows/ci.yml` | ✅ Activ [S21] |
+| `requirements.in` | ✅ pip-compile ready [S21] |
 | `tests/` (27 files, 264+ cases) | ✅ Suite completa |
-| `.env.example` | ✅ Actualizat — toate variabilele S19 |
+| `.env.example` | ✅ Actualizat — toate variabilele S19-S21 |
 
 ---
 
@@ -682,11 +742,9 @@ pytest tests/test_smoke_s15_s17.py -v
 | Sprint | Feature | Status |
 |--------|---------|--------|
 | S19 | Signal v4 (P0+P1), AdoptionEngine, ProfitOptimizer, WorkflowOrchestrator | ✅ Livrat |
-| S20 | Redis persistence pentru `_JOBS` in-memory din `api/backtest.py` | 🔜 Planned |
-| S20 | Rate limiting pe `/compare` endpoint (max rows cap + streaming) | 🔜 Planned |
-| S21 | CI/CD pipeline activ (GitHub Actions: lint + pytest + docker build) | 🔜 Planned |
-| S21 | `__all__` exports in toate modulele publice + `pip-compile` version pins | 🔜 Planned |
-| S22 | Compare UI in dashboard — radar chart + diff matrix vizualizare live | 🔜 Planned |
+| S20 | SQLite WAL persistence `_JOBS`, ThreadPoolExecutor, evictie safe, OOM cap `/compare` | ✅ Livrat |
+| S21 | CI/CD GitHub Actions (lint + pytest + docker + gitleaks) + `pip-compile` + `__all__` | ✅ Livrat |
+| S22 | Compare UI in dashboard — radar chart + diff matrix + metrics + param diff + CSV | ✅ Livrat |
 
 ---
 
