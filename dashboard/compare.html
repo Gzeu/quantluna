@@ -137,6 +137,7 @@ const COLORS = [
 let _radarChart = null;
 let _lastJobIds = '';
 
+// [REVIEW-1] AbortController + 30s timeout — previne browser freeze pe jobs mari
 async function loadCompare() {
   const jobIds = document.getElementById('jobIds').value.trim();
   const rankBy = document.getElementById('rankBy').value;
@@ -147,20 +148,29 @@ async function loadCompare() {
   hideAll();
   _lastJobIds = jobIds;
 
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000);
+
   try {
     const url = `/api/backtest/compare?job_ids=${encodeURIComponent(jobIds)}&rank_by=${rankBy}&metrics=sharpe,sortino,calmar,max_drawdown_pct,win_rate,profit_factor,ann_return,n_trades,total_net_pnl`;
-    const res = await fetch(url);
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeoutId);
     if (!res.ok) {
-      const err = await res.json().catch(() => ({detail: res.statusText}));
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
       throw new Error(err.detail || res.statusText);
     }
     const data = await res.json();
     setStatus('');
     renderAll(data);
     document.getElementById('btnDownload').disabled = false;
-  } catch(e) {
+  } catch (e) {
+    clearTimeout(timeoutId);
     setStatus('');
-    setError('Eroare: ' + e.message);
+    if (e.name === 'AbortError') {
+      setError('Timeout — compare a durat prea mult (>30s). Incearca cu mai putine job-uri.');
+    } else {
+      setError('Eroare: ' + e.message);
+    }
   }
 }
 
@@ -243,7 +253,6 @@ function renderRadar(data) {
 function renderDiffMatrix(data) {
   const dm = data.diff_matrix;
   const container = document.getElementById('diffMatrixContainer');
-  const n = dm.job_ids.length;
   let html = '<table><thead><tr><th></th>';
   dm.job_ids.forEach((jid, i) => {
     html += `<th style="color:${COLORS[i%COLORS.length]}">${jid}</th>`;
@@ -317,17 +326,22 @@ function renderParams(data) {
   document.getElementById('paramTable').innerHTML = html;
 }
 
+// [REVIEW-4] Safari fix: <a> trebuie adaugat in DOM inainte de .click(),
+// altfel Safari blocheaza download-ul. Chrome/Firefox nu sunt afectate.
 async function downloadCsv() {
   if (!_lastJobIds) return;
   const url = `/api/backtest/compare/trades.csv?job_ids=${encodeURIComponent(_lastJobIds)}`;
   const a = document.createElement('a');
-  a.href = url; a.download = 'quantluna_compare.csv'; a.click();
+  a.href = url;
+  a.download = 'quantluna_compare.csv';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 function setStatus(msg) { document.getElementById('status').textContent = msg; }
-function setError(msg) { document.getElementById('error').textContent = msg; }
+function setError(msg)  { document.getElementById('error').textContent = msg; }
 
-// Enter key trigger
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('jobIds').addEventListener('keydown', e => {
     if (e.key === 'Enter') loadCompare();
