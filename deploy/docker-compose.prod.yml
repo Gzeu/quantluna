@@ -1,0 +1,79 @@
+version: '3.9'
+
+services:
+  quantluna:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: quantluna_live
+    restart: on-failure:5
+    # Restart automat la crash, maxim 5 ori consecutiv.
+    # `on-failure` NU restartează la `docker stop` manual.
+
+    env_file:
+      - ../.env
+
+    volumes:
+      # Persistă toate DB-urile şi log-urile în afara containerului
+      - quantluna_data:/opt/quantluna/data
+      - quantluna_logs:/opt/quantluna/logs
+
+    ports:
+      # API intern — NU expus public; accesat via reverse proxy sau VPN
+      - "127.0.0.1:8000:8000"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+      # Docker va restarted containerul dacă /health eşuează de 3 ori consecutiv
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+    # Limită de resurse — previne OOM killer
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 256M
+
+    command: python main.py --mode live
+
+  # Watchdog extern: curl la /health la fiecare 5 min
+  # Dacă eşuează → trimite alerta Telegram şi restartează containerul
+  watchdog:
+    image: alpine:3.19
+    container_name: quantluna_watchdog
+    restart: always
+    env_file:
+      - ../.env
+    depends_on:
+      - quantluna
+    command: >
+      sh -c '
+        while true; do
+          sleep 300;
+          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" http://quantluna:8000/health || echo "000");
+          if [ "$$STATUS" != "200" ]; then
+            echo "[Watchdog] /health returned $$STATUS — alerting";
+            curl -s -X POST "https://api.telegram.org/bot$${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=$${TELEGRAM_CHAT_ID}" \
+              -d "text=⚠️ QuantLuna /health FAILED ($$STATUS) — container restarting";
+            docker restart quantluna_live;
+          fi;
+        done
+      '
+
+volumes:
+  quantluna_data:
+    driver: local
+  quantluna_logs:
+    driver: local

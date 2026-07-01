@@ -1,0 +1,36 @@
+[Unit]
+Description=QuantLuna Live Trading Bot
+After=network-online.target
+Wants=network-online.target
+# Așteaptă network să fie complet funcțională înainte de start
+
+[Service]
+Type=simple
+User=quantluna
+WorkingDirectory=/opt/quantluna
+EnvironmentFile=/opt/quantluna/.env
+
+# Comanda de start
+ExecStart=/opt/quantluna/.venv/bin/python main.py --mode live
+
+# Restart automat la crash (nu la stop manual cu `systemctl stop`)
+Restart=on-failure
+RestartSec=15s
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# După 5 restart-uri în 5 minute — opreşte permanent + notificare
+
+# Timeout-uri
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+# Logging — jurnalul merge în systemd journal + fiśier
+StandardOutput=append:/opt/quantluna/logs/quantluna.log
+StandardError=append:/opt/quantluna/logs/quantluna_error.log
+
+# Securitate minimală
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
