@@ -7,6 +7,14 @@ Sprint 13 additions:
   - WebSocket /ws/live     — real-time state push la fiecare 1s
   - CORS configurat pentru dev frontend
 
+Sprint 16 additions:
+  - Backtest REST API montat via api.backtest router:
+    POST   /api/backtest/run
+    GET    /api/backtest/jobs/{job_id}
+    GET    /api/backtest/jobs/{job_id}/trades.csv
+    GET    /api/backtest/jobs
+    DELETE /api/backtest/jobs/{job_id}
+
 All original endpoints preserved.
 """
 from __future__ import annotations
@@ -42,8 +50,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="QuantLuna Dashboard",
-    description="Adaptive Kalman Filter Pairs Trading — Monitoring API",
-    version="1.0.0",
+    description="Adaptive Kalman Filter Pairs Trading — Monitoring & Backtest API",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -60,6 +68,17 @@ try:
     app.mount("/static", StaticFiles(directory=_static_dir), name="static")
 except Exception:
     pass
+
+# ---------------------------------------------------------------------------
+# Sprint 16 — Mount backtest router
+# ---------------------------------------------------------------------------
+
+try:
+    from api.backtest import router as backtest_router
+    app.include_router(backtest_router)
+    logger.info("Backtest API router mounted at /api/backtest")
+except ImportError as _e:
+    logger.warning(f"Backtest router not mounted: {_e}")
 
 
 # ---------------------------------------------------------------------------
@@ -150,38 +169,13 @@ async def api_optimize_results(
 ) -> Dict[str, Any]:
     """
     Returns Optuna trial history pentru vizualizare în dashboard.
-
-    Response:
-    {
-        "study_name": "quantluna_opt",
-        "storage": "sqlite:///optuna.db",
-        "n_trials": 150,
-        "best_value": 1.82,
-        "best_params": {...},
-        "objective_direction": "maximize",
-        "trials": [
-            {
-                "number": 0,
-                "value": 1.45,
-                "state": "COMPLETE",
-                "params": {...},
-                "duration_s": 2.3
-            },
-            ...
-        ],
-        "param_importances": {"zscore_entry": 0.42, "delta": 0.31, ...}  // if available
-    }
     """
     if not storage:
-        # Try default locations
-        default_paths = [
-            "sqlite:///optuna.db",
-            "sqlite:///data/optuna.db",
-        ]
+        default_paths = ["sqlite:///optuna.db", "sqlite:///data/optuna.db"]
         for default in default_paths:
             db_path = default.replace("sqlite:///", "")
-            import os
-            if os.path.exists(db_path):
+            import os as _os
+            if _os.path.exists(db_path):
                 storage = default
                 break
 
@@ -236,7 +230,6 @@ async def api_optimize_results(
                 "datetime_start": t.datetime_start.isoformat() if t.datetime_start else None,
             })
 
-        # Best trial
         best_value = None
         best_params = {}
         try:
@@ -245,7 +238,6 @@ async def api_optimize_results(
         except Exception:
             pass
 
-        # Parameter importances (Optuna fanova — optional)
         param_importances = {}
         if len(completed) >= 10:
             try:
@@ -268,10 +260,7 @@ async def api_optimize_results(
         }
 
     except ImportError:
-        raise HTTPException(
-            status_code=501,
-            detail="Optuna not installed. Run: pip install optuna"
-        )
+        raise HTTPException(status_code=501, detail="Optuna not installed.")
     except Exception as exc:
         logger.error(f"optimize/results error: {exc}")
         raise HTTPException(status_code=500, detail=str(exc))
