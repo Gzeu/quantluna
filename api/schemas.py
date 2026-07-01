@@ -1,14 +1,18 @@
 """
-api/schemas.py  —  QuantLuna Pydantic schemas (Sprint 16 + S18 + S20)
+api/schemas.py  —  QuantLuna Pydantic schemas (Sprint 16 + S18 + S20 + REVIEW-3)
 
 Toate modelele de request/response pentru API-ul backtest.
+
+Fix-uri aplicate:
+  [REVIEW-3] n_bars: ge/le pe Optional[int] sunt ignorate de Pydantic v2 cand
+             valoarea este None. Adaugat @field_validator explicit.
 """
 from __future__ import annotations
 
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 __all__ = [
     "BarFreq",
@@ -43,13 +47,16 @@ class JobStatus(str, Enum):
 
 
 class BacktestRequest(BaseModel):
-    sym_y:            str   = Field("BTC/USDT:USDT")
-    sym_x:            str   = Field("ETH/USDT:USDT")
+    sym_y:            str     = Field("BTC/USDT:USDT")
+    sym_x:            str     = Field("ETH/USDT:USDT")
     bar_freq:         BarFreq = Field(BarFreq.h1)
-    n_splits:         int   = Field(3, ge=1, le=20)
-    n_bars:           Optional[int]   = Field(None, ge=100, le=200_000)
-    data_dir:         Optional[str]   = None
-    params_file:      Optional[str]   = None
+    n_splits:         int     = Field(3, ge=1, le=20)
+    # [REVIEW-3] Field(None) fara ge/le: Pydantic v2 ignora ge/le pe Optional[int]
+    # cand valoarea este None, deci n_bars=50 trecea validarea silentios.
+    # Validarea range-ului este delegata la @field_validator de mai jos.
+    n_bars:           Optional[int] = Field(None)
+    data_dir:         Optional[str] = None
+    params_file:      Optional[str] = None
     capital_usdt:     float = Field(10_000.0, gt=0)
     vol_target:       float = Field(0.01, gt=0, le=0.5)
     kelly_fraction:   float = Field(0.25, gt=0, le=1.0)
@@ -65,6 +72,17 @@ class BacktestRequest(BaseModel):
     purge_bars:       int   = Field(5, ge=0)
     embargo_bars:     int   = Field(2, ge=0)
     include_trades:   bool  = Field(False)
+
+    # [REVIEW-3] Explicit range enforcement pentru n_bars.
+    # Fara acest validator, n_bars=50 trece validarea silentios in Pydantic v2.
+    @field_validator("n_bars")
+    @classmethod
+    def validate_n_bars(cls, v: Optional[int]) -> Optional[int]:
+        if v is not None and not (100 <= v <= 200_000):
+            raise ValueError(
+                f"n_bars must be between 100 and 200_000, got {v}"
+            )
+        return v
 
     model_config = {"json_schema_extra": {
         "example": {
@@ -95,16 +113,16 @@ class BacktestMetrics(BaseModel):
 
 
 class BacktestResponse(BaseModel):
-    job_id:       str
-    status:       JobStatus
-    request:      BacktestRequest
-    metrics:      Optional[BacktestMetrics] = None
-    trades:       Optional[List[Dict[str, Any]]] = None
+    job_id:         str
+    status:         JobStatus
+    request:        BacktestRequest
+    metrics:        Optional[BacktestMetrics] = None
+    trades:         Optional[List[Dict[str, Any]]] = None
     trades_csv_url: Optional[str] = None
-    error:        Optional[str] = None
-    duration_s:   Optional[float] = None
-    created_at:   str
-    completed_at: Optional[str] = None
+    error:          Optional[str] = None
+    duration_s:     Optional[float] = None
+    created_at:     str
+    completed_at:   Optional[str] = None
 
 
 class JobListItem(BaseModel):
