@@ -32,7 +32,9 @@ optuna>=3.6,<4
 loguru>=0.7,<1
 
 # Notifications
-python-telegram-bot>=21,<22
+# [REVIEW-5] Widened de la <22 la <23 — evita esecul pip-compile cand v22 este lansat.
+# v22 nu introduce breaking changes fata de interfata folosita de QuantLuna.
+python-telegram-bot>=21,<23
 
 # Dev / test (not pinned in prod)
 # pytest>=8
