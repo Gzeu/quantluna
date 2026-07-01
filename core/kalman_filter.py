@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import logging
 import numpy as np
 import pandas as pd
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional, Deque
-from loguru import logger
+
+logger = logging.getLogger(__name__)
 
 # Maximum number of KalmanState snapshots kept in memory.
 # At 1-min bars this is ~7 days; at 1h bars ~180 days.
@@ -231,6 +233,10 @@ class KalmanHedgeRatio:
         """
         Fit Kalman Filter over a full price series.
 
+        NOTE: This method resets state before running.
+        Calling fit() twice on the same object produces identical results
+        to calling fit() on a fresh object — no stale state contamination.
+
         Returns
         -------
         pd.DataFrame with columns:
@@ -239,6 +245,21 @@ class KalmanHedgeRatio:
         """
         if len(y) != len(x):
             raise ValueError(f"y ({len(y)}) and x ({len(x)}) must have same length")
+
+        # FIX Sprint 13: reset state before fit — prevents stale state on 2nd call
+        # Before this fix, calling fit() twice gave different results for the same
+        # input because beta/alpha/P carried over from the previous run.
+        self.reset()
+
+        # FIX Sprint 13: warn if series is shorter than warm_up threshold
+        # Without this, all rows would have is_warm=False silently.
+        if len(y) < self.warm_up:
+            logger.warning(
+                f"KalmanHedgeRatio.fit(): series length {len(y)} is shorter than "
+                f"warm_up={self.warm_up}. The filter will not warm up — "
+                f"is_warm will remain False for all bars. "
+                f"Consider reducing warm_up or providing more data."
+            )
 
         rows = []
         for ts, yi, xi in zip(y.index, y.values, x.values):
