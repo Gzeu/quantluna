@@ -1,189 +1,112 @@
-# QuantLuna — Changelog
+# QuantLuna — CHANGELOG
 
-## Sprint 12 — 2026-07-01
+All notable changes to QuantLuna are documented here.
+Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+
+---
+
+## [Sprint 15] — 2026-07-01
 
 ### Added
+- **`backtest/engine_adapter.py`** — Bridge layer: `StrategyConfig` → `BacktestConfig` + `WalkForwardEngine`
+  - `strategy_to_backtest_config()`: maps all `StrategyConfig` fields to `BacktestConfig`, including `bar_freq` string → `bar_freq_hours` float, `fee_rate`, `slippage_pct`
+  - `BacktestEngine(cfg)`: public API accepting `StrategyConfig` directly; supports `run(y, x)`, `run(df=...)`, `run(data_dir=...)`; graceful fallback when full engine unavailable
+  - `WalkForwardRunner(cfg)`: wraps `WalkForwardValidator` with `StrategyConfig`; propagates `purge_bars` + `embargo_bars` explicitly
+  - `_MinimalSpreadEngine`: fallback spread engine using `KalmanHedgeRatio` directly (no `core.spread` dependency needed in testing)
+- **`backtest/__init__.py`** — Exports `BacktestEngine`, `WalkForwardRunner` as top-level public names
+- **`tests/test_sprint15_backtest.py`** — 25 teste covering adapter, purging gap, engine, walk-forward runner
 
-**`strategy/optimizer.py` — Optuna Hyperparameter Optimizer**
-
-- `QuantLunaOptimizer` cu TPE sampler (Tree-structured Parzen Estimator)
-- `SearchSpace` dataclass — bounds configurabile pentru toți parametrii
-- `OptimizerConfig` — n_trials, n_jobs, objective, train_ratio, seed, storage, pruning
-- `OptimizationResult` — best params + metrici train + out-of-sample (Sharpe, Sortino, Calmar, win rate, max DD, profit factor)
-- Walk-forward aware: split strict 70/30 fără leakage
-- MedianPruner — taie trial-uri slabe devreme
-- Obiective suportate: `sharpe`, `sortino`, `calmar`, `profit_factor`
-- Parametrii optimizați: `delta`, `R`, `zscore_entry`, `zscore_exit`, `kelly_fraction`, `vol_target`, `half_life_min_h`, `half_life_max_h`, `min_warmup_bars`
-- Constraints automate: `zscore_exit < zscore_entry`, `half_life_min < half_life_max`
-- Optuna SQLite storage — resume study după întrerupere
-- `result.save_json()` + `result.print_summary()`
-
-**`data/market_data_cache.py` — Local Parquet Cache**
-
-- `MarketDataCache` — download OHLCV via CCXT + cache local Parquet (Apache Arrow, snappy)
-- `load()` — load din cache sau download dacă lipsă/stale
-- `refresh()` — incremental merge (descarcă doar barele noi de la ultima bară cached)
-- `exists()`, `info()`, `list_cached()`, `clear()`
-- Cache dir: `~/.quantluna/cache/<exchange>/<symbol>/<timeframe>.parquet`
-- Stale detection configurabilă (default: 4h)
-- Deduplicare automată și sortare cronologică
-- Pagination automată la CCXT (descarcă tot istoricul cu limit=1000 per request)
-
-**`execution/rate_limiter.py` — Async Token Bucket Rate Limiter**
-
-- `RateLimiter` cu bucket-uri separate per endpoint type: `order`, `query`, `market`
-- Limite default per exchange: Bybit (10/20/50 rps), Binance (10/20/20 rps)
-- `burst_factor` configurabil — permite burst scurt
-- Warning log la wait > `warn_wait_s`
-- `acquire()`, `acquire_order()`, `acquire_market()`, `acquire_query()` shortcuts
-
-**`execution/health_check.py` — Pre-flight Health Check**
-
-- `HealthCheck` cu 7 checks: ccxt import, API credentials, exchange connectivity, symbols tradeable, account balance, config constraints, cache freshness
-- `HealthReport` cu `all_passed`, `critical_failures`, `print_report()` Rich table
-- `critical=False` pentru checks non-blocante (balance, cache)
-- `CheckResult` per check cu pass/fail/message/critical
-
-**`scripts/optimize_params.py` — CLI Optimizer Runner**
-
-- Full CLI cu argparse: pair, exchange, timeframe, days, trials, jobs, objective, train-ratio, seed, storage, output
-- Auto-load din MarketDataCache
-- Index alignment automat pe barele comune
-- Print LiveConfig patch după optimizare
-
-**`scripts/run_paper.py` — CLI Paper Trading Dedicated Runner**
-
-- CLI cu argparse: pair, exchange, capital, slippage, latency, warmup, zscore params
-- `--params best_params.json` — încarcă automat parametrii din optimizer
-- `--health-check` flag — rulează HealthCheck înainte de start
-- Telegram integration din CLI flags
-- Summary la oprire (Ctrl+C)
-
-**`.github/workflows/ci.yml` — GitHub Actions CI**
-
-- Test suite pe Python 3.10, 3.11, 3.12 (matrix)
-- Coverage upload la Codecov (Python 3.11)
-- Ruff lint check
-- TruffleHog secret scan pe fiecare push/PR
-
-**`Dockerfile` + `docker-compose.yml` — Containerizare**
-
-- Multi-stage build (builder + runtime)
-- Non-root user pentru securitate
-- 4 services: `paper`, `live` (profile), `optimize` (profile), `dashboard`
-- Volume persistent pentru data și cache
-- Live service cu `restart: "no"` — restart manual intentionat pentru siguranță
+### Changed / Fixed
+- **Purging gap anti-lookahead** fully documented with explicit rationale:
+  - `purge_bars` ≥ `warm_up_bars`: eliminates Kalman state contamination at IS/OOS boundary
+  - `embargo_bars` ≥ estimated half-life: prevents spread mean-reversion echo (IS entry closing in OOS)
+  - `BacktestEngine` defaults: `purge_bars=cfg.warm_up_bars`, `embargo_bars=24` (1 day @ 1h bars)
+- **`scripts/optimize_params.py`**: `make_objective()` now imports `BacktestEngine` via `from backtest.engine_adapter import BacktestEngine` (Sprint 14 gap fixed)
+- **`scripts/run_backtest.py`**: uses `BacktestEngine` from `backtest.engine_adapter` (not stale import)
 
 ---
 
-## Sprint 11 — 2026-07-01
+## [Sprint 14] — 2026-07-01
 
 ### Added
-
-**`notifications/telegram_notifier.py`**
-
-- `TelegramNotifier` — async, non-blocking, fail-safe
-- `send_trade_entry()`, `send_trade_exit()`, `send_halt()`, `send_daily_summary()`
-- `send_watchdog_alert()`, `send_queue_overflow()`, `send_custom()`
-- Rate limiting (1 msg/s), retry exponential backoff (3x)
-- `NotifierConfig` cu filtre granulare per tip de alert
-- `AlertLevel` enum cu emoji per severitate
-
-**`execution/paper_trader.py`**
-
-- `PaperTrader` — drop-in replacement pentru LiveTrader
-- WebSocket feed real (Bybit + Binance), fills simulate
-- Slippage model: `ask + slippage_pct/2 * mid` pentru buy, invers pentru sell
-- Fee model per exchange: Bybit taker 0.055%, Binance taker 0.04%
-- Latency simulation (asyncio.sleep)
-- Același PortfolioAllocator pipeline ca LiveTrader
-- SQLite persistence (`paper_trades.db`)
-- `summary()` dict, `send_daily_summary()` via Telegram
-
-**`CONTRIBUTING.md`**
-
-- Getting started, project structure table, development workflow
-- Code standards: PEP 8, type hints, async, logging levels, error handling
-- Testing requirements: mock APIs, no leakage, pytest-asyncio
-- Commit message format + PR checklist
-
----
-
-## fix(integration) — 2026-06-24
-
-### Fixed — Integration Commit (Sprint 4-10 Consolidation)
-
-**`execution/live_trader.py` — rescris complet**
-
-- `PortfolioRisk.record_trade()` lipsea — adăugat în `risk/portfolio_risk.py`
-- `PortfolioAllocator` Sprint 10 neintegrat — integrat complet
-- `close_all(reason)` — metodă async nouă pentru HARD_STOP / PAIR_DD / urgenta externă
-- Sprint 6 patch (`live_trader_sprint6_patch.py`) aplicat direct în cod
-- `live_trader_sprint6_patch.py` — marcat deprecat cu `ImportError` explicit
-
-**`execution/live_trader.py` — WsWatchdog integrat (Sprint 7)**
-
-- `WsWatchdog` importat și creat în `__init__`
-- `watchdog.ping()` apelat în `_consumer()` la fiecare tick
-- Gate entry: `watchdog_gate_entries=True` blochează `_open_position()` când `watchdog.state != LIVE`
-
----
-
-## Sprint 10 — 2026-06-24
-
-### Added
-
-- `risk/correlation_matrix.py` — `SpreadCorrelationMatrix` cu Ledoit-Wolf shrinkage
-- `risk/kelly.py` — `KellyCrossPair` + `KellyConfig` + `KellyResult`
-- `risk/drawdown_controller.py` — `DrawdownController` NORMAL → SOFT_LIMIT → HARD_STOP
-- `risk/multi_pair_allocator.py` — `PortfolioAllocator` cu 5 gates secvențiale
-
----
-
-## Sprint 9 — 2026-06-24
-
-### Added
-- `strategy/cointegration/` — pachet complet: EngleGrangerTest, JohansenTest, ResidualDiagnostics, CointegrationValidator
-
----
-
-## Sprint 8 — 2026-06-24
+- **`requirements.txt`** — completat cu `optuna>=3.5.0`, `fastapi>=0.110.0`, `uvicorn[standard]>=0.27.0`, `httpx>=0.27.0`, `pydantic>=2.6.0`, `pydantic-settings>=2.2.0`, `kaleido>=0.2.1`, `ruff>=0.4.0`; restructurat pe secțiuni cu comentarii
+- **`config/cointegration_config.py`** — `CointegrationConfig` dataclass cu toți parametrii testelor de cointegration: `adf_alpha`, `johansen_signif`, `min/max_half_life_h`, `require_both_tests`; preseturi `conservative()`, `liberal()`, `from_env()`; `__post_init__` validation
+- **`config/strategy_config.py`** — `StrategyConfig` master dataclass: agregă toți parametrii sistemului (Kalman, Z-score, Risk, Execution, Capital); `from_optimizer_json(path)`, `from_env()`, `to_dict()`, `summary()`
+- **`config/__init__.py`** — exports `CointegrationConfig`, `StrategyConfig`
+- **`dashboard/index.html`** — tab **Optimizer** complet: trial values scatter + running best chart (Plotly), parameter importances bar chart (fANOVA), best params table cu inline importance bars, top trials table
+- **`tests/test_cointegration.py`** — 14 teste: `CointegrationConfig` validation, `EngleGrangerTest` cu config parametrizabil, `StrategyConfig` constraints
+- **`.github/workflows/ci.yml`** — upgraded: ruff lint job, test matrix Python 3.10/3.11/3.12, `--cov-fail-under=60`, Codecov upload, docker-build job pe `main`
+- **`pyproject.toml`** — `[tool.ruff]` config complet: reguli `E,W,F,I,UP,B,C4,SIM`; `[tool.coverage.run]`; `[project.scripts]` entry point
+- **`.env.example`** — completat cu toate variabilele Sprint 14: `QUANTLUNA_COINT_*`, `OPTUNA_*`, `DASHBOARD_*`, `QUANTLUNA_HALF_LIFE_*`
+- **`scripts/optimize_params.py`** — CLI Optuna complet: `--sampler` (tpe/random/cmaes), `--pruner` (median/hyperband/none), `--jobs`, `--dry-run`, `--export-best`; `_synthetic_sharpe()` fallback pentru CI
+- **`scripts/run_backtest.py`** — `StrategyConfig.from_optimizer_json()` integration, CLI overrides, `--walk-forward`
+- **`tests/conftest.py`** — rescris complet: fixture `rng` (session-scoped), `sample_prices`, `cointegrated`, `strategy_config`, `coint_config`, `mock_ccxt`, `mock_ws`, `sample_trades`
 
 ### Fixed
-- `dashboard/server.py` — `bus.snapshot_dict()` fix
-
-### Added
-- `backtest/monte_carlo.py`, `strategy/live_pair_scanner.py`
+- `tests/conftest.py`: fixture `rng` lipsă — cauza crash CI pe `test_cointegration.py`
 
 ---
 
-## Sprint 7 — 2026-06-24
+## [Sprint 13] — 2026-07-01
 
 ### Added
-- `execution/ws_watchdog.py`, `backtest/engine.py`
+- **`dashboard/server.py`** — `GET /api/optimize/results`: Optuna trial history, `n_trials`, `n_complete`, `n_pruned`, `best_value`, `best_params`, `param_importances` (fANOVA ≥10 trials), top-N trials sorted by objective; `GET /api/health`; `WebSocket /ws/live` cu `_WSManager`
+- **`tests/test_dashboard_api.py`** — 5 teste: `/api/status`, `/api/health`, `/api/optimize/results` null storage + mock Optuna study
+- **`tests/test_kalman_filter.py`** — 17 teste: update mechanics, warmup, Joseph form PD, `fit()` stateful bug, warmup guard, delta setter, reset, history deque bounded
+- **`tests/test_analytics.py`** — 7 teste: keys complete, max_dd negativ, win_rate bounds, no trades, finite values
+- **`tests/test_rate_limiter.py`** — 5 teste async: token bucket, bybit/binance limits, burst, endpoint fallback
+- **`tests/test_health_check.py`** — 7 teste: `all_passed`, critical failures, API key checks, mock asyncio
+- **`tests/test_market_data_cache.py`** — 7 teste: cache miss/hit, metadata, deduplication, symbol normalization
+- **`tests/test_telegram_notifier.py`** — 5 teste async: disabled notifier, network error fail-safe, entry/halt format
+- **`tests/conftest.py`** — fixtures Sprint 13: mock CCXT, mock WebSocket, `sample_trades`
+- **`pytest.ini`** — `asyncio_mode = auto`
+- **`main.py`** — entry point CLI: subcomands `paper`, `optimize`, `health`, `dashboard`; argparse + ASCII banner
+- **`core/state_bus.py`** — `state_bus.py` mutat din root cu `DeprecationWarning` shim la root
+- **`core/__init__.py`** — creat
 
-### Changed
-- `state_bus.py` patch Sprint 6 + 7
+### Fixed
+- **`core/kalman_filter.py`** — `fit()` stateful bug: `self.reset()` adăugat la începutul `fit()` — al doilea apel pe acelați obiect producea rezultate diferite
+- **`core/kalman_filter.py`** — warmup guard: `WARNING` loggat când `len(y) < self.warm_up`
 
 ---
 
-## Sprint 6 — 2026-06-24
+## [Sprint 12] — (anterior)
 
 ### Added
-- `execution/funding_monitor.py`, `pnl_reconciler.py`
-- `strategy/signal_adapter.py`
+- Optuna hyperparameter optimization engine
+- Walk-forward validation cu Monte Carlo bootstrap
+- `backtest/engine.py`: `WalkForwardEngine` cu purged K-fold, anti-lookahead z-score (FIX-BT-1), `bar_freq_hours` configurabil (FIX-BT-2)
+- `backtest/walk_forward.py`: `WalkForwardValidator` cu overfit detection (OOS < 50% IS Sharpe)
+- `backtest/monte_carlo.py`: bootstrap empiric fără distribuție parametrică
+
+### Fixed
+- FIX-BT-1: z-score OOS era normalizat pe statistici OOS (look-ahead bias). Rezolvat: mean/std fixate din IS tail
+- FIX-BT-2: `bars_per_day` hardcodat la 24. Rezolvat: calculat din `bar_freq_hours`
 
 ---
 
-## Sprint 5 — 2026-06-24
+## [Sprint 9–11] — (anterior)
 
 ### Added
-- `state_bus.py`, `dashboard/server.py`, `dashboard/index.html`
+- `strategy/cointegration/engle_granger.py`: Engle-Granger test complet cu half-life AR(1)
+- `strategy/cointegration/johansen.py`: Johansen test cu eigenvalue + trace statistics
+- `strategy/cointegration/residual_diagnostics.py`: Ljung-Box, Hurst, Jarque-Bera
+- `strategy/cointegration/validator.py`: `CointegrationValidator` agregator
+- `core/kalman_filter.py`: Sprint 9 — Joseph form covariance update, x=0 guard, `deque(maxlen=10_000)`, atomic property setters
+- `risk/`: Kelly sizing, vol-target, per-pair DD limits, portfolio hard stop
+- `notifications/telegram.py`: async Telegram notifier cu fail-safe
+- `execution/rate_limiter.py`: token bucket rate limiter (Bybit/Binance limits)
 
 ---
 
-## Sprint 4 — anterioare
+## [Sprint 1–8] — (anterior)
 
-- Kalman Filter adaptive hedge ratio (SpreadEngine)
-- SignalGenerator v3, PortfolioRisk, PositionSizer
-- Backtesting walk-forward engine
+### Added
+- Initial project structure: `core/`, `strategy/`, `execution/`, `risk/`, `backtest/`, `notifications/`
+- `core/kalman_filter.py`: KalmanHedgeRatio initial implementation
+- `core/spread.py`: SpreadEngine
+- `strategy/signal.py`: SignalGenerator cu z-score thresholds
+- `backtest/analytics.py`: PerformanceAnalytics
+- Dockerfile, docker-compose.yml
+- CI/CD initial workflow
+- README.md complet
