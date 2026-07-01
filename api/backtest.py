@@ -12,6 +12,8 @@ Fix-uri aplicate (code review):
   [FIX-4] /compare OOM cap: max 50_000 rânduri per job în diff matrix +
           trades CSV; 422 dacă job depăşeşte limita.
   [FIX-5] __all__ exportat explicit pentru tree-shaking clar.
+  [REVIEW-2] _DB_PATH citit din env var QUANTLUNA_DB_PATH pentru persistență
+             Docker. DB supraviețuiește restart container când volumul e montat.
 
 Endpoints:
   POST /api/backtest/run
@@ -29,6 +31,7 @@ import io
 import json
 import logging
 import math
+import os
 import sqlite3
 import time
 import uuid
@@ -80,9 +83,14 @@ _MAX_JOBS = 100
 
 # ---------------------------------------------------------------------------
 # [FIX-1] SQLite persistence layer (zero extra deps — stdlib sqlite3)
+# [REVIEW-2] _DB_PATH citit din env var QUANTLUNA_DB_PATH — DB supravietuieste
+#            restart container cand volumul e montat la /app/data.
+#            docker-compose.yml:
+#              volumes: ["./data:/app/data"]
+#              environment: ["QUANTLUNA_DB_PATH=/app/data/quantluna_jobs.db"]
 # ---------------------------------------------------------------------------
 
-_DB_PATH = Path("quantluna_jobs.db")
+_DB_PATH = Path(os.getenv("QUANTLUNA_DB_PATH", "quantluna_jobs.db"))
 
 
 def _db_connect() -> sqlite3.Connection:
@@ -124,7 +132,7 @@ def _persist_job(job: Dict[str, Any]) -> None:
 
 def _load_jobs_from_db() -> Dict[str, Dict]:
     """
-    Rehidratează _JOBS la startup din SQLite.
+    Rehidrateză _JOBS la startup din SQLite.
     trades_df e setat la None (nu e persistat).
     """
     rows = _DB.execute(
@@ -693,7 +701,7 @@ async def compare_download_csv(
     """
     GET /api/backtest/compare/trades.csv?job_ids=a,b,c
 
-    [FIX-4] Același OOM cap aplicat per job înainte de concat.
+    [FIX-4] Acelaşi OOM cap aplicat per job înainte de concat.
     """
     ids = [jid.strip() for jid in job_ids.split(",") if jid.strip()]
     if len(ids) < 2:
