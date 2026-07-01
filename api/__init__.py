@@ -1,15 +1,24 @@
 """
-api/  —  QuantLuna REST API package (Sprint 16)
+api/__init__.py  —  QuantLuna API package
 
-Routers:
-  backtest  —  POST /api/backtest/run
-               GET  /api/backtest/jobs/{job_id}
-               GET  /api/backtest/jobs/{job_id}/trades.csv
-               GET  /api/backtest/jobs
-
-Mount:
-  app.include_router(backtest_router, prefix="")  # in dashboard/server.py
+[FIX-5] __all__ declarat explicit pentru tree-shaking și IDE autocomplete clar.
 """
-from api.backtest import router as backtest_router
+from api.backtest import router as backtest_router  # noqa: F401
+from api.backtest import (
+    CompareResponse,  # noqa: F401
+    JobSummary,       # noqa: F401
+    RadarData,        # noqa: F401
+    RadarSeries,      # noqa: F401
+    DiffMatrix,       # noqa: F401
+    ParamField,       # noqa: F401
+)
 
-__all__ = ["backtest_router"]
+__all__ = [
+    "backtest_router",
+    "CompareResponse",
+    "JobSummary",
+    "RadarData",
+    "RadarSeries",
+    "DiffMatrix",
+    "ParamField",
+]

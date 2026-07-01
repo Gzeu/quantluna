@@ -1,46 +1,40 @@
 """
-api/backtest.py  —  QuantLuna Sprint 16 + Sprint 18
+api/backtest.py  —  QuantLuna Sprint 16 + Sprint 18 + Review Fixes
 
-FastAPI router pentru backtest REST API.
+Fix-uri aplicate (code review):
+  [FIX-1] _JOBS persistence: SQLite WAL via sqlite3 + JSON (zero extra deps).
+          Toate job-urile sunt scrise/citite din quantluna_jobs.db la fiecare
+          operație. La start, store-ul e rehidratat din DB.
+  [FIX-2] sync=True nu mai blochează Uvicorn worker: rulează în
+          ThreadPoolExecutor(max_workers=4) via asyncio.run_in_executor.
+  [FIX-3] Evicție FIFO sigură: șterge NUMAI jobs cu status done/error,
+          nu queued/running — previne ştergerea unui job în polling.
+  [FIX-4] /compare OOM cap: max 50_000 rânduri per job în diff matrix +
+          trades CSV; 422 dacă job depăşeşte limita.
+  [FIX-5] __all__ exportat explicit pentru tree-shaking clar.
 
-Endpoints (Sprint 16):
+Endpoints:
   POST /api/backtest/run
   GET  /api/backtest/jobs/{job_id}
   GET  /api/backtest/jobs/{job_id}/trades.csv
   GET  /api/backtest/jobs
   DELETE /api/backtest/jobs/{job_id}
-
-Endpoints (Sprint 18 — multi-run comparison):
   GET  /api/backtest/compare
-      ?job_ids=id1,id2,id3  (2–10 job_ids, toate trebuie să fie status=done)
-      ?metrics=sharpe,sortino,calmar,max_drawdown_pct,win_rate,profit_factor,ann_return
-      ?rank_by=sharpe  (metrica principală pentru ranking, default sharpe)
-      ?include_trades_diff=false
-
-      Returnează CompareResponse:
-        - summary: List[JobSummary]  (fiecare job cu toate metricile cerute)
-        - ranking: List[str]         (job_ids sorted by rank_by desc)
-        - radar: RadarData           (normalizat 0-1 per metrica, gata pentru Plotly radar)
-        - diff_matrix: DiffMatrix    (pairwise diff a[i] - a[j] pe fiecare metrica)
-        - param_diff: ParamDiff      (ce parametri differ între joburi)
-        - best_job_id: str
-        - comparison_ts: str
-
-Design:
-  - Job store in-memory (dict); pentru producție înlocuiți cu Redis/DB.
-  - BacktestEngine din backtest.engine_adapter.
-  - Date sintetice dacă data_dir lipsă (CI/dev friendly).
-  - CSV generat on-demand via pandas to_csv(StringIO).
-  - Background tasks prin FastAPI BackgroundTasks.
+  GET  /api/backtest/compare/trades.csv
 """
 from __future__ import annotations
 
+import asyncio
 import io
+import json
 import logging
 import math
+import sqlite3
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -57,19 +51,104 @@ from api.schemas import (
     JobStatus,
 )
 
+__all__ = [
+    "router",
+    "CompareResponse",
+    "JobSummary",
+    "RadarData",
+    "RadarSeries",
+    "DiffMatrix",
+    "ParamField",
+]
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/backtest", tags=["backtest"])
 
 # ---------------------------------------------------------------------------
-# In-memory job store
+# [FIX-2] Thread pool for sync backtest runs (avoids blocking Uvicorn worker)
 # ---------------------------------------------------------------------------
 
-_JOBS: Dict[str, Dict[str, Any]] = {}  # job_id → internal job dict
+_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="bt-sync")
+
+# ---------------------------------------------------------------------------
+# [FIX-4] Safety caps
+# ---------------------------------------------------------------------------
+
+_COMPARE_MAX_ROWS_PER_JOB = 50_000  # max trade rows per job in compare ops
 _MAX_JOBS = 100
 
 # ---------------------------------------------------------------------------
-# Sprint 18 — Compare schemas (inline, no separate file needed)
+# [FIX-1] SQLite persistence layer (zero extra deps — stdlib sqlite3)
+# ---------------------------------------------------------------------------
+
+_DB_PATH = Path("quantluna_jobs.db")
+
+
+def _db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            job_id      TEXT PRIMARY KEY,
+            status      TEXT NOT NULL,
+            payload     TEXT NOT NULL,   -- JSON: everything except trades_df
+            created_at  TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+_DB: sqlite3.Connection = _db_connect()
+
+
+def _persist_job(job: Dict[str, Any]) -> None:
+    """
+    Persistă job în SQLite. trades_df nu e serializat (prea mare);
+    se pierde la restart dar trades.csv poate fi re-generat dacă
+    vrei să adaugi un mecanism de re-run viitor.
+    """
+    safe = {k: v for k, v in job.items() if k != "trades_df"}
+    # BacktestRequest → dict pentru JSON
+    if hasattr(safe.get("request"), "model_dump"):
+        safe["request"] = safe["request"].model_dump(mode="json")
+    payload = json.dumps(safe, default=str)
+    _DB.execute(
+        "INSERT OR REPLACE INTO jobs (job_id, status, payload, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (job["job_id"], str(job["status"]), payload, job["created_at"]),
+    )
+    _DB.commit()
+
+
+def _load_jobs_from_db() -> Dict[str, Dict]:
+    """
+    Rehidratează _JOBS la startup din SQLite.
+    trades_df e setat la None (nu e persistat).
+    """
+    rows = _DB.execute(
+        "SELECT payload FROM jobs ORDER BY created_at DESC LIMIT 100"
+    ).fetchall()
+    result: Dict[str, Dict] = {}
+    for (payload_str,) in rows:
+        try:
+            data = json.loads(payload_str)
+            data["trades_df"] = None  # not persisted
+            # Re-hydrate BacktestRequest
+            if isinstance(data.get("request"), dict):
+                data["request"] = BacktestRequest(**data["request"])
+            result[data["job_id"]] = data
+        except Exception as exc:
+            logger.warning(f"DB load skip: {exc}")
+    return result
+
+
+# In-memory job store — rehidratat din DB la import
+_JOBS: Dict[str, Dict[str, Any]] = _load_jobs_from_db()
+
+# ---------------------------------------------------------------------------
+# Sprint 18 — Compare schemas
 # ---------------------------------------------------------------------------
 
 _COMPARE_METRICS_ALL = [
@@ -77,13 +156,10 @@ _COMPARE_METRICS_ALL = [
     "max_drawdown_pct", "win_rate", "profit_factor",
     "ann_return", "n_trades", "total_net_pnl",
 ]
-
-# Metrics where LOWER is better (used for normalization inversion)
 _LOWER_IS_BETTER = {"max_drawdown_pct"}
 
 
 class JobSummary(BaseModel):
-    """Metrics + key params for one job in a comparison."""
     job_id: str
     sym_y: str
     sym_x: str
@@ -102,47 +178,40 @@ class JobSummary(BaseModel):
 
 
 class RadarSeries(BaseModel):
-    """One job's normalized scores for all requested metrics (0–1)."""
     job_id: str
-    label: str  # e.g. "BTCUSDT/ETHUSDT 5f"
-    values: List[float]  # same order as `metrics` field in RadarData
+    label: str
+    values: List[float]
 
 
 class RadarData(BaseModel):
-    """Plotly-ready radar chart data."""
-    metrics: List[str]          # axis labels
-    series: List[RadarSeries]   # one per job
-    raw_min: Dict[str, float]   # raw min per metric (for tooltip denormalization)
-    raw_max: Dict[str, float]   # raw max per metric
+    metrics: List[str]
+    series: List[RadarSeries]
+    raw_min: Dict[str, float]
+    raw_max: Dict[str, float]
 
 
 class DiffMatrix(BaseModel):
-    """
-    Pairwise difference matrix.
-    cell[i][j][metric] = jobs[i].metric - jobs[j].metric
-    """
     job_ids: List[str]
     metrics: List[str]
-    matrix: List[List[Dict[str, float]]]  # [i][j] → {metric: diff}
+    matrix: List[List[Dict[str, float]]]
 
 
 class ParamField(BaseModel):
     param: str
-    values: Dict[str, Any]  # job_id → value
+    values: Dict[str, Any]
     all_equal: bool
 
 
 class CompareResponse(BaseModel):
-    """Full multi-run comparison payload."""
     job_ids: List[str]
     requested_metrics: List[str]
     rank_by: str
     best_job_id: str
-    ranking: List[str]              # job_ids sorted best → worst by rank_by
+    ranking: List[str]
     summary: List[JobSummary]
     radar: RadarData
     diff_matrix: DiffMatrix
-    param_diff: List[ParamField]    # only params that differ across jobs
+    param_diff: List[ParamField]
     comparison_ts: str
 
 
@@ -178,15 +247,7 @@ def _job_to_response(job: Dict) -> BacktestResponse:
     )
 
 
-def _generate_synthetic_prices(
-    n: int,
-    seed: int = 42,
-    freq: str = "1h",
-) -> pd.DataFrame:
-    """
-    Generează pereche de prețuri cointegrate sintetic, pentru dev/CI.
-    Returnează DataFrame cu coloane [timestamp, close_y, close_x].
-    """
+def _generate_synthetic_prices(n: int, seed: int = 42, freq: str = "1h") -> pd.DataFrame:
     rng = np.random.default_rng(seed)
     freq_map = {
         "1m": "1min", "3m": "3min", "5m": "5min", "15m": "15min",
@@ -201,35 +262,26 @@ def _generate_synthetic_prices(
 
 
 def _build_strategy_config(req: BacktestRequest):
-    """Construiește StrategyConfig din BacktestRequest."""
     try:
         from config.strategy_config import StrategyConfig
     except ImportError:
         raise HTTPException(status_code=500, detail="config.strategy_config not available")
-
     kwargs = dict(
-        sym_y=req.sym_y,
-        sym_x=req.sym_x,
-        bar_freq=req.bar_freq.value,
-        capital_usdt=req.capital_usdt,
-        vol_target=req.vol_target,
-        kelly_fraction=req.kelly_fraction,
-        max_leverage=req.max_leverage,
-        zscore_entry=req.zscore_entry,
-        zscore_exit=req.zscore_exit,
-        zscore_window=req.zscore_window,
-        warm_up_bars=req.warm_up_bars,
-        delta=req.delta,
-        observation_noise=req.observation_noise,
-        fee_rate=req.fee_rate,
-        slippage_pct=req.slippage_pct,
+        sym_y=req.sym_y, sym_x=req.sym_x, bar_freq=req.bar_freq.value,
+        capital_usdt=req.capital_usdt, vol_target=req.vol_target,
+        kelly_fraction=req.kelly_fraction, max_leverage=req.max_leverage,
+        zscore_entry=req.zscore_entry, zscore_exit=req.zscore_exit,
+        zscore_window=req.zscore_window, warm_up_bars=req.warm_up_bars,
+        delta=req.delta, observation_noise=req.observation_noise,
+        fee_rate=req.fee_rate, slippage_pct=req.slippage_pct,
     )
     if req.params_file:
         try:
-            cfg = StrategyConfig.from_optimizer_json(req.params_file)
-            return cfg
+            from config.strategy_config import StrategyConfig
+            return StrategyConfig.from_optimizer_json(req.params_file)
         except Exception as e:
             logger.warning(f"params_file load failed: {e} — using request params")
+    from config.strategy_config import StrategyConfig
     return StrategyConfig(**{k: v for k, v in kwargs.items() if v is not None})
 
 
@@ -238,36 +290,34 @@ def _build_strategy_config(req: BacktestRequest):
 # ---------------------------------------------------------------------------
 
 def _run_backtest_job(job_id: str, req: BacktestRequest) -> None:
+    """
+    Rulează backtest complet şi actualizează job store + SQLite.
+    Sigur de apelat din orice thread (ThreadPoolExecutor sau BackgroundTasks).
+    """
     job = _JOBS.get(job_id)
     if not job:
         return
 
     job["status"] = JobStatus.RUNNING
+    _persist_job(job)  # [FIX-1] persist running state
     t0 = time.monotonic()
 
     try:
         cfg = _build_strategy_config(req)
 
         if req.data_dir:
-            from pathlib import Path
             from backtest.engine_adapter import BacktestEngine
-            engine = BacktestEngine(
-                cfg,
-                n_splits=req.n_splits,
-                purge_bars=req.purge_bars,
-                embargo_bars=req.embargo_bars,
-            )
+            engine = BacktestEngine(cfg, n_splits=req.n_splits,
+                                    purge_bars=req.purge_bars,
+                                    embargo_bars=req.embargo_bars)
             result = engine.run(data_dir=Path(req.data_dir))
         else:
             n = req.n_bars or 2000
             df = _generate_synthetic_prices(n=n, freq=req.bar_freq.value)
             from backtest.engine_adapter import BacktestEngine
-            engine = BacktestEngine(
-                cfg,
-                n_splits=req.n_splits,
-                purge_bars=req.purge_bars,
-                embargo_bars=req.embargo_bars,
-            )
+            engine = BacktestEngine(cfg, n_splits=req.n_splits,
+                                    purge_bars=req.purge_bars,
+                                    embargo_bars=req.embargo_bars)
             result = engine.run(df=df)
 
         def _safe(v):
@@ -291,9 +341,7 @@ def _run_backtest_job(job_id: str, req: BacktestRequest) -> None:
             "overfit_flag":     bool(result.get("overfit_flag", False)),
         }
 
-        trades_df = result.get("trades_df")
-        if trades_df is None:
-            trades_df = pd.DataFrame()
+        trades_df = result.get("trades_df") or pd.DataFrame()
 
         job["status"]       = JobStatus.DONE
         job["metrics"]      = metrics
@@ -301,6 +349,7 @@ def _run_backtest_job(job_id: str, req: BacktestRequest) -> None:
         job["duration_s"]   = round(time.monotonic() - t0, 3)
         job["completed_at"] = datetime.now(timezone.utc).isoformat()
 
+        _persist_job(job)  # [FIX-1] persist completed state
         logger.info(
             f"[{job_id}] DONE in {job['duration_s']}s | "
             f"Sharpe={metrics['sharpe']:.2f} Trades={metrics['n_trades']}"
@@ -311,19 +360,15 @@ def _run_backtest_job(job_id: str, req: BacktestRequest) -> None:
         job["error"]        = str(exc)
         job["duration_s"]   = round(time.monotonic() - t0, 3)
         job["completed_at"] = datetime.now(timezone.utc).isoformat()
+        _persist_job(job)  # [FIX-1] persist error state
         logger.error(f"[{job_id}] ERROR: {exc}")
 
 
 # ---------------------------------------------------------------------------
-# Sprint 18 — Compare helpers
+# Compare helpers
 # ---------------------------------------------------------------------------
 
 def _parse_metrics_param(raw: str) -> List[str]:
-    """
-    Parsează query param metrics='sharpe,sortino,calmar'.
-    Validează că fiecare metric e în _COMPARE_METRICS_ALL.
-    Returnează lista deduplicată, ordinea păstrată.
-    """
     requested = [m.strip().lower() for m in raw.split(",") if m.strip()]
     invalid = [m for m in requested if m not in _COMPARE_METRICS_ALL]
     if invalid:
@@ -331,7 +376,6 @@ def _parse_metrics_param(raw: str) -> List[str]:
             status_code=422,
             detail=f"Unknown metrics: {invalid}. Valid: {_COMPARE_METRICS_ALL}",
         )
-    # dedup preserving order
     seen, result = set(), []
     for m in requested:
         if m not in seen:
@@ -341,10 +385,6 @@ def _parse_metrics_param(raw: str) -> List[str]:
 
 
 def _build_radar(summaries: List[JobSummary], metrics: List[str]) -> RadarData:
-    """
-    Normalizează metricile 0–1 (min-max per metrica).
-    Pentru metrici lower-is-better (max_drawdown_pct) inversează scala.
-    """
     raw_min: Dict[str, float] = {}
     raw_max: Dict[str, float] = {}
     for m in metrics:
@@ -356,80 +396,54 @@ def _build_radar(summaries: List[JobSummary], metrics: List[str]) -> RadarData:
     for s in summaries:
         normalized = []
         for m in metrics:
-            v    = float(s.metrics.get(m, 0.0))
-            lo   = raw_min[m]
-            hi   = raw_max[m]
+            v, lo, hi = float(s.metrics.get(m, 0.0)), raw_min[m], raw_max[m]
             span = hi - lo
-            if span == 0:
-                norm = 0.5  # all equal → mid
-            else:
-                norm = (v - lo) / span
-                if m in _LOWER_IS_BETTER:
-                    norm = 1.0 - norm  # invert: lower raw → higher score
+            norm = 0.5 if span == 0 else (v - lo) / span
+            if m in _LOWER_IS_BETTER:
+                norm = 1.0 - norm
             normalized.append(round(norm, 6))
-
         label = f"{s.sym_y}/{s.sym_x} {s.n_splits}f"
         series.append(RadarSeries(job_id=s.job_id, label=label, values=normalized))
 
     return RadarData(metrics=metrics, series=series, raw_min=raw_min, raw_max=raw_max)
 
 
-def _build_diff_matrix(
-    summaries: List[JobSummary],
-    metrics: List[str],
-) -> DiffMatrix:
-    """
-    Pairwise diff matrix: matrix[i][j][metric] = summaries[i].metric - summaries[j].metric
-    Diagonal is always 0.0.
-    """
+def _build_diff_matrix(summaries: List[JobSummary], metrics: List[str]) -> DiffMatrix:
     n = len(summaries)
     job_ids = [s.job_id for s in summaries]
     matrix: List[List[Dict[str, float]]] = []
-
     for i in range(n):
         row: List[Dict[str, float]] = []
         for j in range(n):
-            cell = {}
-            for m in metrics:
-                vi = float(summaries[i].metrics.get(m, 0.0))
-                vj = float(summaries[j].metrics.get(m, 0.0))
-                cell[m] = round(vi - vj, 6)
+            cell = {
+                m: round(float(summaries[i].metrics.get(m, 0.0))
+                         - float(summaries[j].metrics.get(m, 0.0)), 6)
+                for m in metrics
+            }
             row.append(cell)
         matrix.append(row)
-
     return DiffMatrix(job_ids=job_ids, metrics=metrics, matrix=matrix)
 
 
 def _build_param_diff(summaries: List[JobSummary]) -> List[ParamField]:
-    """
-    Confrontă parametrii între joburi, returnează doar cei care diferă.
-    Câmpuri comparate: zscore_entry, zscore_exit, delta, vol_target,
-    kelly_fraction, capital_usdt, n_splits, bar_freq, sym_y, sym_x.
-    """
     PARAM_FIELDS = [
         "sym_y", "sym_x", "bar_freq", "n_splits", "capital_usdt",
-        "zscore_entry", "zscore_exit", "delta", "vol_target",
-        "kelly_fraction",
+        "zscore_entry", "zscore_exit", "delta", "vol_target", "kelly_fraction",
     ]
     result: List[ParamField] = []
     for pf in PARAM_FIELDS:
         vals = {s.job_id: getattr(s, pf, None) for s in summaries}
-        unique_vals = set(
+        unique_vals = {
             v if not isinstance(v, float) else round(v, 8)
             for v in vals.values()
-        )
-        result.append(ParamField(
-            param=pf,
-            values=vals,
-            all_equal=(len(unique_vals) == 1),
-        ))
-    # Sort: differing params first
+        }
+        result.append(ParamField(param=pf, values=vals, all_equal=(len(unique_vals) == 1)))
     result.sort(key=lambda p: (p.all_equal, p.param))
     return result
 
 
 # ---------------------------------------------------------------------------
-# Endpoints — Sprint 16 (unchanged)
+# Endpoints — Sprint 16
 # ---------------------------------------------------------------------------
 
 @router.post("/run", response_model=BacktestResponse, status_code=202)
@@ -438,47 +452,51 @@ async def run_backtest(
     background_tasks: BackgroundTasks,
     sync: bool = Query(
         default=False,
-        description="Dacă True, blochează până la finalizare (max 120s). "
-                    "Dacă False (default), returnează imediat job_id."
+        description="True → blochează până la finalizare (rulat în ThreadPool). "
+                    "False (default) → răspuns imediat cu job_id.",
     ),
 ) -> BacktestResponse:
     """
     POST /api/backtest/run
 
-    Pornește un backtest walk-forward cu parametrii din body.
-
-    - **sync=false** (implicit): răspuns imediat cu `{job_id, status: queued}`;
-      poll GET /api/backtest/jobs/{job_id} până `status == done`.
-    - **sync=true**: blochează până la finalizare, returnează metrics complete.
-
-    Curl example::
-
-        curl -X POST http://localhost:8000/api/backtest/run \\
-          -H 'Content-Type: application/json' \\
-          -d '{"sym_y": "BTCUSDT", "sym_x": "ETHUSDT", "n_splits": 3, "n_bars": 1000}'
+    [FIX-2] sync=True rulează în ThreadPoolExecutor, nu în Uvicorn worker thread,
+    deci nu blochează event loop-ul altor request-uri concurente.
     """
+    # [FIX-3] Evict ONLY done/error jobs, never queued/running
     if len(_JOBS) >= _MAX_JOBS:
-        oldest = sorted(_JOBS.values(), key=lambda j: j["created_at"])[:10]
-        for j in oldest:
+        evictable = [
+            j for j in _JOBS.values()
+            if j["status"] in (JobStatus.DONE, JobStatus.ERROR)
+        ]
+        evictable_sorted = sorted(evictable, key=lambda j: j["created_at"])[:10]
+        for j in evictable_sorted:
             del _JOBS[j["job_id"]]
+            try:
+                _DB.execute("DELETE FROM jobs WHERE job_id = ?", (j["job_id"],))
+            except Exception:
+                pass
+        _DB.commit()
 
     job_id = str(uuid.uuid4())[:8]
     now = datetime.now(timezone.utc).isoformat()
 
     _JOBS[job_id] = {
-        "job_id":      job_id,
-        "status":      JobStatus.QUEUED,
-        "request":     req,
-        "metrics":     None,
-        "trades_df":   None,
-        "error":       None,
-        "duration_s":  None,
-        "created_at":  now,
+        "job_id":       job_id,
+        "status":       JobStatus.QUEUED,
+        "request":      req,
+        "metrics":      None,
+        "trades_df":    None,
+        "error":        None,
+        "duration_s":   None,
+        "created_at":   now,
         "completed_at": None,
     }
+    _persist_job(_JOBS[job_id])  # [FIX-1]
 
     if sync:
-        _run_backtest_job(job_id, req)
+        # [FIX-2] Run in ThreadPoolExecutor — non-blocking for event loop
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(_EXECUTOR, _run_backtest_job, job_id, req)
     else:
         background_tasks.add_task(_run_backtest_job, job_id, req)
 
@@ -490,25 +508,19 @@ async def list_jobs(
     status: Optional[str] = Query(default=None),
     limit: int = Query(default=20, ge=1, le=100),
 ) -> List[JobListItem]:
-    """GET /api/backtest/jobs — listează job-urile recente."""
     jobs = sorted(_JOBS.values(), key=lambda j: j["created_at"], reverse=True)
     if status:
         jobs = [j for j in jobs if j["status"] == status]
     jobs = jobs[:limit]
-
     result = []
     for j in jobs:
         req: BacktestRequest = j["request"]
         sharpe = j["metrics"].get("sharpe") if j.get("metrics") else None
         result.append(JobListItem(
-            job_id=j["job_id"],
-            status=j["status"],
-            sym_y=req.sym_y,
-            sym_x=req.sym_x,
-            bar_freq=req.bar_freq.value,
-            n_splits=req.n_splits,
-            created_at=j["created_at"],
-            duration_s=j.get("duration_s"),
+            job_id=j["job_id"], status=j["status"],
+            sym_y=req.sym_y, sym_x=req.sym_x,
+            bar_freq=req.bar_freq.value, n_splits=req.n_splits,
+            created_at=j["created_at"], duration_s=j.get("duration_s"),
             sharpe=sharpe,
         ))
     return result
@@ -516,7 +528,6 @@ async def list_jobs(
 
 @router.get("/jobs/{job_id}", response_model=BacktestResponse)
 async def get_job(job_id: str) -> BacktestResponse:
-    """GET /api/backtest/jobs/{job_id} — status + metrics."""
     job = _JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found")
@@ -525,7 +536,6 @@ async def get_job(job_id: str) -> BacktestResponse:
 
 @router.get("/jobs/{job_id}/trades.csv")
 async def download_trades_csv(job_id: str) -> StreamingResponse:
-    """GET /api/backtest/jobs/{job_id}/trades.csv — download CSV."""
     job = _JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found")
@@ -534,9 +544,8 @@ async def download_trades_csv(job_id: str) -> StreamingResponse:
             status_code=409,
             detail=f"Job {job_id!r} is {job['status']} — wait for status=done"
         )
-
-    df: pd.DataFrame = job.get("trades_df", pd.DataFrame())
-    if df is None or df.empty:
+    df: pd.DataFrame = job.get("trades_df") or pd.DataFrame()
+    if df.empty:
         headers = [
             "fold", "split", "entry_ts", "exit_ts", "direction",
             "entry_zscore", "exit_zscore", "hedge_ratio", "qty_y", "qty_x",
@@ -563,10 +572,14 @@ async def download_trades_csv(job_id: str) -> StreamingResponse:
 
 @router.delete("/jobs/{job_id}", status_code=204)
 async def delete_job(job_id: str) -> None:
-    """DELETE /api/backtest/jobs/{job_id} — șterge job din memorie."""
     if job_id not in _JOBS:
         raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found")
     del _JOBS[job_id]
+    try:
+        _DB.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+        _DB.commit()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -575,59 +588,25 @@ async def delete_job(job_id: str) -> None:
 
 @router.get("/compare", response_model=CompareResponse)
 async def compare_jobs(
-    job_ids: str = Query(
-        ...,
-        description="Comma-separated list of 2–10 job IDs to compare. "
-                    "All must have status=done.",
-        example="a1b2c3d4,e5f6g7h8,i9j0k1l2",
-    ),
+    job_ids: str = Query(..., description="Comma-separated 2–10 job IDs (all status=done)."),
     metrics: str = Query(
         default="sharpe,sortino,calmar,max_drawdown_pct,win_rate,profit_factor",
-        description="Comma-separated metrics to include in comparison. "
-                    f"Valid: {_COMPARE_METRICS_ALL}",
     ),
-    rank_by: str = Query(
-        default="sharpe",
-        description="Primary metric for ranking (higher = better, "
-                    "except max_drawdown_pct where lower = better).",
-    ),
-    include_trades_diff: bool = Query(
-        default=False,
-        description="Se True, agrega trade-count per fold pentru fiecare job "
-                    "(nu include raw trades).",
-    ),
+    rank_by: str = Query(default="sharpe"),
+    include_trades_diff: bool = Query(default=False),
 ) -> CompareResponse:
     """
     GET /api/backtest/compare?job_ids=id1,id2,id3
 
-    Compară N backtests side-by-side.
-
-    Returnează:
-    - **summary**: metrici complete pentru fiecare job
-    - **ranking**: job_ids sorted by `rank_by`
-    - **radar**: date normalizate 0-1 per metrica pentru Plotly radar chart
-    - **diff_matrix**: diferențe pairwise `jobs[i].metric - jobs[j].metric`
-    - **param_diff**: parametrii care diferă între joburi (differing first)
-    - **best_job_id**: job-ul cu cel mai bun `rank_by`
-
-    Curl example::
-
-        curl "http://localhost:8000/api/backtest/compare?job_ids=aabb1122,ccdd3344&rank_by=sharpe"
+    [FIX-4] Dacă orice job depăşeşte _COMPARE_MAX_ROWS_PER_JOB trade-uri,
+    returneaz 422 cu mesaj explicit — previne OOM la 10 × DF mari.
     """
-    # ── Parse job_ids ──
     ids = [jid.strip() for jid in job_ids.split(",") if jid.strip()]
     if len(ids) < 2:
-        raise HTTPException(
-            status_code=422,
-            detail="compare requires at least 2 job_ids (got {len(ids)})",
-        )
+        raise HTTPException(status_code=422, detail=f"compare requires at least 2 job_ids (got {len(ids)})")
     if len(ids) > 10:
-        raise HTTPException(
-            status_code=422,
-            detail=f"compare supports max 10 jobs (got {len(ids)})",
-        )
+        raise HTTPException(status_code=422, detail=f"compare supports max 10 jobs (got {len(ids)})")
 
-    # ── Resolve jobs ──
     jobs_resolved: List[Dict] = []
     for jid in ids:
         job = _JOBS.get(jid)
@@ -638,74 +617,59 @@ async def compare_jobs(
                 status_code=409,
                 detail=f"Job {jid!r} has status={job['status']} — must be done",
             )
+        # [FIX-4] OOM cap
+        df = job.get("trades_df")
+        if df is not None and not df.empty and len(df) > _COMPARE_MAX_ROWS_PER_JOB:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Job {jid!r} has {len(df):,} trade rows — exceeds "
+                    f"compare cap of {_COMPARE_MAX_ROWS_PER_JOB:,}. "
+                    "Use /jobs/{job_id}/trades.csv for large exports."
+                ),
+            )
         jobs_resolved.append(job)
 
-    # ── Parse + validate metrics ──
     requested_metrics = _parse_metrics_param(metrics)
 
-    # ── Validate rank_by ──
     if rank_by not in _COMPARE_METRICS_ALL:
         raise HTTPException(
             status_code=422,
             detail=f"rank_by={rank_by!r} not in valid metrics: {_COMPARE_METRICS_ALL}",
         )
     if rank_by not in requested_metrics:
-        # auto-add so it's always in the comparison
         requested_metrics = [rank_by] + requested_metrics
 
-    # ── Build summaries ──
     summaries: List[JobSummary] = []
     for job in jobs_resolved:
         req: BacktestRequest = job["request"]
         raw_metrics = job.get("metrics") or {}
-
-        # Fold-level trade counts if requested
         extra: Dict[str, Any] = {}
         if include_trades_diff and job.get("trades_df") is not None:
-            df: pd.DataFrame = job["trades_df"]
+            df = job["trades_df"]
             if not df.empty and "fold" in df.columns:
-                fold_counts = df.groupby("fold").size().to_dict()
-                extra["trades_per_fold"] = fold_counts
+                extra["trades_per_fold"] = df.groupby("fold").size().to_dict()
 
         metrics_payload = {m: raw_metrics.get(m, 0.0) for m in requested_metrics}
         metrics_payload.update(extra)
 
         summaries.append(JobSummary(
-            job_id=job["job_id"],
-            sym_y=req.sym_y,
-            sym_x=req.sym_x,
-            bar_freq=req.bar_freq.value,
-            n_splits=req.n_splits,
-            capital_usdt=req.capital_usdt,
-            zscore_entry=req.zscore_entry,
-            zscore_exit=req.zscore_exit,
-            delta=req.delta,
-            vol_target=req.vol_target,
-            kelly_fraction=req.kelly_fraction,
-            n_bars=req.n_bars,
-            metrics=metrics_payload,
-            duration_s=job.get("duration_s"),
-            created_at=job["created_at"],
+            job_id=job["job_id"], sym_y=req.sym_y, sym_x=req.sym_x,
+            bar_freq=req.bar_freq.value, n_splits=req.n_splits,
+            capital_usdt=req.capital_usdt, zscore_entry=req.zscore_entry,
+            zscore_exit=req.zscore_exit, delta=req.delta,
+            vol_target=req.vol_target, kelly_fraction=req.kelly_fraction,
+            n_bars=req.n_bars, metrics=metrics_payload,
+            duration_s=job.get("duration_s"), created_at=job["created_at"],
         ))
 
-    # ── Ranking ──
     def _rank_key(s: JobSummary) -> float:
         v = float(s.metrics.get(rank_by, 0.0))
-        # lower-is-better: invert sign for consistent sort (desc)
         return -v if rank_by in _LOWER_IS_BETTER else v
 
     summaries_sorted = sorted(summaries, key=_rank_key, reverse=True)
     ranking = [s.job_id for s in summaries_sorted]
     best_job_id = ranking[0]
-
-    # ── Radar ──
-    radar = _build_radar(summaries, requested_metrics)
-
-    # ── Diff matrix ──
-    diff_matrix = _build_diff_matrix(summaries, requested_metrics)
-
-    # ── Param diff ──
-    param_diff = _build_param_diff(summaries)
 
     return CompareResponse(
         job_ids=ids,
@@ -714,39 +678,22 @@ async def compare_jobs(
         best_job_id=best_job_id,
         ranking=ranking,
         summary=summaries,
-        radar=radar,
-        diff_matrix=diff_matrix,
-        param_diff=param_diff,
+        radar=_build_radar(summaries, requested_metrics),
+        diff_matrix=_build_diff_matrix(summaries, requested_metrics),
+        param_diff=_build_param_diff(summaries),
         comparison_ts=datetime.now(timezone.utc).isoformat(),
     )
 
 
-# ---------------------------------------------------------------------------
-# Sprint 18 — Multi-job CSV export
-# ---------------------------------------------------------------------------
-
 @router.get("/compare/trades.csv")
 async def compare_download_csv(
-    job_ids: str = Query(
-        ...,
-        description="Comma-separated job IDs (2–10, all must be status=done).",
-    ),
-    split: Optional[str] = Query(
-        default=None,
-        description="Filtrează: 'OOS', 'IS', sau None pentru toate.",
-    ),
+    job_ids: str = Query(...),
+    split: Optional[str] = Query(default=None),
 ) -> StreamingResponse:
     """
     GET /api/backtest/compare/trades.csv?job_ids=a,b,c
 
-    Descarcă un CSV combinat cu trade-urile tuturor job-urilor comparate.
-    Adaugă coloana `job_id` pentru identificare, plus `sym_y`, `sym_x`.
-    Streamed via generator pentru memorie minimă.
-
-    Curl example::
-
-        curl -o compare.csv \\
-          "http://localhost:8000/api/backtest/compare/trades.csv?job_ids=aabb1122,ccdd3344"
+    [FIX-4] Același OOM cap aplicat per job înainte de concat.
     """
     ids = [jid.strip() for jid in job_ids.split(",") if jid.strip()]
     if len(ids) < 2:
@@ -766,6 +713,14 @@ async def compare_download_csv(
             )
         df = job.get("trades_df")
         if df is not None and not df.empty:
+            if len(df) > _COMPARE_MAX_ROWS_PER_JOB:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"Job {jid!r} has {len(df):,} rows — exceeds cap "
+                        f"{_COMPARE_MAX_ROWS_PER_JOB:,}. Use single-job CSV."
+                    ),
+                )
             df = df.copy()
             df.insert(0, "job_id", jid)
             df.insert(1, "sym_y", job["request"].sym_y)
@@ -773,7 +728,6 @@ async def compare_download_csv(
             frames.append(df)
 
     if not frames:
-        # All jobs have empty trade DataFrames
         combined_csv = "job_id,sym_y,sym_x\n"
     else:
         combined = pd.concat(frames, ignore_index=True)
@@ -789,7 +743,7 @@ async def compare_download_csv(
     filename = f"quantluna_compare_{ts}.csv"
 
     def _stream():
-        chunk_size = 65536  # 64 KB
+        chunk_size = 65536
         for i in range(0, len(combined_csv), chunk_size):
             yield combined_csv[i: i + chunk_size]
 
