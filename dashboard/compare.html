@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>QuantLuna — Compare Jobs</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0d1117; --card: #161b22; --border: #30363d;
+      --text: #e6edf3; --muted: #8b949e;
+      --green: #3fb950; --red: #f85149; --blue: #58a6ff;
+      --yellow: #d29922;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; }
+    header { display: flex; align-items: center; gap: 12px; padding: 16px 24px; border-bottom: 1px solid var(--border); }
+    header h1 { font-size: 18px; font-weight: 600; }
+    header a { color: var(--blue); text-decoration: none; font-size: 13px; }
+    .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+    .input-row { display: flex; gap: 12px; margin-bottom: 24px; flex-wrap: wrap; }
+    input[type=text] {
+      flex: 1; min-width: 300px; padding: 8px 12px;
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 6px; color: var(--text); font-size: 14px;
+    }
+    input[type=text]:focus { outline: none; border-color: var(--blue); }
+    select {
+      padding: 8px 12px; background: var(--card); border: 1px solid var(--border);
+      border-radius: 6px; color: var(--text); font-size: 14px; cursor: pointer;
+    }
+    button {
+      padding: 8px 20px; border-radius: 6px; border: none;
+      font-size: 14px; font-weight: 500; cursor: pointer; transition: opacity .15s;
+    }
+    button:hover { opacity: 0.85; }
+    .btn-primary { background: var(--blue); color: #000; }
+    .btn-secondary { background: var(--card); color: var(--text); border: 1px solid var(--border); }
+    .btn-download { background: var(--green); color: #000; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+    @media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
+    .card {
+      background: var(--card); border: 1px solid var(--border);
+      border-radius: 8px; padding: 20px;
+    }
+    .card h2 { font-size: 15px; font-weight: 600; margin-bottom: 16px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+    canvas { max-height: 380px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { padding: 8px 10px; text-align: left; color: var(--muted); border-bottom: 1px solid var(--border); font-weight: 500; white-space: nowrap; }
+    td { padding: 7px 10px; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
+    tr:last-child td { border-bottom: none; }
+    .positive { color: var(--green); }
+    .negative { color: var(--red); }
+    .neutral { color: var(--muted); }
+    .differ { color: var(--yellow); font-weight: 600; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+    .badge-best { background: rgba(63,185,80,.2); color: var(--green); }
+    .badge-done { background: rgba(88,166,255,.15); color: var(--blue); }
+    #status { color: var(--muted); font-size: 13px; margin-bottom: 16px; min-height: 20px; }
+    #error { color: var(--red); font-size: 13px; margin-bottom: 16px; min-height: 20px; }
+    .separator { height: 24px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <span style="font-size:22px">&#127769;</span>
+  <h1>QuantLuna &mdash; Compare Backtest Jobs</h1>
+  <a href="/">&#8592; Dashboard</a>
+</header>
+
+<div class="container">
+  <div class="input-row">
+    <input type="text" id="jobIds"
+           placeholder="Job IDs (comma-separated, ex: a1b2c3d4, e5f6g7h8)"
+           value="" />
+    <select id="rankBy">
+      <option value="sharpe">Rank by: Sharpe</option>
+      <option value="sortino">Rank by: Sortino</option>
+      <option value="calmar">Rank by: Calmar</option>
+      <option value="ann_return">Rank by: Ann. Return</option>
+      <option value="win_rate">Rank by: Win Rate</option>
+      <option value="max_drawdown_pct">Rank by: Max DD (lower)</option>
+    </select>
+    <button class="btn-primary" onclick="loadCompare()">&#9654; Compare</button>
+    <button class="btn-download" onclick="downloadCsv()" id="btnDownload" disabled>&#11123; CSV</button>
+  </div>
+
+  <div id="status"></div>
+  <div id="error"></div>
+
+  <!-- Ranking bar -->
+  <div id="rankingBar" style="display:none; margin-bottom:24px;">
+    <div class="card">
+      <h2>Ranking</h2>
+      <div id="rankingList" style="display:flex; gap:12px; flex-wrap:wrap;"></div>
+    </div>
+  </div>
+
+  <!-- Radar + Diff Matrix -->
+  <div class="grid-2" id="mainGrid" style="display:none">
+    <div class="card">
+      <h2>Radar Chart</h2>
+      <canvas id="radarChart"></canvas>
+    </div>
+    <div class="card" style="overflow-x:auto">
+      <h2>Diff Matrix</h2>
+      <div id="diffMatrixContainer"></div>
+    </div>
+  </div>
+
+  <div class="separator"></div>
+
+  <!-- Metrics table -->
+  <div class="card" id="metricsCard" style="display:none; margin-bottom:24px;">
+    <h2>Metrics per Job</h2>
+    <div style="overflow-x:auto">
+      <table id="metricsTable"></table>
+    </div>
+  </div>
+
+  <!-- Param diff -->
+  <div class="card" id="paramCard" style="display:none">
+    <h2>Parameter Differences</h2>
+    <div style="overflow-x:auto">
+      <table id="paramTable"></table>
+    </div>
+  </div>
+</div>
+
+<script>
+const COLORS = [
+  '#58a6ff','#3fb950','#f0883e','#bc8cff','#ff7b72',
+  '#ffa657','#79c0ff','#56d364','#d2a8ff','#ffa198'
+];
+
+let _radarChart = null;
+let _lastJobIds = '';
+
+async function loadCompare() {
+  const jobIds = document.getElementById('jobIds').value.trim();
+  const rankBy = document.getElementById('rankBy').value;
+  if (!jobIds) { setError('Introdu cel putin 2 job IDs.'); return; }
+
+  setStatus('Se incarca...');
+  setError('');
+  hideAll();
+  _lastJobIds = jobIds;
+
+  try {
+    const url = `/api/backtest/compare?job_ids=${encodeURIComponent(jobIds)}&rank_by=${rankBy}&metrics=sharpe,sortino,calmar,max_drawdown_pct,win_rate,profit_factor,ann_return,n_trades,total_net_pnl`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({detail: res.statusText}));
+      throw new Error(err.detail || res.statusText);
+    }
+    const data = await res.json();
+    setStatus('');
+    renderAll(data);
+    document.getElementById('btnDownload').disabled = false;
+  } catch(e) {
+    setStatus('');
+    setError('Eroare: ' + e.message);
+  }
+}
+
+function renderAll(data) {
+  renderRanking(data);
+  renderRadar(data);
+  renderDiffMatrix(data);
+  renderMetrics(data);
+  renderParams(data);
+
+  document.getElementById('rankingBar').style.display = 'block';
+  document.getElementById('mainGrid').style.display = 'grid';
+  document.getElementById('metricsCard').style.display = 'block';
+  document.getElementById('paramCard').style.display = 'block';
+}
+
+function hideAll() {
+  ['rankingBar','mainGrid','metricsCard','paramCard'].forEach(id => {
+    document.getElementById(id).style.display = 'none';
+  });
+  document.getElementById('btnDownload').disabled = true;
+}
+
+function renderRanking(data) {
+  const el = document.getElementById('rankingList');
+  el.innerHTML = '';
+  data.ranking.forEach((jid, i) => {
+    const isBest = jid === data.best_job_id;
+    const s = data.summary.find(s => s.job_id === jid);
+    const label = s ? `${s.sym_y}/${s.sym_x}` : jid;
+    const badgeClass = isBest ? 'badge-best' : 'badge-done';
+    el.innerHTML += `
+      <div style="display:flex;align-items:center;gap:6px;">
+        <span style="color:${COLORS[i % COLORS.length]};font-weight:700;">#${i+1}</span>
+        <span class="badge ${badgeClass}">${isBest ? '🏆 ' : ''}${jid}</span>
+        <span style="color:var(--muted);font-size:12px">${label}</span>
+      </div>`;
+  });
+}
+
+function renderRadar(data) {
+  const radar = data.radar;
+  const labels = radar.metrics.map(m => m.replace('_', ' ').replace('pct','%'));
+
+  if (_radarChart) { _radarChart.destroy(); _radarChart = null; }
+
+  const datasets = radar.series.map((s, i) => ({
+    label: s.label,
+    data: s.values,
+    borderColor: COLORS[i % COLORS.length],
+    backgroundColor: COLORS[i % COLORS.length] + '22',
+    pointBackgroundColor: COLORS[i % COLORS.length],
+    borderWidth: 2,
+    pointRadius: 3,
+  }));
+
+  const ctx = document.getElementById('radarChart').getContext('2d');
+  _radarChart = new Chart(ctx, {
+    type: 'radar',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: true,
+      plugins: {
+        legend: { position: 'bottom', labels: { color: '#8b949e', boxWidth: 12, font: { size: 12 } } }
+      },
+      scales: {
+        r: {
+          min: 0, max: 1,
+          ticks: { display: false },
+          grid: { color: '#30363d' },
+          angleLines: { color: '#30363d' },
+          pointLabels: { color: '#8b949e', font: { size: 11 } },
+        }
+      }
+    }
+  });
+}
+
+function renderDiffMatrix(data) {
+  const dm = data.diff_matrix;
+  const container = document.getElementById('diffMatrixContainer');
+  const n = dm.job_ids.length;
+  let html = '<table><thead><tr><th></th>';
+  dm.job_ids.forEach((jid, i) => {
+    html += `<th style="color:${COLORS[i%COLORS.length]}">${jid}</th>`;
+  });
+  html += '</tr></thead><tbody>';
+
+  const mainMetric = data.rank_by || 'sharpe';
+
+  dm.matrix.forEach((row, i) => {
+    html += `<tr><td style="color:${COLORS[i%COLORS.length]};font-weight:600">${dm.job_ids[i]}</td>`;
+    row.forEach((cell, j) => {
+      if (i === j) {
+        html += `<td class="neutral">&mdash;</td>`;
+      } else {
+        const v = cell[mainMetric] !== undefined ? cell[mainMetric] : 0;
+        const cls = v > 0.001 ? 'positive' : v < -0.001 ? 'negative' : 'neutral';
+        const sign = v > 0 ? '+' : '';
+        html += `<td class="${cls}">${sign}${v.toFixed(3)}</td>`;
+      }
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  html += `<p style="color:var(--muted);font-size:11px;margin-top:8px">Diff pe: <strong>${mainMetric}</strong> (row − col)</p>`;
+  container.innerHTML = html;
+}
+
+function renderMetrics(data) {
+  const metrics = data.requested_metrics;
+  const summaries = data.summary;
+  let html = '<thead><tr><th>Metric</th>';
+  summaries.forEach((s, i) => {
+    const isBest = s.job_id === data.best_job_id;
+    html += `<th style="color:${COLORS[i%COLORS.length]}">${s.job_id}${isBest ? ' 🏆' : ''}</th>`;
+  });
+  html += '</tr></thead><tbody>';
+  metrics.forEach(m => {
+    const vals = summaries.map(s => parseFloat(s.metrics[m] ?? 0));
+    const best = m === 'max_drawdown_pct' ? Math.min(...vals) : Math.max(...vals);
+    html += `<tr><td style="color:var(--muted)">${m}</td>`;
+    summaries.forEach((s, i) => {
+      const v = parseFloat(s.metrics[m] ?? 0);
+      const isBestVal = Math.abs(v - best) < 1e-9;
+      const formatted = Number.isInteger(v) ? v : v.toFixed(4);
+      html += `<td style="${isBestVal ? 'color:var(--green);font-weight:700' : ''}">${formatted}</td>`;
+    });
+    html += '</tr>';
+  });
+  html += '</tbody>';
+  document.getElementById('metricsTable').innerHTML = html;
+}
+
+function renderParams(data) {
+  const params = data.param_diff;
+  const jobIds = data.job_ids;
+  let html = '<thead><tr><th>Param</th>';
+  jobIds.forEach((jid, i) => {
+    html += `<th style="color:${COLORS[i%COLORS.length]}">${jid}</th>`;
+  });
+  html += '</tr></thead><tbody>';
+  params.forEach(p => {
+    const cls = p.all_equal ? '' : 'differ';
+    html += `<tr><td class="${cls}">${p.param}</td>`;
+    jobIds.forEach(jid => {
+      const v = p.values[jid];
+      html += `<td class="${cls}">${v !== undefined && v !== null ? v : '&mdash;'}</td>`;
+    });
+    html += '</tr>';
+  });
+  html += '</tbody>';
+  document.getElementById('paramTable').innerHTML = html;
+}
+
+async function downloadCsv() {
+  if (!_lastJobIds) return;
+  const url = `/api/backtest/compare/trades.csv?job_ids=${encodeURIComponent(_lastJobIds)}`;
+  const a = document.createElement('a');
+  a.href = url; a.download = 'quantluna_compare.csv'; a.click();
+}
+
+function setStatus(msg) { document.getElementById('status').textContent = msg; }
+function setError(msg) { document.getElementById('error').textContent = msg; }
+
+// Enter key trigger
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('jobIds').addEventListener('keydown', e => {
+    if (e.key === 'Enter') loadCompare();
+  });
+});
+</script>
+</body>
+</html>
