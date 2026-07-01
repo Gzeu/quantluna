@@ -4,32 +4,82 @@ build-backend = "setuptools.backends.legacy:build"
 
 [project]
 name = "quantluna"
-version = "0.1.0"
-description = "Adaptive Kalman Filter Pairs Trading Engine for Crypto Markets"
-readme = "README.md"
-license = {text = "MIT"}
-authors = [{name = "George Pricop", email = "george@quantluna.dev"}]
+version = "0.14.0"
+description = "Statistical arbitrage pair-trading bot for crypto markets"
 requires-python = ">=3.10"
-keywords = ["pairs-trading", "kalman-filter", "statistical-arbitrage", "crypto", "quant"]
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "George Pricop", email = "96602369+Gzeu@users.noreply.github.com" }
+]
+keywords = ["trading", "crypto", "kalman", "cointegration", "pairs-trading", "optuna"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Financial and Insurance Industry",
-    "Topic :: Office/Business :: Financial :: Investment",
-    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
 ]
 
 [project.scripts]
-quantluna-backtest = "scripts.run_backtest:main"
-quantluna-live     = "scripts.run_live:main"
-quantluna-scan     = "scripts.scan_pairs:main"
+quantluna = "main:main"
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
 asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-v --tb=short"
 
+# ============================================================
+# Ruff — linter + formatter (replaces flake8 + black + isort)
+# ============================================================
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+extend-exclude = [".venv", "venv", "__pycache__", "data", "logs"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear  — real bugs
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "E501",  # line-too-long — handled by formatter
+    "B008",  # function calls in argument defaults (FastAPI pattern)
+    "SIM117",# multiple with statements
+    "UP007", # Use X | Y for union types (keep Optional for 3.10 compat)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["core", "config", "strategy", "execution", "risk", "backtest", "notifications", "dashboard"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.coverage.run]
+source = ["."] 
+omit = [
+    "tests/*",
+    "scripts/*",
+    ".venv/*",
+    "venv/*",
+    "setup.py",
+    "*/migrations/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "pass",
+]
