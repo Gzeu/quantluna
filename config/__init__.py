@@ -1,3 +1,5 @@
-from .settings import config, QuantLunaConfig, KalmanConfig, SignalConfig, RiskConfig
+# config package
+from config.cointegration_config import CointegrationConfig
+from config.strategy_config import StrategyConfig
 
-__all__ = ["config", "QuantLunaConfig", "KalmanConfig", "SignalConfig", "RiskConfig"]
+__all__ = ["CointegrationConfig", "StrategyConfig"]

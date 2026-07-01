@@ -1,727 +1,693 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>QuantLuna — Live Dashboard</title>
-<script src="https://cdn.plot.ly/plotly-2.32.0.min.js"></script>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@300..700&display=swap" rel="stylesheet">
-<style>
-/* ─── Design tokens ─────────────────────────────────────────────── */
-:root {
-  --font-body:    'Inter', system-ui, sans-serif;
-  --font-mono:    'JetBrains Mono', 'Fira Code', monospace;
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QuantLuna Dashboard</title>
+  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --surface2: #1c2128;
+      --border: #30363d;
+      --text: #e6edf3;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --green: #3fb950;
+      --red: #f85149;
+      --yellow: #d29922;
+      --purple: #bc8cff;
+      --orange: #ffa657;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace;
+      font-size: 14px;
+    }
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    header h1 { font-size: 18px; color: var(--accent); letter-spacing: 1px; }
+    #status-badge {
+      padding: 4px 12px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 600;
+      background: #21262d;
+      border: 1px solid var(--border);
+    }
+    .status-running  { color: var(--green);  border-color: var(--green)  !important; }
+    .status-idle     { color: var(--yellow); border-color: var(--yellow) !important; }
+    .status-halt     { color: var(--red);    border-color: var(--red)    !important; }
+    .status-error    { color: var(--red);    border-color: var(--red)    !important; }
 
-  --text-xs:   clamp(0.75rem,  0.7rem  + 0.25vw, 0.875rem);
-  --text-sm:   clamp(0.875rem, 0.8rem  + 0.35vw, 1rem);
-  --text-base: clamp(1rem,     0.95rem + 0.25vw, 1.125rem);
-  --text-lg:   clamp(1.125rem, 1rem    + 0.75vw, 1.5rem);
-  --text-xl:   clamp(1.5rem,   1.2rem  + 1.25vw, 2.25rem);
+    main { max-width: 1400px; margin: 0 auto; padding: 20px 24px; }
 
-  --space-1: 0.25rem; --space-2: 0.5rem;  --space-3: 0.75rem;
-  --space-4: 1rem;    --space-6: 1.5rem;  --space-8: 2rem;
-  --space-10: 2.5rem; --space-12: 3rem;
+    /* --- Stat cards --- */
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 12px;
+      margin-bottom: 20px;
+    }
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 14px 16px;
+    }
+    .card-label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
+    .card-value { font-size: 22px; font-weight: 600; margin-top: 4px; }
+    .positive { color: var(--green); }
+    .negative { color: var(--red); }
+    .neutral  { color: var(--text); }
 
-  --radius-sm: 0.375rem; --radius-md: 0.5rem;
-  --radius-lg: 0.75rem;  --radius-xl: 1rem;
+    /* --- Sections --- */
+    .section {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 16px;
+    }
+    .section-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .section-title .badge {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1px 8px;
+      font-size: 11px;
+    }
 
-  --transition: 180ms cubic-bezier(0.16, 1, 0.3, 1);
-}
+    /* --- Charts grid --- */
+    .charts-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    @media (max-width: 900px) { .charts-grid { grid-template-columns: 1fr; } }
 
-[data-theme="dark"] {
-  --bg:           #0d0f12;
-  --surface:      #131618;
-  --surface-2:    #181b1e;
-  --surface-3:    #1e2124;
-  --border:       rgba(255,255,255,0.07);
-  --text:         #e2e4e8;
-  --text-muted:   #6e737a;
-  --text-faint:   #3e4348;
-  --primary:      #4eaaff;
-  --primary-dim:  rgba(78,170,255,0.12);
-  --green:        #34d399;
-  --green-dim:    rgba(52,211,153,0.12);
-  --red:          #f87171;
-  --red-dim:      rgba(248,113,113,0.12);
-  --amber:        #fbbf24;
-  --amber-dim:    rgba(251,191,36,0.12);
-  --purple:       #a78bfa;
-  --shadow:       0 4px 16px rgba(0,0,0,0.4);
-}
+    .chart-box {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+    }
+    .chart-title { font-size: 12px; color: var(--text-muted); margin-bottom: 8px; }
 
-[data-theme="light"] {
-  --bg:           #f4f5f7;
-  --surface:      #ffffff;
-  --surface-2:    #f9fafb;
-  --surface-3:    #f0f2f5;
-  --border:       rgba(0,0,0,0.08);
-  --text:         #1a1d21;
-  --text-muted:   #6b7280;
-  --text-faint:   #d1d5db;
-  --primary:      #2563eb;
-  --primary-dim:  rgba(37,99,235,0.08);
-  --green:        #059669;
-  --green-dim:    rgba(5,150,105,0.08);
-  --red:          #dc2626;
-  --red-dim:      rgba(220,38,38,0.08);
-  --amber:        #d97706;
-  --amber-dim:    rgba(217,119,6,0.08);
-  --purple:       #7c3aed;
-  --shadow:       0 2px 8px rgba(0,0,0,0.08);
-}
+    /* --- Optimizer section --- */
+    .opt-grid {
+      display: grid;
+      grid-template-columns: 2fr 1fr;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+    @media (max-width: 900px) { .opt-grid { grid-template-columns: 1fr; } }
 
-/* ─── Reset & base ──────────────────────────────────────────────── */
-*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-html { -webkit-font-smoothing: antialiased; scroll-behavior: smooth; }
-body {
-  font-family: var(--font-body);
-  font-size: var(--text-sm);
-  color: var(--text);
-  background: var(--bg);
-  min-height: 100dvh;
-  line-height: 1.5;
-}
-mono, .mono { font-family: var(--font-mono); }
-button { cursor: pointer; border: none; background: none; font: inherit; color: inherit; }
-a { color: var(--primary); text-decoration: none; }
+    .opt-stat-row {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+    }
+    .opt-stat {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 14px;
+      min-width: 130px;
+    }
+    .opt-stat-label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; }
+    .opt-stat-value { font-size: 16px; font-weight: 600; margin-top: 2px; }
 
-/* ─── Layout ────────────────────────────────────────────────────── */
-.shell {
-  display: grid;
-  grid-template-rows: 52px 1fr;
-  min-height: 100dvh;
-}
+    /* --- Tables --- */
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th {
+      text-align: left;
+      padding: 6px 10px;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border);
+      font-weight: 500;
+      font-size: 11px;
+      text-transform: uppercase;
+    }
+    td { padding: 6px 10px; border-bottom: 1px solid #21262d; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: var(--surface2); }
 
-/* Header */
-.header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0 var(--space-6);
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-  position: sticky;
-  top: 0;
-  z-index: 100;
-  gap: var(--space-4);
-}
-.logo {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  font-weight: 700;
-  font-size: var(--text-base);
-  letter-spacing: -0.02em;
-}
-.logo svg { color: var(--primary); }
-.pair-label {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  padding: 2px var(--space-2);
-  background: var(--primary-dim);
-  color: var(--primary);
-  border-radius: var(--radius-sm);
-  font-weight: 600;
-}
-.header-right { display: flex; align-items: center; gap: var(--space-3); }
-.ws-dot {
-  width: 8px; height: 8px;
-  border-radius: 50%;
-  background: var(--text-faint);
-  transition: background var(--transition);
-}
-.ws-dot.connected { background: var(--green); box-shadow: 0 0 6px var(--green); }
-.ws-dot.error { background: var(--red); }
-.theme-toggle {
-  width: 32px; height: 32px;
-  border-radius: var(--radius-md);
-  display: flex; align-items: center; justify-content: center;
-  color: var(--text-muted);
-  transition: background var(--transition), color var(--transition);
-}
-.theme-toggle:hover { background: var(--surface-3); color: var(--text); }
-.state-badge {
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  padding: 2px var(--space-2);
-  border-radius: var(--radius-sm);
-  font-weight: 600;
-  text-transform: uppercase;
-  background: var(--surface-3);
-  color: var(--text-muted);
-}
-.state-badge.active { background: var(--green-dim); color: var(--green); }
-.state-badge.in_position { background: var(--primary-dim); color: var(--primary); }
-.state-badge.halted { background: var(--red-dim); color: var(--red); }
-.state-badge.warming_up { background: var(--amber-dim); color: var(--amber); }
-.state-badge.closing { background: var(--amber-dim); color: var(--amber); }
+    /* --- Tabs --- */
+    .tabs { display: flex; gap: 4px; margin-bottom: 16px; border-bottom: 1px solid var(--border); padding-bottom: 0; }
+    .tab {
+      padding: 8px 16px;
+      cursor: pointer;
+      font-size: 13px;
+      color: var(--text-muted);
+      border-bottom: 2px solid transparent;
+      margin-bottom: -1px;
+      transition: color 0.15s;
+    }
+    .tab:hover { color: var(--text); }
+    .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .tab-content { display: none; }
+    .tab-content.active { display: block; }
 
-/* Main content */
-.main {
-  padding: var(--space-6);
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
-  max-width: 1600px;
-  margin: 0 auto;
-  width: 100%;
-}
+    /* --- Misc --- */
+    .pill {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .pill-green  { background: #1a3a22; color: var(--green); }
+    .pill-red    { background: #3a1a1a; color: var(--red); }
+    .pill-yellow { background: #3a2e0a; color: var(--yellow); }
+    .pill-blue   { background: #0d2a50; color: var(--accent); }
 
-/* KPI row */
-.kpi-row {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(200px, 100%), 1fr));
-  gap: var(--space-3);
-}
-.kpi {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: var(--space-4);
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-1);
-  box-shadow: var(--shadow);
-  transition: box-shadow var(--transition);
-}
-.kpi:hover { box-shadow: 0 6px 24px rgba(0,0,0,0.3); }
-.kpi-label {
-  font-size: var(--text-xs);
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  font-weight: 500;
-}
-.kpi-value {
-  font-family: var(--font-mono);
-  font-size: var(--text-lg);
-  font-weight: 600;
-  color: var(--text);
-  transition: color var(--transition);
-  line-height: 1.1;
-}
-.kpi-value.pos { color: var(--green); }
-.kpi-value.neg { color: var(--red); }
-.kpi-value.warn { color: var(--amber); }
-.kpi-sub {
-  font-size: var(--text-xs);
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-}
+    #opt-refresh-btn {
+      padding: 6px 14px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      cursor: pointer;
+      font-size: 12px;
+      transition: border-color 0.15s;
+    }
+    #opt-refresh-btn:hover { border-color: var(--accent); color: var(--accent); }
 
-/* Two-column chart grid */
-.chart-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: var(--space-4);
-}
-@media (max-width: 900px) { .chart-grid { grid-template-columns: 1fr; } }
-
-.card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: var(--space-4);
-  box-shadow: var(--shadow);
-}
-.card-title {
-  font-size: var(--text-xs);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  font-weight: 600;
-  color: var(--text-muted);
-  margin-bottom: var(--space-3);
-}
-.chart-wrap { height: 240px; }
-
-/* Kalman panel */
-.kalman-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(min(180px, 100%), 1fr));
-  gap: var(--space-3);
-}
-
-/* Funding row */
-.funding-row {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: var(--space-3);
-}
-@media (max-width: 600px) { .funding-row { grid-template-columns: 1fr; } }
-.funding-card {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: var(--space-4);
-  box-shadow: var(--shadow);
-}
-.funding-label { font-size: var(--text-xs); color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 500; margin-bottom: var(--space-2); }
-.funding-rate { font-family: var(--font-mono); font-size: var(--text-base); font-weight: 600; }
-.funding-next { font-size: var(--text-xs); color: var(--text-muted); font-family: var(--font-mono); margin-top: var(--space-1); }
-
-/* Trades table */
-.table-wrap { overflow-x: auto; }
-table { width: 100%; border-collapse: collapse; font-size: var(--text-xs); font-family: var(--font-mono); }
-th {
-  text-align: left;
-  padding: var(--space-2) var(--space-3);
-  color: var(--text-muted);
-  font-weight: 500;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  border-bottom: 1px solid var(--border);
-  white-space: nowrap;
-}
-td {
-  padding: var(--space-2) var(--space-3);
-  border-bottom: 1px solid var(--border);
-  color: var(--text);
-  white-space: nowrap;
-}
-tr:last-child td { border-bottom: none; }
-tr:hover td { background: var(--surface-2); }
-.td-pos { color: var(--green); }
-.td-neg { color: var(--red); }
-
-/* Skeleton shimmer */
-@keyframes shimmer {
-  0%   { background-position: -400px 0; }
-  100% { background-position:  400px 0; }
-}
-.skeleton {
-  background: linear-gradient(90deg, var(--surface-3) 25%, var(--surface-2) 50%, var(--surface-3) 75%);
-  background-size: 400px 100%;
-  animation: shimmer 1.5s ease-in-out infinite;
-  border-radius: var(--radius-sm);
-  height: 1.2em;
-}
-
-/* Tooltip */
-.tooltip-wrap { position: relative; display: inline-block; }
-.tooltip-wrap:hover .tooltip-body { opacity: 1; pointer-events: auto; transform: translateY(0); }
-.tooltip-body {
-  position: absolute; bottom: calc(100% + 6px); left: 50%; transform: translateX(-50%) translateY(4px);
-  background: var(--surface-3); border: 1px solid var(--border);
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-md); font-size: var(--text-xs);
-  white-space: nowrap; opacity: 0; pointer-events: none;
-  transition: opacity 120ms, transform 120ms;
-  z-index: 200;
-}
-
-/* Scrollbar */
-::-webkit-scrollbar { width: 6px; height: 6px; }
-::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 3px; }
-
-/* Reduced motion */
-@media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
-}
-</style>
+    #opt-storage-input {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      padding: 5px 10px;
+      font-size: 12px;
+      width: 280px;
+    }
+    #last-update { font-size: 11px; color: var(--text-muted); }
+  </style>
 </head>
 <body>
-<div class="shell">
 
-  <!-- HEADER -->
-  <header class="header">
-    <div class="logo">
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-label="QuantLuna" role="img">
-        <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.5"/>
-        <path d="M12 3 C7 8 7 16 12 21" stroke="currentColor" stroke-width="1.5" fill="none"/>
-        <path d="M12 3 C17 8 17 16 12 21" stroke="currentColor" stroke-width="1.5" fill="none" opacity="0.4"/>
-        <circle cx="12" cy="12" r="2.5" fill="currentColor"/>
-      </svg>
-      QuantLuna
-    </div>
-    <div style="display:flex;align-items:center;gap:var(--space-3);">
-      <span class="pair-label" id="pair-label">—/—</span>
-      <span class="state-badge" id="state-badge">idle</span>
-    </div>
-    <div class="header-right">
-      <span class="ws-dot" id="ws-dot" title="WebSocket status"></span>
-      <span style="font-size:var(--text-xs);color:var(--text-muted);font-family:var(--font-mono);" id="last-update">--:--:--</span>
-      <button class="theme-toggle" id="theme-toggle" aria-label="Toggle theme" data-theme-toggle>
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-        </svg>
-      </button>
-    </div>
-  </header>
+<header>
+  <h1>⚡ QuantLuna</h1>
+  <div style="display:flex;align-items:center;gap:16px;">
+    <span id="last-update">connecting...</span>
+    <span id="status-badge">IDLE</span>
+  </div>
+</header>
 
-  <!-- MAIN -->
-  <main class="main">
+<main>
 
-    <!-- KPI Row -->
-    <section class="kpi-row" aria-label="Key metrics">
-      <div class="kpi">
-        <div class="kpi-label">Realized P&amp;L</div>
-        <div class="kpi-value" id="kpi-rpnl">—</div>
-        <div class="kpi-sub" id="kpi-rpnl-sub">all time</div>
+  <!-- Stat Cards -->
+  <div class="cards">
+    <div class="card">
+      <div class="card-label">PnL (USDT)</div>
+      <div class="card-value neutral" id="card-pnl">—</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Drawdown</div>
+      <div class="card-value neutral" id="card-dd">—</div>
+    </div>
+    <div class="card">
+      <div class="card-label">N Trades</div>
+      <div class="card-value neutral" id="card-trades">—</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Pair</div>
+      <div class="card-value neutral" id="card-pair">—</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Beta (Kalman)</div>
+      <div class="card-value neutral" id="card-beta">—</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Z-Score</div>
+      <div class="card-value neutral" id="card-zscore">—</div>
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('trading')">Trading</div>
+    <div class="tab" onclick="switchTab('optimizer')">Optimizer</div>
+    <div class="tab" onclick="switchTab('system')">System</div>
+  </div>
+
+  <!-- TAB: Trading -->
+  <div id="tab-trading" class="tab-content active">
+    <div class="charts-grid">
+      <div class="chart-box">
+        <div class="chart-title">Equity Curve</div>
+        <div id="chart-equity" style="height:220px"></div>
       </div>
-      <div class="kpi">
-        <div class="kpi-label">Open P&amp;L</div>
-        <div class="kpi-value" id="kpi-opnl">—</div>
-        <div class="kpi-sub" id="kpi-opnl-sub">current position</div>
+      <div class="chart-box">
+        <div class="chart-title">Z-Score History</div>
+        <div id="chart-zscore" style="height:220px"></div>
       </div>
-      <div class="kpi">
-        <div class="kpi-label">Daily P&amp;L</div>
-        <div class="kpi-value" id="kpi-dpnl">—</div>
-        <div class="kpi-sub" id="kpi-dpnl-sub">today UTC</div>
+    </div>
+
+    <div class="section">
+      <div class="section-title">
+        Recent Trades
+        <span class="badge" id="trades-count">0</span>
       </div>
-      <div class="kpi">
-        <div class="kpi-label">Z-Score</div>
-        <div class="kpi-value" id="kpi-zscore">—</div>
-        <div class="kpi-sub" id="kpi-zscore-sub">entry ≥ 2.0 | exit ≤ 0.5</div>
+      <table>
+        <thead><tr>
+          <th>Time</th><th>Pair</th><th>Direction</th><th>Notional</th><th>PnL</th><th>Reason</th>
+        </tr></thead>
+        <tbody id="trades-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- TAB: Optimizer (Sprint 13 / 14) -->
+  <div id="tab-optimizer" class="tab-content">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap;">
+      <input id="opt-storage-input" placeholder="sqlite:///optuna.db" value="">
+      <input id="opt-study-input" style="width:160px;" placeholder="quantluna_opt"
+             class="" style="background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:5px 10px;font-size:12px;">
+      <button id="opt-refresh-btn" onclick="loadOptimizerResults()">&#8635; Load Results</button>
+    </div>
+
+    <!-- Summary stats -->
+    <div class="opt-stat-row">
+      <div class="opt-stat">
+        <div class="opt-stat-label">Total Trials</div>
+        <div class="opt-stat-value" id="opt-n-trials">—</div>
       </div>
-      <div class="kpi">
-        <div class="kpi-label">Hedge Ratio β</div>
-        <div class="kpi-value mono" id="kpi-beta">—</div>
-        <div class="kpi-sub">Kalman estimate</div>
+      <div class="opt-stat">
+        <div class="opt-stat-label">Completed</div>
+        <div class="opt-stat-value" id="opt-n-complete">—</div>
       </div>
-      <div class="kpi">
-        <div class="kpi-label">Half-Life</div>
-        <div class="kpi-value mono" id="kpi-hl">—</div>
-        <div class="kpi-sub">mean reversion bars</div>
+      <div class="opt-stat">
+        <div class="opt-stat-label">Pruned</div>
+        <div class="opt-stat-value" id="opt-n-pruned">—</div>
       </div>
-      <div class="kpi">
-        <div class="kpi-label">Trades</div>
-        <div class="kpi-value" id="kpi-trades">—</div>
-        <div class="kpi-sub" id="kpi-fees">fees: —</div>
+      <div class="opt-stat">
+        <div class="opt-stat-label">Best Value</div>
+        <div class="opt-stat-value positive" id="opt-best-value">—</div>
       </div>
-      <div class="kpi">
-        <div class="kpi-label">Regime</div>
-        <div class="kpi-value" id="kpi-regime">—</div>
-        <div class="kpi-sub">cointegration status</div>
+      <div class="opt-stat">
+        <div class="opt-stat-label">Objective</div>
+        <div class="opt-stat-value" id="opt-objective">Sharpe</div>
       </div>
-    </section>
+    </div>
 
     <!-- Charts -->
-    <section class="chart-grid">
-      <div class="card">
-        <div class="card-title">Z-Score Series</div>
-        <div class="chart-wrap" id="chart-zscore"></div>
+    <div class="opt-grid">
+      <div class="chart-box">
+        <div class="chart-title">Trial Values — optimization history</div>
+        <div id="opt-chart-trials" style="height:260px"></div>
       </div>
-      <div class="card">
-        <div class="card-title">Cumulative P&amp;L (USDT)</div>
-        <div class="chart-wrap" id="chart-pnl"></div>
+      <div class="chart-box">
+        <div class="chart-title">Parameter Importances (fANOVA)</div>
+        <div id="opt-chart-importances" style="height:260px"></div>
       </div>
-    </section>
+    </div>
 
-    <!-- Kalman detail -->
-    <section class="card">
-      <div class="card-title">Kalman Filter Status</div>
-      <div class="kalman-grid">
-        <div class="kpi">
-          <div class="kpi-label">Kalman Gain</div>
-          <div class="kpi-value mono" id="kal-gain">—</div>
-          <div class="kpi-sub">0 = full trust prior | 1 = full trust obs</div>
-        </div>
-        <div class="kpi">
-          <div class="kpi-label">Uncertainty (P)</div>
-          <div class="kpi-value mono" id="kal-unc">—</div>
-          <div class="kpi-sub">posterior variance</div>
-        </div>
-        <div class="kpi">
-          <div class="kpi-label">Spread</div>
-          <div class="kpi-value mono" id="kal-spread">—</div>
-          <div class="kpi-sub">Y − β·X</div>
-        </div>
-        <div class="kpi">
-          <div class="kpi-label">Price Y</div>
-          <div class="kpi-value mono" id="kal-py">—</div>
-          <div class="kpi-sub" id="kal-py-sym">—</div>
-        </div>
-        <div class="kpi">
-          <div class="kpi-label">Price X</div>
-          <div class="kpi-value mono" id="kal-px">—</div>
-          <div class="kpi-sub" id="kal-px-sym">—</div>
-        </div>
-      </div>
-    </section>
+    <!-- Best params table -->
+    <div class="section">
+      <div class="section-title">Best Hyperparameters</div>
+      <table>
+        <thead><tr><th>Parameter</th><th>Value</th><th>Importance</th></tr></thead>
+        <tbody id="opt-params-tbody"></tbody>
+      </table>
+    </div>
 
-    <!-- Funding rates -->
-    <section>
-      <div class="card-title" style="margin-bottom:var(--space-3);text-transform:uppercase;letter-spacing:0.06em;font-size:var(--text-xs);color:var(--text-muted);font-weight:600;">Funding Rates</div>
-      <div class="funding-row">
-        <div class="funding-card">
-          <div class="funding-label" id="fund-label-y">LEG Y</div>
-          <div class="funding-rate" id="fund-rate-y">—</div>
-          <div class="funding-next" id="fund-next-y">next: —</div>
-        </div>
-        <div class="funding-card">
-          <div class="funding-label" id="fund-label-x">LEG X</div>
-          <div class="funding-rate" id="fund-rate-x">—</div>
-          <div class="funding-next" id="fund-next-x">next: —</div>
-        </div>
+    <!-- Top trials table -->
+    <div class="section">
+      <div class="section-title">
+        Top Trials
+        <span class="badge" id="opt-trials-count">0</span>
       </div>
-    </section>
+      <table>
+        <thead><tr>
+          <th>#</th><th>Value</th><th>delta</th><th>zscore_entry</th>
+          <th>kelly</th><th>vol_target</th><th>Duration</th>
+        </tr></thead>
+        <tbody id="opt-trials-tbody"></tbody>
+      </table>
+    </div>
+  </div>
 
-    <!-- Recent trades -->
-    <section class="card">
-      <div class="card-title">Recent Trades (last 50)</div>
-      <div class="table-wrap">
-        <table aria-label="Recent trades">
-          <thead>
-            <tr>
-              <th>#</th>
-              <th>Time (UTC)</th>
-              <th>Side</th>
-              <th>Entry Y</th>
-              <th>Entry X</th>
-              <th>Exit Y</th>
-              <th>Exit X</th>
-              <th>Fees</th>
-              <th>P&amp;L</th>
-            </tr>
-          </thead>
-          <tbody id="trades-tbody">
-            <tr><td colspan="9" style="text-align:center;color:var(--text-muted);padding:var(--space-8);">No trades yet</td></tr>
-          </tbody>
-        </table>
-      </div>
-    </section>
+  <!-- TAB: System -->
+  <div id="tab-system" class="tab-content">
+    <div class="section">
+      <div class="section-title">System Health</div>
+      <table>
+        <thead><tr><th>Check</th><th>Status</th><th>Details</th></tr></thead>
+        <tbody id="health-tbody"></tbody>
+      </table>
+    </div>
+    <div class="section" style="margin-top:12px;">
+      <div class="section-title">Raw State</div>
+      <pre id="raw-state" style="font-size:11px;color:var(--text-muted);overflow:auto;max-height:300px;"></pre>
+    </div>
+  </div>
 
-  </main>
-</div><!-- .shell -->
+</main>
 
 <script>
-(function () {
-  'use strict';
+// ============================================================
+// QuantLuna Dashboard — Sprint 14
+// ============================================================
 
-  // ── Theme toggle ────────────────────────────────────────────────────
-  const root = document.documentElement;
-  let theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
-  root.setAttribute('data-theme', theme);
+const API = '';
+let wsConn = null;
+let equityData = { x: [], y: [] };
+let zscoreData = { x: [], y: [] };
+let optData = null;
 
-  const themeBtn = document.getElementById('theme-toggle');
-  const SUN = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>`;
-  const MOON = `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>`;
-  function applyTheme(t) {
-    root.setAttribute('data-theme', t);
-    themeBtn.innerHTML = t === 'dark' ? SUN : MOON;
-    themeBtn.setAttribute('aria-label', 'Switch to ' + (t === 'dark' ? 'light' : 'dark') + ' mode');
-    redrawCharts();
+// --- Plotly common layout ---
+const LAYOUT_BASE = {
+  paper_bgcolor: 'transparent',
+  plot_bgcolor: 'transparent',
+  font: { color: '#8b949e', size: 11 },
+  margin: { l: 45, r: 12, t: 8, b: 35 },
+  xaxis: { gridcolor: '#21262d', zerolinecolor: '#30363d' },
+  yaxis: { gridcolor: '#21262d', zerolinecolor: '#30363d' },
+};
+const CONFIG = { displayModeBar: false, responsive: true };
+
+// ============================================================
+// Tab switching
+// ============================================================
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  document.querySelector(`.tab[onclick="switchTab('${name}')"]`).classList.add('active');
+  document.getElementById(`tab-${name}`).classList.add('active');
+  if (name === 'optimizer' && !optData) loadOptimizerResults();
+  if (name === 'system') loadHealth();
+}
+
+// ============================================================
+// WebSocket live feed
+// ============================================================
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  wsConn = new WebSocket(`${proto}://${location.host}/ws/live`);
+
+  wsConn.onmessage = (evt) => {
+    const state = JSON.parse(evt.data);
+    updateCards(state);
+    updateStatusBadge(state.status);
+    document.getElementById('last-update').textContent =
+      new Date().toLocaleTimeString();
+  };
+
+  wsConn.onclose = () => {
+    setTimeout(connectWS, 3000);  // reconnect
+  };
+
+  wsConn.onerror = () => wsConn.close();
+}
+
+// ============================================================
+// State cards
+// ============================================================
+function updateCards(s) {
+  const pnl = parseFloat(s.pnl_usdt || 0);
+  setCard('card-pnl', `$${pnl.toFixed(2)}`, pnl >= 0 ? 'positive' : 'negative');
+
+  const dd = parseFloat(s.drawdown || 0);
+  setCard('card-dd', `${(dd * 100).toFixed(2)}%`, dd <= -0.05 ? 'negative' : 'neutral');
+
+  setCard('card-trades', s.n_trades ?? '—', 'neutral');
+  setCard('card-pair', s.pair || '—', 'neutral');
+
+  const beta = parseFloat(s.beta || 0);
+  setCard('card-beta', isNaN(beta) ? '—' : beta.toFixed(4), 'neutral');
+
+  const z = parseFloat(s.zscore || 0);
+  setCard('card-zscore', isNaN(z) ? '—' : z.toFixed(3),
+    Math.abs(z) > 2 ? 'positive' : 'neutral');
+
+  // Append to mini charts
+  const ts = new Date().toLocaleTimeString();
+  equityData.x.push(ts);
+  equityData.y.push(pnl + 10000);  // approximate equity
+  zscoreData.x.push(ts);
+  zscoreData.y.push(z);
+  if (equityData.x.length > 200) {
+    equityData.x.shift(); equityData.y.shift();
+    zscoreData.x.shift(); zscoreData.y.shift();
   }
-  themeBtn.addEventListener('click', () => { theme = theme === 'dark' ? 'light' : 'dark'; applyTheme(theme); });
-  applyTheme(theme);
+  renderMiniCharts();
 
-  // ── Chart setup ─────────────────────────────────────────────────────
-  const CHART_MARGIN = { l: 44, r: 16, t: 8, b: 36 };
-  let zData = { ts: [], v: [] };
-  let pData = { ts: [], v: [] };
+  document.getElementById('raw-state').textContent = JSON.stringify(s, null, 2);
+}
 
-  function chartLayout(yTitle) {
-    const dark = root.getAttribute('data-theme') === 'dark';
-    return {
-      margin: CHART_MARGIN,
-      paper_bgcolor: 'transparent',
-      plot_bgcolor: 'transparent',
-      font: { family: "'JetBrains Mono', monospace", size: 11, color: dark ? '#6e737a' : '#6b7280' },
-      xaxis: {
-        gridcolor: dark ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.04)',
-        zeroline: false, showline: false, tickfont: { size: 10 },
+function setCard(id, value, cls) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.textContent = value;
+  el.className = 'card-value ' + (cls || 'neutral');
+}
+
+function updateStatusBadge(status) {
+  const el = document.getElementById('status-badge');
+  el.textContent = status || 'UNKNOWN';
+  el.className = 'status-' + (status || 'idle').toLowerCase();
+}
+
+// ============================================================
+// Mini charts (equity + zscore)
+// ============================================================
+function renderMiniCharts() {
+  Plotly.react('chart-equity', [{
+    x: equityData.x, y: equityData.y,
+    type: 'scatter', mode: 'lines',
+    line: { color: '#3fb950', width: 1.5 },
+    fill: 'tozeroy', fillcolor: 'rgba(63,185,80,0.07)',
+  }], { ...LAYOUT_BASE, yaxis: { ...LAYOUT_BASE.yaxis, tickprefix: '$' } }, CONFIG);
+
+  Plotly.react('chart-zscore', [{
+    x: zscoreData.x, y: zscoreData.y,
+    type: 'scatter', mode: 'lines',
+    line: { color: '#58a6ff', width: 1.5 },
+  }, {
+    x: [zscoreData.x[0], zscoreData.x[zscoreData.x.length-1]],
+    y: [2, 2], type: 'scatter', mode: 'lines',
+    line: { color: '#f85149', dash: 'dot', width: 1 }, showlegend: false,
+  }, {
+    x: [zscoreData.x[0], zscoreData.x[zscoreData.x.length-1]],
+    y: [-2, -2], type: 'scatter', mode: 'lines',
+    line: { color: '#f85149', dash: 'dot', width: 1 }, showlegend: false,
+  }], LAYOUT_BASE, CONFIG);
+}
+
+// ============================================================
+// Performance (equity from API)
+// ============================================================
+async function loadPerformance() {
+  try {
+    const r = await fetch(`${API}/api/performance`);
+    const d = await r.json();
+    const trades = d.recent_trades || [];
+    renderTradesTable(trades);
+  } catch(e) { console.warn('perf fetch:', e); }
+}
+
+function renderTradesTable(trades) {
+  const tbody = document.getElementById('trades-tbody');
+  document.getElementById('trades-count').textContent = trades.length;
+  tbody.innerHTML = trades.slice(-20).reverse().map(t => {
+    const pnl = parseFloat(t.pnl_net ?? t.pnl ?? 0);
+    const cls = pnl >= 0 ? 'pill-green' : 'pill-red';
+    return `<tr>
+      <td>${t.exit_ts || t.ts || ''}</td>
+      <td>${t.pair || ''}</td>
+      <td>${t.direction || ''}</td>
+      <td>$${parseFloat(t.notional_usdt ?? 0).toFixed(0)}</td>
+      <td><span class="pill ${cls}">$${pnl.toFixed(2)}</span></td>
+      <td>${t.reason || ''}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ============================================================
+// OPTIMIZER RESULTS  — Sprint 13/14
+// ============================================================
+async function loadOptimizerResults() {
+  const storage = document.getElementById('opt-storage-input').value.trim() || undefined;
+  const studyName = document.getElementById('opt-study-input')?.value.trim() || 'quantluna_opt';
+
+  let url = `${API}/api/optimize/results?top_n=100&study_name=${encodeURIComponent(studyName)}`;
+  if (storage) url += `&storage=${encodeURIComponent(storage)}`;
+
+  try {
+    const r = await fetch(url);
+    const d = await r.json();
+    optData = d;
+    renderOptimizerResults(d);
+  } catch(e) {
+    console.warn('optimizer fetch:', e);
+  }
+}
+
+function renderOptimizerResults(d) {
+  // Summary stats
+  document.getElementById('opt-n-trials').textContent   = d.n_trials ?? '—';
+  document.getElementById('opt-n-complete').textContent = d.n_complete ?? '—';
+  document.getElementById('opt-n-pruned').textContent   = d.n_pruned ?? '—';
+  document.getElementById('opt-best-value').textContent = d.best_value != null ? d.best_value.toFixed(3) : '—';
+  document.getElementById('opt-trials-count').textContent = (d.trials || []).length;
+
+  if (d.message) {
+    // No data yet
+    document.getElementById('opt-chart-trials').innerHTML =
+      `<div style="padding:40px;text-align:center;color:var(--text-muted);">${d.message}</div>`;
+    return;
+  }
+
+  // --- Trial values chart ---
+  const trials = d.trials || [];
+  if (trials.length > 0) {
+    const sorted = [...trials].sort((a, b) => a.number - b.number);
+    const xs = sorted.map(t => t.number);
+    const ys = sorted.map(t => t.value);
+    // Running best
+    const best = [];
+    let runMax = -Infinity;
+    ys.forEach(v => { runMax = Math.max(runMax, v ?? -Infinity); best.push(runMax === -Infinity ? null : runMax); });
+
+    Plotly.react('opt-chart-trials', [
+      {
+        x: xs, y: ys,
+        type: 'scatter', mode: 'markers',
+        marker: { color: '#58a6ff', size: 4, opacity: 0.7 },
+        name: 'Trial value',
       },
-      yaxis: {
-        title: { text: yTitle, font: { size: 10 }, standoff: 8 },
-        gridcolor: dark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)',
-        zeroline: true,
-        zerolinecolor: dark ? 'rgba(255,255,255,0.15)' : 'rgba(0,0,0,0.12)',
-        zerolinewidth: 1,
-        tickfont: { size: 10 },
+      {
+        x: xs, y: best,
+        type: 'scatter', mode: 'lines',
+        line: { color: '#3fb950', width: 2 },
+        name: 'Running best',
       },
-      hovermode: 'x unified',
-      showlegend: false,
-    };
+    ], {
+      ...LAYOUT_BASE,
+      legend: { font: { size: 10, color: '#8b949e' }, bgcolor: 'transparent' },
+      xaxis: { ...LAYOUT_BASE.xaxis, title: { text: 'Trial #', font: { size: 10 } } },
+      yaxis: { ...LAYOUT_BASE.yaxis, title: { text: 'Sharpe', font: { size: 10 } } },
+    }, CONFIG);
   }
 
-  function buildZTrace() {
-    const dark = root.getAttribute('data-theme') === 'dark';
-    return [{
-      x: zData.ts.map(t => new Date(t * 1000)),
-      y: zData.v,
-      type: 'scatter', mode: 'lines',
-      line: { color: dark ? '#4eaaff' : '#2563eb', width: 1.5, shape: 'spline' },
-      name: 'z-score',
-      fill: 'tozeroy',
-      fillcolor: dark ? 'rgba(78,170,255,0.06)' : 'rgba(37,99,235,0.04)',
-    }, {
-      x: [zData.ts[0] ? new Date(zData.ts[0]*1000) : new Date(), zData.ts[zData.ts.length-1] ? new Date(zData.ts[zData.ts.length-1]*1000) : new Date()],
-      y: [2, 2],
-      type: 'scatter', mode: 'lines',
-      line: { color: dark ? 'rgba(248,113,113,0.5)' : 'rgba(220,38,38,0.4)', width: 1, dash: 'dot' },
-      name: '+2σ',
-    }, {
-      x: [zData.ts[0] ? new Date(zData.ts[0]*1000) : new Date(), zData.ts[zData.ts.length-1] ? new Date(zData.ts[zData.ts.length-1]*1000) : new Date()],
-      y: [-2, -2],
-      type: 'scatter', mode: 'lines',
-      line: { color: dark ? 'rgba(248,113,113,0.5)' : 'rgba(220,38,38,0.4)', width: 1, dash: 'dot' },
-      name: '-2σ',
-    }];
+  // --- Parameter importances chart ---
+  const imp = d.param_importances || {};
+  const impKeys = Object.keys(imp);
+  if (impKeys.length > 0) {
+    const sorted = impKeys.sort((a, b) => imp[b] - imp[a]);
+    Plotly.react('opt-chart-importances', [{
+      x: sorted.map(k => imp[k]),
+      y: sorted.map(k => k.replace(/_/g, ' ')),
+      type: 'bar',
+      orientation: 'h',
+      marker: {
+        color: sorted.map((_, i) => `hsl(${210 + i * 20}, 70%, ${60 - i * 3}%)`),
+      },
+    }], {
+      ...LAYOUT_BASE,
+      margin: { l: 100, r: 12, t: 8, b: 35 },
+      xaxis: { ...LAYOUT_BASE.xaxis, title: { text: 'Importance', font: { size: 10 } }, range: [0, 1] },
+    }, CONFIG);
+  } else {
+    document.getElementById('opt-chart-importances').innerHTML =
+      '<div style="padding:30px;text-align:center;color:var(--text-muted);font-size:12px;">Importances available after ≥10 completed trials</div>';
   }
 
-  function buildPnlTrace() {
-    const dark = root.getAttribute('data-theme') === 'dark';
-    const pos = pData.v.length === 0 || pData.v[pData.v.length - 1] >= 0;
-    return [{
-      x: pData.ts.map(t => new Date(t * 1000)),
-      y: pData.v,
-      type: 'scatter', mode: 'lines',
-      line: { color: pos ? (dark ? '#34d399' : '#059669') : (dark ? '#f87171' : '#dc2626'), width: 1.5, shape: 'spline' },
-      name: 'P&L',
-      fill: 'tozeroy',
-      fillcolor: pos ? (dark ? 'rgba(52,211,153,0.07)' : 'rgba(5,150,105,0.05)') : (dark ? 'rgba(248,113,113,0.07)' : 'rgba(220,38,38,0.05)'),
-    }];
-  }
+  // --- Best params table ---
+  const tbody = document.getElementById('opt-params-tbody');
+  const bp = d.best_params || {};
+  tbody.innerHTML = Object.entries(bp).map(([k, v]) => {
+    const importance = imp[k];
+    const impStr = importance != null
+      ? `<div style="display:flex;align-items:center;gap:6px;">
+           <div style="width:${Math.round(importance*100)}px;height:6px;background:#58a6ff;border-radius:3px;"></div>
+           <span>${(importance*100).toFixed(1)}%</span>
+         </div>`
+      : '—';
+    const displayVal = typeof v === 'number'
+      ? (Math.abs(v) < 0.01 ? v.toExponential(2) : v.toFixed(4))
+      : v;
+    return `<tr><td><code>${k}</code></td><td><strong>${displayVal}</strong></td><td>${impStr}</td></tr>`;
+  }).join('');
 
-  const CFG = { displayModeBar: false, responsive: true, scrollZoom: false };
+  // --- Top trials table ---
+  const trialsTbody = document.getElementById('opt-trials-tbody');
+  trialsTbody.innerHTML = trials.slice(0, 20).map((t, i) => {
+    const p = t.params || {};
+    const valueCls = t.value > 1.5 ? 'positive' : t.value > 0.5 ? 'neutral' : 'negative';
+    return `<tr>
+      <td>${t.number}</td>
+      <td class="${valueCls}"><strong>${t.value?.toFixed(3) ?? '—'}</strong></td>
+      <td>${p.delta != null ? p.delta.toExponential(1) : '—'}</td>
+      <td>${p.zscore_entry?.toFixed(2) ?? '—'}</td>
+      <td>${p.kelly_fraction?.toFixed(2) ?? '—'}</td>
+      <td>${p.vol_target?.toFixed(4) ?? '—'}</td>
+      <td>${t.duration_s != null ? t.duration_s + 's' : '—'}</td>
+    </tr>`;
+  }).join('');
+}
 
-  Plotly.newPlot('chart-zscore', buildZTrace(), chartLayout('z-score'), CFG);
-  Plotly.newPlot('chart-pnl', buildPnlTrace(), chartLayout('USDT'), CFG);
+// ============================================================
+// System Health
+// ============================================================
+async function loadHealth() {
+  try {
+    const r = await fetch(`${API}/api/health`);
+    const d = await r.json();
+    const tbody = document.getElementById('health-tbody');
+    tbody.innerHTML = [
+      ['Trading Status', d.trading_status, d.trading_status === 'RUNNING' ? 'pill-green' : 'pill-yellow'],
+      ['PnL', `$${parseFloat(d.pnl_usdt || 0).toFixed(2)}`, 'pill-blue'],
+      ['Drawdown', `${(parseFloat(d.drawdown || 0) * 100).toFixed(2)}%`, parseFloat(d.drawdown) < -0.05 ? 'pill-red' : 'pill-green'],
+      ['N Trades', d.n_trades, 'pill-blue'],
+      ['Last Update', d.last_update || '—', 'pill-yellow'],
+    ].map(([label, value, cls]) =>
+      `<tr><td>${label}</td><td><span class="pill ${cls}">${value}</span></td><td>—</td></tr>`
+    ).join('');
+  } catch(e) { console.warn('health fetch:', e); }
+}
 
-  function redrawCharts() {
-    Plotly.react('chart-zscore', buildZTrace(), chartLayout('z-score'), CFG);
-    Plotly.react('chart-pnl', buildPnlTrace(), chartLayout('USDT'), CFG);
-  }
+// ============================================================
+// Init
+// ============================================================
+window.addEventListener('DOMContentLoaded', () => {
+  // Init empty charts
+  Plotly.newPlot('chart-equity', [], LAYOUT_BASE, CONFIG);
+  Plotly.newPlot('chart-zscore', [], LAYOUT_BASE, CONFIG);
+  Plotly.newPlot('opt-chart-trials', [], LAYOUT_BASE, CONFIG);
+  Plotly.newPlot('opt-chart-importances', [], LAYOUT_BASE, CONFIG);
 
-  // ── DOM helpers ──────────────────────────────────────────────────────
-  function el(id) { return document.getElementById(id); }
-  function setMono(id, val, decimals = 4) {
-    const e = el(id);
-    if (!e) return;
-    e.textContent = val === null || val === undefined ? '—' : (+val).toFixed(decimals);
-  }
-  function setPnl(id, val, suffix = '') {
-    const e = el(id);
-    if (!e) return;
-    const n = +val;
-    e.textContent = (n >= 0 ? '+' : '') + n.toFixed(2) + ' USDT' + suffix;
-    e.className = 'kpi-value' + (n > 0 ? ' pos' : n < 0 ? ' neg' : '');
-  }
-  function setFunding(id, val) {
-    const e = el(id);
-    if (!e) return;
-    const pct = (+val * 100).toFixed(4);
-    e.textContent = pct + '%';
-    e.style.color = +val > 0 ? 'var(--green)' : +val < 0 ? 'var(--red)' : 'var(--text)';
-  }
-
-  // ── State update ─────────────────────────────────────────────────────
-  function applySnapshot(s) {
-    // Pair label
-    const sym_y = (s.sym_y || '').split('/')[0];
-    const sym_x = (s.sym_x || '').split('/')[0];
-    if (sym_y && sym_x) el('pair-label').textContent = sym_y + '/' + sym_x;
-
-    // Trader state badge
-    const badge = el('state-badge');
-    badge.textContent = s.trader_state || 'idle';
-    badge.className = 'state-badge ' + (s.trader_state || 'idle').replace('_', '_');
-
-    // KPIs
-    setPnl('kpi-rpnl', s.realized_pnl);
-    setPnl('kpi-opnl', s.open_pnl);
-    setPnl('kpi-dpnl', s.daily_pnl);
-    setMono('kpi-zscore', s.zscore, 3);
-    el('kpi-zscore').className = 'kpi-value' + (Math.abs(+s.zscore) >= 2 ? ' warn' : '');
-    setMono('kpi-beta', s.hedge_ratio, 4);
-    setMono('kpi-hl', s.half_life, 1);
-    el('kpi-trades').textContent = s.trade_count ?? '—';
-    el('kpi-fees').textContent = 'fees: ' + (s.total_fees_usdt != null ? (+s.total_fees_usdt).toFixed(2) + ' USDT' : '—');
-
-    const regime = s.regime || 'unknown';
-    const re = el('kpi-regime');
-    re.textContent = regime;
-    re.className = 'kpi-value' + (regime === 'cointegrated' ? ' pos' : regime === 'breakdown' ? ' neg' : '');
-
-    // Kalman
-    setMono('kal-gain', s.kalman_gain, 5);
-    setMono('kal-unc', s.kalman_uncertainty, 6);
-    setMono('kal-spread', s.spread, 4);
-    setMono('kal-py', s.price_y, 4);
-    setMono('kal-px', s.price_x, 4);
-    if (sym_y) el('kal-py-sym').textContent = sym_y + ' (Y)';
-    if (sym_x) el('kal-px-sym').textContent = sym_x + ' (X)';
-
-    // Funding
-    if (sym_y) el('fund-label-y').textContent = 'LEG Y — ' + sym_y;
-    if (sym_x) el('fund-label-x').textContent = 'LEG X — ' + sym_x;
-    setFunding('fund-rate-y', s.funding_rate_y);
-    setFunding('fund-rate-x', s.funding_rate_x);
-    el('fund-next-y').textContent = 'next: ' + (s.next_funding_ts_y || '—');
-    el('fund-next-x').textContent = 'next: ' + (s.next_funding_ts_x || '—');
-
-    // Series
-    if (s.zscore_series && s.zscore_series.length) {
-      zData.ts = s.zscore_series.map(p => p.ts);
-      zData.v  = s.zscore_series.map(p => p.v);
-      Plotly.react('chart-zscore', buildZTrace(), chartLayout('z-score'), CFG);
-    }
-    if (s.pnl_series && s.pnl_series.length) {
-      pData.ts = s.pnl_series.map(p => p.ts);
-      pData.v  = s.pnl_series.map(p => p.v);
-      Plotly.react('chart-pnl', buildPnlTrace(), chartLayout('USDT'), CFG);
-    }
-
-    // Trades table
-    if (s.recent_trades && s.recent_trades.length) {
-      const tbody = el('trades-tbody');
-      tbody.innerHTML = '';
-      const trades = [...s.recent_trades].reverse();
-      trades.forEach((t, i) => {
-        const pnl = +t.pnl;
-        const tr = document.createElement('tr');
-        tr.innerHTML = [
-          `<td>${trades.length - i}</td>`,
-          `<td>${t.ts ? new Date(+t.ts * 1000).toISOString().replace('T',' ').slice(0,19) : '—'}</td>`,
-          `<td>${t.side || '—'}</td>`,
-          `<td>${(+t.entry_y||0).toFixed(4)}</td>`,
-          `<td>${(+t.entry_x||0).toFixed(4)}</td>`,
-          `<td>${(+t.exit_y||0).toFixed(4)}</td>`,
-          `<td>${(+t.exit_x||0).toFixed(4)}</td>`,
-          `<td>${(+t.fees||0).toFixed(4)}</td>`,
-          `<td class="${pnl>=0?'td-pos':'td-neg'}">${pnl>=0?'+':''}${pnl.toFixed(2)}</td>`,
-        ].join('');
-        tbody.appendChild(tr);
-      });
-    }
-
-    // Last update
-    el('last-update').textContent = new Date().toISOString().slice(11,19) + ' UTC';
-  }
-
-  // ── WebSocket ─────────────────────────────────────────────────────────
-  const WS_URL = 'ws://' + location.host + '/ws';
-  const dot = el('ws-dot');
-  let ws, reconnectTimer;
-
-  function connect() {
-    ws = new WebSocket(WS_URL);
-
-    ws.onopen = () => {
-      dot.className = 'ws-dot connected';
-      clearTimeout(reconnectTimer);
-      // Bootstrap from /state
-      fetch('/state').then(r => r.json()).then(applySnapshot).catch(() => {});
-    };
-
-    ws.onmessage = (ev) => {
-      try { applySnapshot(JSON.parse(ev.data)); } catch (e) { console.warn('WS parse error', e); }
-    };
-
-    ws.onerror = () => { dot.className = 'ws-dot error'; };
-
-    ws.onclose = () => {
-      dot.className = 'ws-dot';
-      reconnectTimer = setTimeout(connect, 3000);
-    };
-  }
-
-  connect();
-
-})();
+  connectWS();
+  loadPerformance();
+  setInterval(loadPerformance, 10_000);
+});
 </script>
 </body>
 </html>
