@@ -5,11 +5,11 @@
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![Status](https://img.shields.io/badge/Status-Prod--Ready-brightgreen)]()
-[![Tests](https://img.shields.io/badge/Tests-Passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/Tests-264%2B-brightgreen)]()
 [![Exchanges](https://img.shields.io/badge/Exchanges-Bybit%20%7C%20Binance-orange)]()
 [![Strategy](https://img.shields.io/badge/Strategy-Stat%20Arb%20%2F%20Pairs-blueviolet)]()
 
-QuantLuna is a **production-grade statistical arbitrage engine** built around a real-time Kalman Filter for dynamic hedge ratio estimation. Designed for crypto spot + perpetual futures markets on **Bybit** and **Binance**, with full portfolio-level risk management, live pair scanning, cointegration validation, and a monitoring dashboard.
+QuantLuna is a **production-grade statistical arbitrage engine** built around a real-time Kalman Filter for dynamic hedge ratio estimation. Designed for crypto spot + perpetual futures markets on **Bybit** and **Binance**, with full portfolio-level risk management, live pair scanning, cointegration validation, adaptive signal v4 engine, orphan position adoption, and a monitoring dashboard.
 
 ---
 
@@ -17,7 +17,9 @@ QuantLuna is a **production-grade statistical arbitrage engine** built around a 
 
 - [Core Strategy](#core-strategy)
 - [Architecture](#architecture)
+- [Signal v4](#signal-v4)
 - [Signal Flow](#signal-flow)
+- [Startup Workflow (S19)](#startup-workflow-s19)
 - [Quick Start](#quick-start)
 - [Configuration](#configuration)
 - [Key Parameters](#key-parameters)
@@ -46,6 +48,8 @@ QuantLuna is a **production-grade statistical arbitrage engine** built around a 
 - **Portfolio-level risk** — `MultiPairAllocator`, `CorrelationMatrix` (Ledoit-Wolf), `DrawdownController`, `PortfolioRisk`
 - **WebSocket health** — `WsWatchdog` with auto-reconnect, stale-feed detection, and entry gate
 - **HALT logic** — queue overflow (100 consecutive drops) triggers system halt + external alert
+- **Signal v4** — volatility-adjusted thresholds, delta-z momentum filter, dynamic cooldown, partial exit at z=0, cointegration validity gate
+- **Startup orchestration (S19)** — `WorkflowOrchestrator` scans, reconciles and adopts orphan positions before `LiveTrader.run()`
 
 ---
 
@@ -59,16 +63,16 @@ quantluna/
 │   └── cointegration.py          # Engle-Granger, Johansen, half-life estimator
 │
 ├── strategy/
-│   ├── signal.py                 # LiveSignalAdapter, SpreadEngine, z-score via on_tick()
+│   ├── signal.py                 # SignalGenerator v4 — z-score + P0/P1 adaptive features
 │   ├── signal_adapter.py         # Adapter layer between signal engine and live trader
 │   ├── regime.py                 # Regime filter, stability gate (lightweight)
 │   ├── regime_detector.py        # RegimeDetector — HMM/vol-based regime classification
 │   ├── pair_selector.py          # PairSelector — scoring, ranking, universe filtering
 │   ├── live_pair_scanner.py      # LivePairScanner — async scanning, real-time pair rotation
 │   └── cointegration/            # Extended cointegration submodule (Sprint 9)
-│       ├── engle_granger.py      # EngleGrangerTest
-│       ├── johansen.py           # JohansenTest
-│       ├── residuals.py          # ResidualDiagnostics
+│       ├── engle_granger.py
+│       ├── johansen.py
+│       ├── residuals.py
 │       └── validator.py          # CointegrationValidator — unified pipeline
 │
 ├── risk/
@@ -81,54 +85,192 @@ quantluna/
 │
 ├── execution/
 │   ├── live_trader.py            # Main live engine — WebSocket feed, order execution
+│   ├── paper_trader.py           # Paper trader — realistic fill simulation + slippage
 │   ├── order_manager.py          # OrderManager — order lifecycle, fills, cancels
 │   ├── funding_monitor.py        # FundingMonitor — real-time funding rate polling
 │   ├── pnl_reconciler.py         # PnLReconciler — realized/unrealized PnL tracking
+│   ├── checkpoint.py             # PositionCheckpoint — SQLite persistence
+│   ├── resume_manager.py         # ResumeManager — checkpoint reconciliation on startup
 │   ├── ws_watchdog.py            # WsWatchdog — WebSocket health, auto-reconnect
-│   └── live_trader_sprint6_patch.py  # Deprecated — emptied, zero import risk
+│   ├── circuit_breaker.py        # CircuitBreaker — exchange error handling
+│   ├── rate_limiter.py           # RateLimiter — API rate limit enforcement
+│   ├── health_check.py           # HealthCheck — pre-flight exchange connectivity
+│   ├── backoff.py                # Exponential backoff for retries
+│   ├── position_scanner.py       # PositionScanner — detect orphan/managed positions  [S19]
+│   ├── adoption_engine.py        # AdoptionEngine — ADOPT / CLOSE_NOW / MONITOR_ONLY  [S19]
+│   ├── profit_optimizer.py       # ProfitOptimizer — TP/SL/trailing/ladder for adopted pos [S19]
+│   ├── workflow_orchestrator.py  # WorkflowOrchestrator — startup phases 1-4             [S19]
+│   └── partial_exit_handler.py  # PartialExitHandler — Signal.PARTIAL_EXIT execution    [S19]
 │
 ├── backtest/
 │   ├── engine.py                 # Vectorised backtest, bar_freq support
 │   ├── walk_forward.py           # Walk-forward, purged K-fold, non-leakage splits
 │   ├── monte_carlo.py            # Monte Carlo simulation — path sampling, confidence bands
-│   └── analytics.py              # Sharpe, Sortino, Calmar, max DD, win rate
+│   └── analytics.py             # Sharpe, Sortino, Calmar, max DD, win rate
 │
 ├── data/
 │   ├── loaders.py                # OHLCV loaders, CCXT wrappers
+│   ├── market_data_cache.py      # Local OHLCV caching (SQLite / Parquet)
 │   └── funding_fetcher.py        # Historical + live funding rate data
 │
 ├── config/
-│   ├── live_config.py            # LiveConfig dataclass — all runtime params
+│   ├── settings.py               # QuantLunaConfig — all runtime params (Pydantic)
+│   ├── live_config.py            # LiveConfig dataclass
 │   └── exec_config.py            # Exchange credentials, API config
 │
 ├── dashboard/                    # Real-time monitoring dashboard (FastAPI + WebSocket)
-│   ├── server.py                 # Dashboard server — /ws endpoint, snapshot broadcast
-│   └── index.html                # Frontend — live metrics, positions, PnL
+│   ├── server.py
+│   └── index.html
+│
+├── api/                          # REST API (FastAPI) — backtest jobs, compare, radar
+│   ├── backtest.py               # /backtest, /status, /results, /compare endpoints
+│   └── schemas.py                # Pydantic models: BacktestRequest, CompareResponse
 │
 ├── scripts/
-│   ├── run_backtest.py           # CLI backtest runner
-│   └── run_live.py               # CLI live/paper runner
+│   ├── run_backtest.py
+│   ├── run_live.py               # v2 — cu WorkflowOrchestrator startup (S19)
+│   ├── run_paper.py
+│   ├── optimize_params.py        # Optuna hyperparameter tuning
+│   ├── preflight_check.py        # Pre-flight connectivity check
+│   └── scan_pairs.py             # Pair universe scanning
 │
-├── tests/                        # 14 test files, 100+ test cases
+├── tests/                        # 27 test files, 264+ test cases
 │   ├── conftest.py
-│   ├── test_kalman.py
+│   ├── test_kalman.py / test_kalman_filter.py
 │   ├── test_spread.py
 │   ├── test_cointegration.py
-│   ├── test_signal.py
-│   ├── test_signal_full.py
+│   ├── test_signal.py / test_signal_full.py
+│   ├── test_signal_v4.py         # P0+P1 features: vol_adj, dz_filter, partial_exit  [NEW]
 │   ├── test_regime.py
 │   ├── test_pair_selector.py
 │   ├── test_risk.py
 │   ├── test_sprint10_allocator.py
 │   ├── test_live_trader.py
-│   ├── test_backtest.py
+│   ├── test_backtest.py / test_sprint15_backtest.py
 │   ├── test_walk_forward.py
-│   └── test_data.py
+│   ├── test_sprint16_api.py / test_sprint18.py
+│   ├── test_adoption_workflow.py # PositionScanner, AdoptionEngine, ProfitOptimizer [NEW]
+│   ├── test_smoke_s15_s17.py
+│   ├── test_health_check.py
+│   ├── test_rate_limiter.py
+│   ├── test_market_data_cache.py
+│   ├── test_data.py
+│   └── test_telegram_notifier.py
 │
 ├── state_bus.py                  # Internal async event bus
-├── .env.example                  # Environment variable template
-├── pyproject.toml
-└── requirements.txt
+├── .env.example                  # Environment variable template (updated S19)
+├── Dockerfile / docker-compose.yml
+├── CHANGELOG.md
+├── CONTRIBUTING.md
+├── PRODUCTION.md
+└── WORKFLOW.md
+```
+
+---
+
+## Signal v4
+
+SignalGenerator v4 introduce 4 feature-uri adaptive peste core-ul Kalman/z-score:
+
+### P0-1: Volatility-Adjusted Threshold
+
+Threshold-ul de entry creste proportional cu percentila de volatilitate curenta, prevenind intrari in perioade de vol extrema:
+
+```
+effective_threshold = zscore_entry × (1 + vol_adj_factor × vol_rank)
+                    ≤ zscore_entry × vol_adj_max_multiplier
+```
+
+| Env var | Default | Descriere |
+|---------|---------|----------|
+| `VOL_ADJ_ENABLED` | `true` | Activeaza feature |
+| `VOL_ADJ_FACTOR` | `0.40` | Amplitudine ajustare (0=off, 0.6=agresiv) |
+| `VOL_ADJ_LOOKBACK` | `100` | Bare pentru percentila vol |
+| `VOL_ADJ_MAX_MULTIPLIER` | `1.6` | Cap threshold (max 1.6× baza) |
+
+### P0-2: Delta-Z Momentum Filter
+
+Blocheaza entry cand spread-ul inca accelereaza in directia z-score-ului — evita catching a falling knife:
+
+```
+blocat dacă: same_sign(dz_avg, z) AND |dz_avg| > dz_block_ratio × |z|
+```
+
+| Env var | Default | Descriere |
+|---------|---------|----------|
+| `DZ_FILTER_ENABLED` | `true` | Activeaza filter |
+| `DZ_LOOKBACK` | `3` | Bare pentru derivata z |
+| `DZ_BLOCK_RATIO` | `0.25` | Bloc daca |dz| > 25% din |z| |
+
+### P1-1: Dynamic Cooldown
+
+Cooldown-ul post-trade se adapteaza la half-life-ul curent al spread-ului:
+
+```
+cooldown = clamp(ceil(half_life × cooldown_hl_factor), cooldown_min, cooldown_max)
+```
+
+### P1-2: Partial Exit la z=0
+
+La primul crossing al z=0 in timp ce suntem in trade, `PARTIAL_EXIT` inchide `partial_exit_pct`% din pozitie pe ambele legs via `reduceOnly` orders. Se executa **o singura data per trade**.
+
+```python
+# In LiveTrader._handle_signal:
+from execution.partial_exit_handler import handle_partial_exit
+
+if signal.signal == Signal.PARTIAL_EXIT:
+    result = await handle_partial_exit(
+        signal=signal, position=current_position,
+        exchange=self._exchange, checkpoint=self._checkpoint,
+        alert_cfg=self._alert_cfg,
+    )
+```
+
+### P1-3: Cointegration Validity Gate
+
+Inainte de fiecare entry, se verifica daca perechea este inca cointegrata (`coint_valid` flag din `CointegrationValidator`). Entry blocat cu `reason='stale_pair'` daca flag-ul este `False`. Pozitiile deja deschise nu sunt fortate la exit.
+
+---
+
+## Startup Workflow (S19)
+
+La pornire, `run_live.py` v2 executa **4 faze** inainte de `LiveTrader.run()`:
+
+```
+Faza 1: PositionScanner.scan()
+    └─> detecteaza pozitii ORPHAN (pe exchange, fara checkpoint local)
+    └─> detecteaza pozitii MANAGED (exista in checkpoint)
+
+Faza 2: ResumeManager.reconcile()
+    └─> verifica divergente intre checkpoint si exchange
+    └─> actualizeaza qty daca fill-uri au venit cat timp bot-ul era oprit
+
+Faza 3: AdoptionEngine.process(orphans)
+    ├─> ADOPT   — PnL > adopt_min_pnl_pct: salveaza in checkpoint + seteaza TP/SL
+    ├─> CLOSE_NOW — PnL < close_loss_pct OR distanta_liq < min_liq_distance_pct
+    └─> MONITOR_ONLY — notional prea mic sau conditii incerte
+
+Faza 4: ProfitOptimizer.register(adopted)
+    └─> porneste loop asyncio (background task) care monitorizeaza:
+        ├─> TP/SL trigger → FULL_CLOSE
+        ├─> Break-even move (dupa +be_trigger_pct)
+        ├─> Profit ladder (inchidere partiala la praguri definite)
+        └─> Trailing stop (dupa activare la +trailing_activation_pct)
+
+Faza 5: LiveTrader.run()  ← trade normal pe perechea configurata
+```
+
+**HALT** — daca orchestratorul semnaleaza `should_halt=True` (ex: exchange down, pozitii critice), procesul se opreste cu `sys.exit(1)` inainte de a incepe trading.
+
+```bash
+# Pornire normala
+python scripts/run_live.py --pair BTCUSDT ETHUSDT --mode live
+
+# Skip orphan scan (debug rapid)
+python scripts/run_live.py --pair BTCUSDT ETHUSDT --mode live --skip-orphan-scan
+
+# Custom checkpoint path
+python scripts/run_live.py --pair BTCUSDT ETHUSDT --mode live --checkpoint /data/ql.db
 ```
 
 ---
@@ -141,33 +283,34 @@ WebSocket tick
             └─> LiveSignalAdapter.on_tick()  [strategy/signal_adapter.py]
                     └─> SpreadEngine → Kalman update → hedge ratio → spread  [core/]
                             └─> Z-score calculation
-                                    └─> RegimeDetector gate  [strategy/regime_detector.py]
-                                            └─> LiveTrader._evaluate_signal()  [execution/live_trader.py]
-                                                    ├─> WatchdogGate (watchdog.state == LIVE)
-                                                    ├─> DrawdownController level check
-                                                    ├─> PortfolioAllocator.request_entry()  [risk/multi_pair_allocator.py]
-                                                    │       ├─> DD level gate
-                                                    │       ├─> Max concurrent pairs gate
-                                                    │       ├─> Correlation gate (SpreadCorrelationMatrix)
-                                                    │       ├─> Kelly cross-pair sizing  [risk/kelly.py]
-                                                    │       └─> PortfolioRisk exposure gate
-                                                    ├─> FundingMonitor cost check  [execution/funding_monitor.py]
-                                                    └─> OrderManager → exchange (CCXT)  [execution/order_manager.py]
-                                                                └─> PnLReconciler  [execution/pnl_reconciler.py]
-                                                                        └─> StateBus broadcast  [state_bus.py]
-                                                                                └─> Dashboard /ws  [dashboard/server.py]
+                                    └─> SignalGenerator v4  [strategy/signal.py]
+                                            ├─> vol_adj threshold gate (P0-1)
+                                            ├─> delta-z momentum filter (P0-2)
+                                            ├─> cointegration validity gate (P1-3)
+                                            └─> RegimeDetector gate
+                                                    └─> LiveTrader._evaluate_signal()  [execution/live_trader.py]
+                                                            ├─> Signal.PARTIAL_EXIT → partial_exit_handler.py (P1-2)
+                                                            ├─> WatchdogGate
+                                                            ├─> DrawdownController
+                                                            ├─> PortfolioAllocator.request_entry()  [risk/]
+                                                            │       ├─> DD gate
+                                                            │       ├─> Max concurrent pairs gate
+                                                            │       ├─> Correlation gate
+                                                            │       ├─> Kelly cross-pair sizing
+                                                            │       └─> PortfolioRisk gate
+                                                            ├─> FundingMonitor cost check
+                                                            └─> OrderManager → exchange (CCXT)
+                                                                        └─> PnLReconciler
+                                                                                └─> StateBus → Dashboard /ws
 
-Background tasks (asyncio.gather):
+Background tasks:
     ├─> _ws_feed()          — WebSocket consumer
     ├─> _consumer()         — tick processing loop
     ├─> _heartbeat()        — periodic status log
-    ├─> _run_watchdog()     — WsWatchdog health monitor
+    ├─> _run_watchdog()     — WsWatchdog health
     ├─> _funding_task()     — FundingMonitor polling
-    └─> _pnl_task()         — PnLReconciler reconciliation
-
-Parallel: LivePairScanner  [strategy/live_pair_scanner.py]
-    └─> CointegrationValidator  [strategy/cointegration/validator.py]
-            └─> PortfolioAllocator.request_entry() — candidate pair evaluation
+    ├─> _pnl_task()         — PnLReconciler
+    └─> optimizer_loop()    — ProfitOptimizer pentru pozitii adoptate (S19)
 ```
 
 ---
@@ -186,23 +329,20 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Fill in API keys, exchange, pair config
+# Completeaza API keys, exchange, pair config
+# Signal v4: VOL_ADJ_ENABLED, DZ_FILTER_ENABLED, PARTIAL_EXIT_ENABLED etc.
+# S19 adoption: ADOPT_MIN_PNL_PCT, TP_TARGET_PCT, SL_MAX_LOSS_PCT etc.
 ```
 
 ### 3. Backtest
 
 ```bash
-# Standard backtest — BTC/ETH pair, 180 days
 python scripts/run_backtest.py --pair BTCUSDT ETHUSDT --exchange binance --days 180
-
-# Walk-forward with 5 folds
 python scripts/run_backtest.py --pair BTCUSDT ETHUSDT --mode walk_forward --folds 5
-
-# Monte Carlo simulation
 python scripts/run_backtest.py --pair BTCUSDT ETHUSDT --mode monte_carlo --simulations 1000
 ```
 
-### 4. Paper Trading (recommended before going live)
+### 4. Paper Trading
 
 ```bash
 python scripts/run_live.py --pair BTCUSDT ETHUSDT --mode paper
@@ -211,72 +351,75 @@ python scripts/run_live.py --pair BTCUSDT ETHUSDT --mode paper
 ### 5. Live Trading
 
 ```bash
-# First run: use warmup mode — entry only after min_warmup_bars ticks
+# Startup complet: scan orphans → reconcile → adopt → trade
 python scripts/run_live.py --pair BTCUSDT ETHUSDT --mode live
+
+# Skip orphan scan (prima pornire sau debug)
+python scripts/run_live.py --pair BTCUSDT ETHUSDT --mode live --skip-orphan-scan
 ```
 
 ### 6. Dashboard
 
 ```bash
-# Start the monitoring dashboard (FastAPI + WebSocket)
 uvicorn dashboard.server:app --host 0.0.0.0 --port 8000
-
-# Open in browser
 open http://localhost:8000
+```
+
+### 7. API REST (backtest jobs)
+
+```bash
+uvicorn api.backtest:app --host 0.0.0.0 --port 8001
+# POST /backtest   → porneste job async
+# GET  /status/{id} → polling status
+# GET  /results/{id} → rezultate complete
+# POST /compare   → radar chart + diff matrix intre doua job-uri
 ```
 
 ---
 
 ## Configuration
 
-### `.env` Variables
+### `.env` Variables (selectie)
 
 ```env
-# Exchange credentials
+# Exchange
 BYBIT_API_KEY=your_key
 BYBIT_API_SECRET=your_secret
-BINANCE_API_KEY=your_key
-BINANCE_API_SECRET=your_secret
-
-# Exchange selection: bybit | binance
 EXCHANGE=bybit
+TRADING_MODE=paper
 
-# Trading mode: live | paper
-MODE=paper
+# Signal v4
+VOL_ADJ_ENABLED=true
+VOL_ADJ_FACTOR=0.40
+DZ_FILTER_ENABLED=true
+PARTIAL_EXIT_ENABLED=true
+PARTIAL_EXIT_PCT=0.50
 
-# Pair universe (comma-separated)
-PAIRS=BTCUSDT,ETHUSDT
-
-# Capital allocation
-CAPITAL_USD=10000
-
-# Risk parameters
-MAX_DRAWDOWN_PCT=0.10
-KELLY_FRACTION=0.25
-VOL_TARGET=0.01
-MAX_PAIRS_LIVE=5
+# S19 — Adoption Engine
+ADOPT_MIN_PNL_PCT=-0.02
+CLOSE_LOSS_PCT=-0.05
+TP_TARGET_PCT=0.04
+SL_MAX_LOSS_PCT=0.03
+TRAILING_ACTIVATION_PCT=0.02
+TRAILING_DISTANCE_PCT=0.015
 ```
+
+Vezi [`.env.example`](.env.example) pentru lista completa cu toate variabilele documentate.
 
 ### LiveConfig (programmatic)
 
 ```python
-from config.live_config import LiveConfig
-from config.exec_config import ExecConfig
+from config.settings import QuantLunaConfig, SignalConfig
 
-config = LiveConfig(
-    exchange="bybit",
-    pairs=[("BTCUSDT", "ETHUSDT")],
-    capital_usd=10_000,
+cfg = QuantLunaConfig()
+cfg.trading_mode = "live"
+cfg.signal = SignalConfig(
     zscore_entry=2.0,
     zscore_exit=0.5,
-    min_warmup_bars=30,
-    kelly_fraction=0.25,
-    vol_target=0.01,
-    max_drawdown_pct=0.10,
-    max_pairs_live=5,
-    corr_threshold=0.85,
-    delta=1e-4,   # Kalman process noise
-    R=1e-2,       # Kalman measurement noise
+    vol_adj_enabled=True,
+    vol_adj_factor=0.40,
+    dz_filter_enabled=True,
+    partial_exit_enabled=True,
 )
 ```
 
@@ -290,19 +433,24 @@ config = LiveConfig(
 | `R` | `1e-2` | Kalman measurement noise — higher = smoother hedge ratio |
 | `zscore_entry` | `2.0` | Z-score threshold for entry |
 | `zscore_exit` | `0.5` | Z-score target for exit |
-| `half_life_min` | `12h` | Minimum acceptable half-life for mean reversion |
+| `vol_adj_factor` | `0.40` | Vol-adj amplitudine (P0-1) |
+| `vol_adj_max_multiplier` | `1.6` | Cap threshold la 1.6× (P0-1) |
+| `dz_block_ratio` | `0.25` | Delta-z block threshold (P0-2) |
+| `partial_exit_pct` | `0.50` | % pozitie inchis la z=0 (P1-2) |
+| `cooldown_hl_factor` | `0.50` | Dynamic cooldown = half_life × factor (P1-1) |
+| `half_life_min` | `12h` | Minimum acceptable half-life |
 | `half_life_max` | `168h` | Maximum acceptable half-life |
-| `min_warmup_bars` | `30` | Minimum bars in spread buffer before first entry |
+| `min_warmup_bars` | `30` | Minimum bars before first entry |
 | `vol_target` | `0.01` | Volatility target per trade (1%) |
 | `kelly_fraction` | `0.25` | Fractional Kelly multiplier |
 | `max_drawdown_pct` | `0.10` | Max drawdown before position scaling |
-| `queue_overflow_halt` | `100` | Consecutive drops → HALT + external alert |
-| `max_pairs_live` | `5` | Max concurrent active pairs (MultiPairAllocator) |
-| `corr_threshold` | `0.85` | Cross-pair correlation threshold — pairs above reduce sizing |
-| `pair_soft_dd` | `0.05` | Pair-level soft DD limit (5%) → force close |
-| `portfolio_soft_dd` | `0.08` | Portfolio soft DD (8%) → SOFT_LIMIT state |
-| `portfolio_hard_dd` | `0.15` | Portfolio hard DD (15%) → HARD_STOP state |
-| `watchdog_timeout_s` | `30` | Seconds without tick before WsWatchdog marks feed STALE |
+| `queue_overflow_halt` | `100` | Consecutive drops → HALT |
+| `max_pairs_live` | `5` | Max concurrent active pairs |
+| `corr_threshold` | `0.85` | Cross-pair correlation threshold |
+| `adopt_min_pnl_pct` | `-0.02` | Min PnL pentru adoptie pozitie orfana |
+| `close_loss_pct` | `-0.05` | Inchide automat daca PnL < -5% |
+| `tp_target_pct` | `0.04` | Take-Profit pozitii adoptate |
+| `sl_max_loss_pct` | `0.03` | Stop-Loss pozitii adoptate |
 
 ---
 
@@ -321,8 +469,8 @@ analytics = BacktestAnalytics(results)
 print(analytics.sharpe())       # Sharpe ratio
 print(analytics.sortino())      # Sortino ratio
 print(analytics.calmar())       # Calmar ratio
-print(analytics.max_drawdown()) # Max drawdown
-print(analytics.win_rate())     # Win rate
+print(analytics.max_drawdown())
+print(analytics.win_rate())
 ```
 
 ### Walk-Forward
@@ -332,8 +480,6 @@ from backtest.walk_forward import WalkForwardEngine
 
 wf = WalkForwardEngine(config, n_folds=5, bar_freq="1h")
 wf_results = wf.run(ohlcv_a, ohlcv_b)
-# Returns per-fold metrics + aggregate stats
-# Non-leakage guaranteed: train/test windows never overlap
 ```
 
 ### Monte Carlo
@@ -342,12 +488,8 @@ wf_results = wf.run(ohlcv_a, ohlcv_b)
 from backtest.monte_carlo import MonteCarloEngine
 
 mc = MonteCarloEngine(config)
-mc_results = mc.run(
-    ohlcv_a, ohlcv_b,
-    n_simulations=1000,
-    confidence_levels=[0.05, 0.50, 0.95]
-)
-# Returns path distribution, confidence bands, ruin probability
+mc_results = mc.run(ohlcv_a, ohlcv_b, n_simulations=1000,
+                    confidence_levels=[0.05, 0.50, 0.95])
 ```
 
 ---
@@ -355,8 +497,6 @@ mc_results = mc.run(
 ## Live Trading
 
 ### PortfolioAllocator — 5-Gate Entry Pipeline
-
-Every entry request passes through 5 sequential gates:
 
 ```python
 from risk import PortfolioAllocator, AllocatorConfig
@@ -375,7 +515,6 @@ cfg = AllocatorConfig(
 )
 allocator = PortfolioAllocator(cfg)
 
-# On entry signal:
 decision = allocator.request_entry(
     pair_id="ETH/BTC_perp",
     candidate_spread=spread_series,
@@ -384,60 +523,44 @@ decision = allocator.request_entry(
     entry_beta=0.0534,
 )
 if decision.allowed:
-    notional = decision.notional_usd  # send order
-
-# Per tick update:
-snap = allocator.update_state(
-    open_pnl_per_pair={"ETH/BTC_perp": 45.2},
-    spread_updates={"ETH/BTC_perp": 0.0118},
-)
-if snap.level.value == "HARD_STOP":
-    await live_trader.close_all("HARD_STOP")
-
-# On exit:
-allocator.record_exit("ETH/BTC_perp")
+    notional = decision.notional_usd
 ```
 
 ### DrawdownController States
 
 ```
-NORMAL ──(portfolio DD > 8%)──> SOFT_LIMIT ──(portfolio DD > 15%)──> HARD_STOP
-         <──────────────────── manual_resume() ────────────────────────────────
+NORMAL ──(DD > 8%)──> SOFT_LIMIT ──(DD > 15%)──> HARD_STOP
+       <──────────── manual_resume() ─────────────────────
 ```
 
-HARD_STOP **does not auto-reset**. Call `allocator.manual_resume()` explicitly after investigation.
+HARD_STOP **nu se reseteaza automat**. Apeleaza `allocator.manual_resume()` dupa investigatie.
 
 ### WsWatchdog States
 
 ```
-LIVE ──(no tick > watchdog_timeout_s)──> STALE ──(reconnect success)──> LIVE
-                                              └──(max retries exceeded)──> DEAD
+LIVE ──(no tick > timeout)──> STALE ──(reconnect ok)──> LIVE
+                                   └──(max retries)──> DEAD
 ```
-
-Entry is blocked when watchdog state is not `LIVE`.
 
 ---
 
 ## Dashboard
 
-The dashboard provides real-time monitoring via WebSocket broadcast from `StateBus`.
-
 ```bash
 uvicorn dashboard.server:app --host 0.0.0.0 --port 8000
 ```
 
-**Available at:** `http://localhost:8000`
+**Disponibil la:** `http://localhost:8000`
 
-**Displays:**
-- Active pairs and their current z-scores
-- Open positions with unrealized PnL
-- Portfolio drawdown level and state (NORMAL / SOFT_LIMIT / HARD_STOP)
-- WsWatchdog state and last tick age
-- Funding rates per active pair
-- Trade history and realized PnL
-- Correlation matrix heatmap (cross-pair)
-
-**WebSocket endpoint:** `ws://localhost:8000/ws` — subscribes to all `StateBus` events.
+**Afiseaza:**
+- Perechi active + z-scores curente
+- Pozitii deschise cu PnL nerealizat
+- Drawdown level si state (NORMAL / SOFT_LIMIT / HARD_STOP)
+- WsWatchdog state + last tick age
+- Funding rates per pereche activa
+- Trade history + PnL realizat
+- Correlation matrix heatmap
+- **Pozitii adoptate** (S19) + status optimizer (TP/SL/trailing)
 
 ---
 
@@ -447,53 +570,48 @@ uvicorn dashboard.server:app --host 0.0.0.0 --port 8000
 
 Continuous Kelly (Thorp): \( f^* = \frac{E[R]}{E[R^2]} \)
 
-Applied with:
 - Fractional Kelly multiplier (default 0.25)
-- Correlation discount from `SpreadCorrelationMatrix`
-- Fallback to vol-target sizing when sample < 20 trades or E[R] ≤ 0
-- Portfolio cap: `min(kelly_adj, vol_target, max_pair_cap, remaining_capital)`
+- Correlation discount din `SpreadCorrelationMatrix`
+- Fallback la vol-target sizing cand sample < 20 trades sau E[R] ≤ 0
+- Cap: `min(kelly_adj, vol_target, max_pair_cap, remaining_capital)`
 
-### Correlation Matrix
-
-- Rolling buffer per pair (default 120 bars)
-- Ledoit-Wolf shrinkage via scikit-learn (auto-fallback to numpy `corrcoef` if not installed)
-- `check_new_pair()` — blocks candidate if |corr| > threshold with any active pair
-- `diversification_discount()` — [0, 1] factor applied to Kelly sizing
-
-### Cointegration Validation Pipeline (Sprint 9)
+### Cointegration Validation Pipeline
 
 ```
 EngleGrangerTest  ──┐
-JohansenTest      ──┼──> CointegrationValidator ──> accept / reject pair
+JohansenTest      ──┼──> CointegrationValidator ──> accept / reject
 ResidualDiagnostics─┘
 ```
 
-All three tests must pass for a pair to be accepted into the live universe.
+Teste P1-3: re-validare la fiecare `COINT_RETEST_INTERVAL_HOURS` ore. Perechi cu `p-value > COINT_BLACKLIST_PVALUE` sunt blacklisted si nu mai primesc entry-uri noi.
 
 ---
 
 ## Testing
 
 ```bash
-# Run full test suite
+# Suite completa (264+ teste)
 pytest tests/ -x --tb=short -q
 
-# Module groups
+# Pe module
 pytest tests/test_kalman.py tests/test_spread.py -v
-pytest tests/test_signal.py tests/test_signal_full.py -v
+pytest tests/test_signal.py tests/test_signal_full.py tests/test_signal_v4.py -v
 pytest tests/test_regime.py tests/test_pair_selector.py -v
 pytest tests/test_risk.py tests/test_sprint10_allocator.py -v
 pytest tests/test_live_trader.py -v
-pytest tests/test_backtest.py tests/test_walk_forward.py -v
-pytest tests/test_cointegration.py tests/test_data.py -v
+pytest tests/test_backtest.py tests/test_walk_forward.py tests/test_sprint15_backtest.py -v
+pytest tests/test_sprint16_api.py tests/test_sprint18.py -v
+pytest tests/test_adoption_workflow.py -v    # S19: scanner + engine + optimizer
+pytest tests/test_smoke_s15_s17.py -v
 ```
 
-**Green suite requirements:**
-- All non-leakage tests must pass — train/test windows must not overlap
-- `bar_freq` must be respected in engine (not hardcoded `bars_per_day = 24`)
-- Walk-forward fold count and split ratio validated against actual API
-- `MultiPairAllocator` tests (Sprint 10) validate cross-pair capital allocation and correlation-aware sizing
-- `LiveTrader` tests (25+ cases) cover HALT paths, watchdog gate, close_all retry logic
+**Cerinte suite verde:**
+- Non-leakage: train/test windows nu se suprapun niciodata
+- `bar_freq` respectat in engine (nu hardcoded `bars_per_day=24`)
+- `MultiPairAllocator`: cross-pair capital allocation + correlation-aware sizing
+- `LiveTrader`: 25+ cazuri — HALT paths, watchdog gate, close_all retry
+- Signal v4: 32 teste dedicate (P0-1, P0-2, P1-1, P1-2, P1-3, backward compat)
+- S19: 15+ teste pentru PositionScanner, AdoptionEngine, ProfitOptimizer
 
 ---
 
@@ -501,16 +619,16 @@ pytest tests/test_cointegration.py tests/test_data.py -v
 
 | ID | File | Description |
 |----|------|-------------|
-| FIX-1 | `backtest/engine.py` | `bars_per_day` removed — replaced with configurable `bar_freq` |
+| FIX-1 | `backtest/engine.py` | `bars_per_day` removed — replaced with `bar_freq` |
 | FIX-2 | `backtest/walk_forward.py` | API rewritten, non-leakage splits, `bar_freq` propagated |
-| FIX-3 | `execution/live_trader.py` | Queue overflow 100 drops → HALT + external alert |
-| FIX-4 | `execution/live_trader.py` | `close_all()` retry logic — 3 retries, 1s delay, alert on failure |
-| FIX-5 | `execution/live_trader.py` | `FundingMonitor` credentials fallback to `exec_config` |
-| FIX-6 | `execution/live_trader.py` | `signal_gen.reset_kalman()` on reconnect with fallback warning |
-| FIX-P1 | `execution/live_trader.py` | Spread buffer threshold: `10` → `min_warmup_bars` — prevents Kelly oversizing at warmup |
-| PATCH | `execution/live_trader_sprint6_patch.py` | Emptied — zero accidental import risk |
-| TEST | `tests/test_backtest.py` | Full rewrite — smoke, metrics, non-leakage, bar_freq |
-| TEST | `tests/test_walk_forward.py` | Full rewrite — new API, non-leakage, bar_freq |
+| FIX-3 | `execution/live_trader.py` | Queue overflow 100 drops → HALT + alert |
+| FIX-4 | `execution/live_trader.py` | `close_all()` retry: 3 retries, 1s delay |
+| FIX-5 | `execution/live_trader.py` | `FundingMonitor` credentials fallback |
+| FIX-6 | `execution/live_trader.py` | `signal_gen.reset_kalman()` on reconnect |
+| FIX-P1 | `execution/live_trader.py` | Spread buffer threshold: `10` → `min_warmup_bars` |
+| FIX-S19-1 | `scripts/run_live.py` | Integrat `WorkflowOrchestrator` faze 1-4 la startup |
+| FIX-S19-2 | `execution/partial_exit_handler.py` | Handler `Signal.PARTIAL_EXIT` — `reduceOnly` orders + checkpoint update |
+| FIX-S19-3 | `execution/live_trader_sprint6_patch.py` | Marcat deprecated — 0 bytes, zero import risk |
 
 ---
 
@@ -521,29 +639,41 @@ pytest tests/test_cointegration.py tests/test_data.py -v
 | `core/kalman_filter.py` | ✅ Prod-ready |
 | `core/spread.py` | ✅ Prod-ready |
 | `core/cointegration.py` | ✅ Prod-ready |
-| `strategy/signal.py` | ✅ Prod-ready |
+| `strategy/signal.py` (v4) | ✅ Prod-ready — P0+P1 features active |
 | `strategy/signal_adapter.py` | ✅ Prod-ready |
 | `strategy/regime_detector.py` | ✅ Prod-ready |
 | `strategy/pair_selector.py` | ✅ Prod-ready |
 | `strategy/live_pair_scanner.py` | ✅ Prod-ready |
-| `strategy/cointegration/` (Sprint 9) | ✅ Prod-ready |
+| `strategy/cointegration/` | ✅ Prod-ready |
 | `risk/kelly.py` | ✅ Prod-ready |
 | `risk/position_sizer.py` | ✅ Prod-ready |
 | `risk/multi_pair_allocator.py` | ✅ Prod-ready |
 | `risk/correlation_matrix.py` | ✅ Prod-ready |
 | `risk/drawdown_controller.py` | ✅ Prod-ready |
 | `risk/portfolio_risk.py` | ✅ Prod-ready |
-| `execution/live_trader.py` | ✅ Prod-ready (FIX-P1 applied) |
+| `execution/live_trader.py` | ✅ Prod-ready |
+| `execution/paper_trader.py` | ✅ Prod-ready |
 | `execution/order_manager.py` | ✅ Prod-ready |
 | `execution/pnl_reconciler.py` | ✅ Prod-ready |
+| `execution/checkpoint.py` | ✅ Prod-ready |
+| `execution/resume_manager.py` | ✅ Prod-ready |
 | `execution/ws_watchdog.py` | ✅ Prod-ready |
-| `execution/live_trader_sprint6_patch.py` | ✅ Emptied |
+| `execution/circuit_breaker.py` | ✅ Prod-ready |
+| `execution/health_check.py` | ✅ Prod-ready |
+| `execution/position_scanner.py` | ✅ Prod-ready [S19] |
+| `execution/adoption_engine.py` | ✅ Prod-ready [S19] |
+| `execution/profit_optimizer.py` | ✅ Prod-ready [S19] |
+| `execution/workflow_orchestrator.py` | ✅ Prod-ready [S19] |
+| `execution/partial_exit_handler.py` | ✅ Prod-ready [S19] |
+| `scripts/run_live.py` (v2) | ✅ Prod-ready — startup orchestration |
 | `backtest/engine.py` | ✅ Prod-ready |
 | `backtest/walk_forward.py` | ✅ Prod-ready |
 | `backtest/monte_carlo.py` | ✅ Prod-ready |
 | `backtest/analytics.py` | ✅ Prod-ready |
+| `api/backtest.py` | ✅ Prod-ready |
 | `dashboard/server.py` | ✅ Operational |
-| `tests/` (14 files, 100+ cases) | ✅ Full suite |
+| `tests/` (27 files, 264+ cases) | ✅ Suite completa |
+| `.env.example` | ✅ Actualizat — toate variabilele S19 |
 
 ---
 
@@ -551,12 +681,12 @@ pytest tests/test_cointegration.py tests/test_data.py -v
 
 | Sprint | Feature | Status |
 |--------|---------|--------|
-| S11 | Telegram notifications — HALT alerts, trade entries/exits, daily PnL summary | 🔜 Planned |
-| S11 | `execution/paper_trader.py` — dedicated paper trading with realistic fill simulation + slippage model | 🔜 Planned |
-| S12 | `strategy/optimizer.py` — Optuna hyperparameter tuning for delta/R/zscore params | 🔜 Planned |
-| S12 | `data/market_data_cache.py` — local OHLCV caching (SQLite / Parquet) | 🔜 Planned |
-| S13 | `Dockerfile` + `docker-compose.yml` — containerized deployment | 🔜 Planned |
-| S13 | `docs/` — extended docs: deployment guide, strategy math, ADRs | 🔜 Planned |
+| S19 | Signal v4 (P0+P1), AdoptionEngine, ProfitOptimizer, WorkflowOrchestrator | ✅ Livrat |
+| S20 | Redis persistence pentru `_JOBS` in-memory din `api/backtest.py` | 🔜 Planned |
+| S20 | Rate limiting pe `/compare` endpoint (max rows cap + streaming) | 🔜 Planned |
+| S21 | CI/CD pipeline activ (GitHub Actions: lint + pytest + docker build) | 🔜 Planned |
+| S21 | `__all__` exports in toate modulele publice + `pip-compile` version pins | 🔜 Planned |
+| S22 | Compare UI in dashboard — radar chart + diff matrix vizualizare live | 🔜 Planned |
 
 ---
 
@@ -566,10 +696,11 @@ pytest tests/test_cointegration.py tests/test_data.py -v
 
 - Cointegration relationships break down — monitor regime shifts continuously
 - Funding rates on perpetual futures can destroy P&L — cost is integrated into sizing but risk is not eliminated
-- Real liquidity and slippage differ from backtest assumptions — validate on your specific exchange
-- Cross-pair correlation can spike sharply during stress periods — `CorrelationMatrix` reduces sizing automatically but does not prevent losses
+- Real liquidity and slippage differ from backtest assumptions
+- Cross-pair correlation can spike sharply during stress — `CorrelationMatrix` reduces sizing but does not prevent losses
 - Never deploy without validated walk-forward results and out-of-sample tested parameters
-- **First live run:** set `min_warmup_bars=60`, capital at 10% of target — verify the buffer fills correctly and Kelly returns reasonable sizing from logs
+- **Prima pornire live:** seteaza `min_warmup_bars=60`, capital la 10% din target — verifica din loguri ca buffer-ul se umple corect si Kelly returneaza sizing rezonabil
+- **S19 adoption engine:** verifica manual pozitiile adoptate din loguri inainte de a lasa `ProfitOptimizer` sa opereze nesupravegheat
 
 ---
 
