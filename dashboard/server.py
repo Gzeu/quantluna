@@ -1,16 +1,10 @@
 """
-dashboard/server.py  —  QuantLuna FastAPI Dashboard Server
+dashboard/server.py  —  QuantLuna FastAPI Dashboard Server v1.4.0
 
-Sprint 17+ (feature/desktop-ui):
-  - Live market data fetched from Bybit (or Binance) via ccxt every 10s
-  - Live balance fetched from exchange if API keys are configured
-  - Mock data used ONLY as fallback when exchange is unreachable
-  - GET  /api/balance   — real balance if keys present, else zeros
-  - GET  /api/pairs     — real positions from state_bus
-  - GET  /api/markets   — real prices from exchange
-  - GET  /api/risk      — regime from state_bus
-  - GET  /api/log       — recent trades from state_bus
-  - WS   /ws/feed       — structured {type, payload, ts} push every 2s
+- Live market data de la Bybit via ccxt, refresh 10s
+- Balance real daca API keys sunt configurate
+- Simboluri valide Bybit (POL in loc de MATIC, fara FTM)
+- Fetch per-simbol cu fallback individual — un simbol lipsa nu blocheaza restul
 """
 from __future__ import annotations
 
@@ -29,18 +23,18 @@ from fastapi.staticfiles import StaticFiles
 try:
     from core.state_bus import bus
 except ImportError:
-    from state_bus import bus  # legacy fallback
+    from state_bus import bus
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Live data cache  (refreshed every 10s by background task)
+# Simboluri valide pe Bybit Spot/Linear (iulie 2026)
+# MATIC redenumit POL; FTM redenumit S (Sonic) — exclus pentru siguranta
 # ---------------------------------------------------------------------------
-
 _SYMBOLS = [
-    "BTC", "ETH", "SOL", "BNB", "AVAX", "MATIC", "DOT", "ADA",
-    "LINK", "UNI", "ATOM", "NEAR", "FTM", "ALGO", "XRP",
-    "LTC", "DOGE", "SHIB", "ARB", "OP",
+    "BTC", "ETH", "SOL", "BNB", "AVAX", "POL", "DOT", "ADA",
+    "LINK", "UNI", "ATOM", "NEAR", "ALGO", "XRP",
+    "LTC", "DOGE", "SHIB", "ARB", "OP", "TON",
 ]
 
 _live_markets: List[Dict[str, Any]] = []
@@ -55,14 +49,14 @@ async def _init_exchange():
         exchange_name = os.getenv("EXCHANGE", "bybit").lower()
         api_key    = os.getenv("BYBIT_API_KEY")    or os.getenv("BINANCE_API_KEY")    or ""
         api_secret = os.getenv("BYBIT_API_SECRET") or os.getenv("BINANCE_API_SECRET") or ""
-
         cls = getattr(ccxt, exchange_name, ccxt.bybit)
         params: Dict[str, Any] = {"enableRateLimit": True}
         if api_key and api_secret:
             params["apiKey"] = api_key
             params["secret"] = api_secret
-
         _exchange_instance = cls(params)
+        # Pre-load markets so symbol validation works
+        await _exchange_instance.load_markets()
         logger.info(f"Exchange initialised: {exchange_name} (keys={'yes' if api_key else 'no'})")
     except Exception as exc:
         logger.warning(f"Exchange init failed: {exc}")
@@ -74,21 +68,28 @@ async def _fetch_markets():
     if _exchange_instance is None:
         return
     try:
-        tickers = await _exchange_instance.fetch_tickers(
-            [f"{s}/USDT" for s in _SYMBOLS]
-        )
+        # Fetch all tickers at once (public endpoint, no auth needed)
+        all_tickers = await _exchange_instance.fetch_tickers()
         markets = []
         for sym in _SYMBOLS:
-            t = tickers.get(f"{sym}/USDT") or tickers.get(f"{sym}/USDT:USDT")
+            # Try linear perpetual first, then spot
+            t = (
+                all_tickers.get(f"{sym}/USDT:USDT")
+                or all_tickers.get(f"{sym}/USDT")
+            )
             if not t:
+                logger.debug(f"Symbol not found on exchange: {sym}")
                 continue
-            last    = float(t.get("last")    or 0)
-            change  = float(t.get("percentage") or 0)   # 24h % change
-            vol     = float(t.get("quoteVolume") or t.get("baseVolume") or 0)
+            last   = float(t.get("last") or 0)
+            change = float(t.get("percentage") or 0)
+            vol    = float(t.get("quoteVolume") or t.get("baseVolume") or 0)
+            # Funding rate — best-effort, skip if unavailable
             funding = 0.0
             try:
-                fi = await _exchange_instance.fetch_funding_rate(f"{sym}/USDT:USDT")
-                funding = float(fi.get("fundingRate") or 0)
+                perp_sym = f"{sym}/USDT:USDT"
+                if perp_sym in _exchange_instance.markets:
+                    fi = await _exchange_instance.fetch_funding_rate(perp_sym)
+                    funding = float(fi.get("fundingRate") or 0)
             except Exception:
                 pass
             markets.append({
@@ -100,7 +101,9 @@ async def _fetch_markets():
             })
         if markets:
             _live_markets = markets
-            logger.debug(f"Markets updated: {len(markets)} symbols")
+            logger.info(f"Markets updated: {len(markets)}/{len(_SYMBOLS)} symbols")
+        else:
+            logger.warning("fetch_markets: no symbols resolved")
     except Exception as exc:
         logger.warning(f"fetch_markets error: {exc}")
 
@@ -113,25 +116,33 @@ async def _fetch_balance():
     if not api_key:
         return
     try:
-        bal = await _exchange_instance.fetch_balance()
-        usdt = bal.get("USDT") or {}
-        total     = float(usdt.get("total") or bal.get("total", {}).get("USDT") or 0)
-        free      = float(usdt.get("free")  or bal.get("free",  {}).get("USDT") or 0)
-        used      = float(usdt.get("used")  or bal.get("used",  {}).get("USDT") or 0)
+        bal   = await _exchange_instance.fetch_balance()
+        usdt  = bal.get("USDT") or {}
+        total = float(usdt.get("total") or bal.get("total", {}).get("USDT") or 0)
+        free  = float(usdt.get("free")  or bal.get("free",  {}).get("USDT") or 0)
+        used  = float(usdt.get("used")  or bal.get("used",  {}).get("USDT") or 0)
+        upnl  = 0.0
+        try:
+            info = bal.get("info", {})
+            # Bybit v5 unified: result.list[0].totalUnrealisedProfit
+            lst = info.get("result", {}).get("list", [])
+            if lst:
+                upnl = float(lst[0].get("totalUnrealisedProfit", 0) or 0)
+        except Exception:
+            pass
         _live_balance = {
             "totalBalance":     round(total, 4),
             "availableBalance": round(free, 4),
             "marginUsed":       round(used, 4),
-            "unrealizedPnl":    round(float(bal.get("info", {}).get("totalUnrealisedProfit", 0) or 0), 4),
+            "unrealizedPnl":    round(upnl, 4),
             "realizedPnl":      0.0,
         }
-        logger.debug(f"Balance updated: total={total:.2f} USDT")
+        logger.info(f"Balance updated: {total:.4f} USDT (free={free:.4f})")
     except Exception as exc:
         logger.warning(f"fetch_balance error: {exc}")
 
 
 async def _live_data_loop():
-    """Background task: refresh market prices + balance every 10 seconds."""
     await _init_exchange()
     while True:
         await asyncio.gather(
@@ -163,7 +174,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="QuantLuna Dashboard",
     description="Adaptive Kalman Filter Pairs Trading — Monitoring & Backtest API",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -192,7 +203,6 @@ except ImportError as _e:
 # ---------------------------------------------------------------------------
 
 def _balance_response() -> Dict[str, Any]:
-    """Real balance if available, else state_bus, else zeros."""
     if _live_balance:
         state = bus.snapshot_dict()
         return {
@@ -261,12 +271,12 @@ async def api_health() -> Dict[str, Any]:
     state = bus.snapshot_dict()
     status = state.get("status", "UNKNOWN")
     return {
-        "status":         "ok" if status in ("RUNNING", "IDLE") else "error",
-        "trading_status": status,
-        "pnl_usdt":       state.get("pnl_usdt", 0.0),
-        "drawdown":       state.get("drawdown", 0.0),
-        "n_trades":       state.get("n_trades", 0),
-        "last_update":    state.get("last_update"),
+        "status":             "ok" if status in ("RUNNING", "IDLE") else "error",
+        "trading_status":     status,
+        "pnl_usdt":           state.get("pnl_usdt", 0.0),
+        "drawdown":           state.get("drawdown", 0.0),
+        "n_trades":           state.get("n_trades", 0),
+        "last_update":        state.get("last_update"),
         "exchange_connected": _exchange_instance is not None,
         "markets_cached":     len(_live_markets),
         "balance_live":       bool(_live_balance),
@@ -285,25 +295,23 @@ async def api_pairs() -> List[Dict[str, Any]]:
         if positions:
             return [
                 {
-                    "symbol":      p.pair,
-                    "zscore":      getattr(p, "zscore",    0.0),
-                    "spread":      getattr(p, "spread",    0.0),
-                    "halfLife":    getattr(p, "half_life", 0.0),
-                    "position":    p.direction if hasattr(p, "direction") else "FLAT",
-                    "pnl":         getattr(p, "pnl",       0.0),
+                    "symbol":       p.pair,
+                    "zscore":       getattr(p, "zscore",    0.0),
+                    "spread":       getattr(p, "spread",    0.0),
+                    "halfLife":     getattr(p, "half_life", 0.0),
+                    "position":     getattr(p, "direction", "FLAT"),
+                    "pnl":          getattr(p, "pnl",       0.0),
                     "spreadHealth": "HEALTHY",
                 }
                 for p in positions
             ]
     except Exception:
         pass
-    # No active positions — return empty list (NOT mock)
     return []
 
 
 @app.get("/api/markets")
 async def api_markets() -> List[Dict[str, Any]]:
-    """Live market prices. Returns cached exchange data, empty list if not yet fetched."""
     return _live_markets
 
 
@@ -333,7 +341,7 @@ async def api_log() -> List[Dict[str, Any]]:
             ]
     except Exception:
         pass
-    return []  # No trades yet — empty log, NOT mock
+    return []
 
 
 @app.get("/api/optimize/results")
@@ -359,17 +367,18 @@ async def api_optimize_results(
             key=lambda t: t.value or 0, reverse=True,
         )
         return {
-            "study_name": study_name, "n_trials": len(study.trials),
-            "best_value": round(study.best_value, 4) if completed else None,
+            "study_name":  study_name,
+            "n_trials":    len(study.trials),
+            "best_value":  round(study.best_value, 4) if completed else None,
             "best_params": study.best_params if completed else {},
-            "trials": [{"number": t.number, "value": t.value, "params": t.params} for t in completed[:top_n]],
+            "trials":      [{"number": t.number, "value": t.value, "params": t.params} for t in completed[:top_n]],
         }
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
-# WebSocket manager
+# WebSocket
 # ---------------------------------------------------------------------------
 
 class _WSManager:
@@ -413,10 +422,6 @@ async def websocket_live(websocket: WebSocket):
 
 @app.websocket("/ws/feed")
 async def websocket_feed(websocket: WebSocket):
-    """
-    Structured WS feed for Next.js dashboard.
-    Sends real data every 2s — no mock fallback.
-    """
     await _ws_manager.connect(websocket)
     try:
         while True:
@@ -425,18 +430,17 @@ async def websocket_feed(websocket: WebSocket):
             state = bus.snapshot_dict()
             bal   = _balance_response()
 
-            # Pairs from state_bus (real positions), empty list if no trader running
             pairs: List[Dict] = []
             try:
                 positions = bus.get_positions()
                 pairs = [
                     {
-                        "symbol":      p.pair,
-                        "zscore":      getattr(p, "zscore",    0.0),
-                        "spread":      getattr(p, "spread",    0.0),
-                        "halfLife":    getattr(p, "half_life", 0.0),
-                        "position":    getattr(p, "direction", "FLAT"),
-                        "pnl":         getattr(p, "pnl",       0.0),
+                        "symbol":       p.pair,
+                        "zscore":       getattr(p, "zscore",    0.0),
+                        "spread":       getattr(p, "spread",    0.0),
+                        "halfLife":     getattr(p, "half_life", 0.0),
+                        "position":     getattr(p, "direction", "FLAT"),
+                        "pnl":          getattr(p, "pnl",       0.0),
                         "spreadHealth": "HEALTHY",
                     }
                     for p in positions
@@ -444,10 +448,10 @@ async def websocket_feed(websocket: WebSocket):
             except Exception:
                 pass
 
-            msgs = [
-                {"type": "balance",   "payload": bal, "ts": now},
-                {"type": "pairs",     "payload": pairs, "ts": now},
-                {"type": "markets",   "payload": _live_markets, "ts": now},
+            for msg in [
+                {"type": "balance", "payload": bal, "ts": now},
+                {"type": "pairs",   "payload": pairs, "ts": now},
+                {"type": "markets", "payload": _live_markets, "ts": now},
                 {
                     "type": "regime",
                     "payload": {
@@ -466,9 +470,7 @@ async def websocket_feed(websocket: WebSocket):
                     },
                     "ts": now,
                 },
-            ]
-
-            for msg in msgs:
+            ]:
                 await websocket.send_json(msg)
 
     except WebSocketDisconnect:
