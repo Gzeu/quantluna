@@ -1,19 +1,54 @@
 """
 core package — public exports
+
+All imports use the *actual* class names from each module.
+Backward-compatible aliases are provided for names that were previously
+referenced elsewhere in the codebase (e.g. KalmanFilter, SpreadCalculator).
 """
-from core.kalman_filter import KalmanHedgeRatio as KalmanFilter  # KalmanFilter is the public alias
+
+# Kalman filter
 from core.kalman_filter import KalmanHedgeRatio, KalmanState
-from core.spread import SpreadCalculator  # type: ignore[attr-defined]
-from core.spread_monitor import SpreadMonitor, SpreadMonitorConfig, SpreadHealthReport, AlertType
-from core.volatility_regime import VolatilityRegime  # type: ignore[attr-defined]
-from core.cointegration import CointegrationAnalyzer  # type: ignore[attr-defined]
+KalmanFilter = KalmanHedgeRatio  # backward-compat alias
+
+# Spread engine
+from core.spread import SpreadEngine
+SpreadCalculator = SpreadEngine  # backward-compat alias
+
+# Spread monitor
+try:
+    from core.spread_monitor import SpreadMonitor, SpreadMonitorConfig, SpreadHealthReport, AlertType
+except ImportError:
+    SpreadMonitor = SpreadMonitorConfig = SpreadHealthReport = AlertType = None  # type: ignore
+
+# Volatility regime
+try:
+    from core.volatility_regime import VolatilityRegime, VolRegimeConfig, RegimeLabel
+except ImportError:
+    VolatilityRegime = VolRegimeConfig = RegimeLabel = None  # type: ignore
+
+# Cointegration
+try:
+    from core.cointegration import CointegrationAnalyzer
+except ImportError:
+    CointegrationAnalyzer = None  # type: ignore
 
 __all__ = [
-    "KalmanFilter",
+    # Kalman
     "KalmanHedgeRatio",
+    "KalmanFilter",      # alias
     "KalmanState",
-    "SpreadCalculator",
-    "SpreadMonitor", "SpreadMonitorConfig", "SpreadHealthReport", "AlertType",
+    # Spread
+    "SpreadEngine",
+    "SpreadCalculator",  # alias
+    # Spread monitor
+    "SpreadMonitor",
+    "SpreadMonitorConfig",
+    "SpreadHealthReport",
+    "AlertType",
+    # Volatility
     "VolatilityRegime",
+    "VolRegimeConfig",
+    "RegimeLabel",
+    # Cointegration
     "CointegrationAnalyzer",
 ]
