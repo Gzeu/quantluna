@@ -28,7 +28,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from execution.bybit_private_ws import BybitPrivateWS
-from execution.live_execution_bridge import LiveExecutionBridge
+from execution.live_execution_bridge import LiveExecutionBridge, EventType
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -84,4 +84,51 @@ async def ws_start(req: StartRequest) -> dict[str, str]:
 @router.post("/ws/stop")
 async def ws_stop() -> dict[str, str]:
     """Stop the Bybit private WebSocket stream."""
-    global _ws_tas
+    global _ws_task
+    if _ws_client is not None:
+        await _ws_client.stop()
+    if _ws_task is not None:
+        _ws_task.cancel()
+        _ws_task = None
+    logger.info("[LIVE_WS_API] WebSocket stream stopped")
+    return {"status": "stopped"}
+
+
+@router.get("/positions")
+async def live_positions() -> dict[str, Any]:
+    """Return live synced positions from private WS."""
+    return {"positions": list(_positions.values())}
+
+
+@router.get("/orders")
+async def live_orders() -> dict[str, Any]:
+    """Return active live orders from private WS."""
+    return {"orders": list(_orders.values())}
+
+
+@router.get("/wallet")
+async def live_wallet() -> dict[str, Any]:
+    """Return current wallet balances from private WS."""
+    return {"wallet": _wallet}
+
+
+async def _run_ws_and_consume() -> None:
+    """Run WS stream and consume events to update local state."""
+    assert _ws_client is not None
+    assert _bridge is not None
+    ws_task = asyncio.create_task(_ws_client.start())
+    try:
+        while True:
+            event = await _bridge.get_event()
+            if event.event_type == EventType.ORDER_FILL:
+                oid = event.payload.get("order_id")
+                if oid:
+                    _orders[oid] = event.payload
+            elif event.event_type == EventType.POSITION_SYNC:
+                sym = event.payload.get("symbol")
+                if sym:
+                    _positions[sym] = event.payload
+            elif event.event_type == EventType.EQUITY_UPDATE:
+                _wallet.update(event.payload)
+    finally:
+        ws_task.cancel()
