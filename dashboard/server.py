@@ -1,5 +1,5 @@
 """
-dashboard/server.py  —  QuantLuna FastAPI Dashboard Server v1.4.2
+dashboard/server.py  —  QuantLuna FastAPI Dashboard Server v1.4.3
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# spot=True => no linear perpetual on Bybit, use spot ticker
+# spot=True => no linear perpetual on Bybit
 _SYMBOLS: List[Dict[str, Any]] = [
     {"sym": "BTC",  "spot": False},
     {"sym": "ETH",  "spot": False},
@@ -43,7 +43,7 @@ _SYMBOLS: List[Dict[str, Any]] = [
     {"sym": "SHIB", "spot": True},
     {"sym": "ARB",  "spot": False},
     {"sym": "OP",   "spot": False},
-    {"sym": "TON",  "spot": False},
+    {"sym": "TON",  "spot": True},
 ]
 
 _live_markets: List[Dict[str, Any]] = []
@@ -70,28 +70,35 @@ async def _init_exchange():
         _exchange_instance = None
 
 
+async def _fetch_ticker_safe(sym: str, is_spot: bool) -> Optional[Dict[str, Any]]:
+    """Fetch ticker for one symbol: tries perp first (unless spot=True), then spot."""
+    if _exchange_instance is None:
+        return None
+    candidates = [f"{sym}/USDT"]
+    if not is_spot:
+        candidates = [f"{sym}/USDT:USDT", f"{sym}/USDT"]
+    for pair in candidates:
+        try:
+            t = await _exchange_instance.fetch_ticker(pair)
+            if t and t.get("last"):
+                return t
+        except Exception:
+            continue
+    return None
+
+
 async def _fetch_markets():
     global _live_markets
     if _exchange_instance is None:
         return
     try:
-        perp_pairs = [f"{s['sym']}/USDT:USDT" for s in _SYMBOLS if not s["spot"]]
-        spot_pairs = [f"{s['sym']}/USDT"       for s in _SYMBOLS if s["spot"]]
-
-        tickers: Dict[str, Any] = {}
-        if perp_pairs:
-            t = await _exchange_instance.fetch_tickers(perp_pairs)
-            tickers.update(t)
-        if spot_pairs:
-            t = await _exchange_instance.fetch_tickers(spot_pairs)
-            tickers.update(t)
-
+        tasks = [_fetch_ticker_safe(s["sym"], s["spot"]) for s in _SYMBOLS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         markets = []
-        for item in _SYMBOLS:
-            sym = item["sym"]
-            t = tickers.get(f"{sym}/USDT:USDT") or tickers.get(f"{sym}/USDT")
-            if not t:
+        for item, t in zip(_SYMBOLS, results):
+            if not t or isinstance(t, Exception):
                 continue
+            sym     = item["sym"]
             last    = float(t.get("last")        or 0)
             change  = float(t.get("percentage")  or 0)
             vol     = float(t.get("quoteVolume") or t.get("baseVolume") or 0)
@@ -173,7 +180,7 @@ async def lifespan(app: FastAPI):
     logger.info("QuantLuna Dashboard shutting down")
 
 
-app = FastAPI(title="QuantLuna Dashboard", version="1.4.2", lifespan=lifespan)
+app = FastAPI(title="QuantLuna Dashboard", version="1.4.3", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 _static_dir = os.path.join(os.path.dirname(__file__))
@@ -218,7 +225,7 @@ async def root() -> HTMLResponse:
     except FileNotFoundError:
         return HTMLResponse(content="<h1>QuantLuna Dashboard</h1>")
 
-@app.get("/api/status")  
+@app.get("/api/status")
 async def api_status() -> Dict[str, Any]: return bus.snapshot_dict()
 
 @app.get("/api/positions")
