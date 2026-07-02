@@ -5,6 +5,49 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Sprint 16] — 2026-07-02
+
+### Added
+- **`strategy/multi_timeframe.py`** — Multi-Timeframe Signal Confirmation engine
+  - `MTFConfig`: configurabil cu `htf_resample`, `htf_zscore_min`, `htf_neutral_band`, `require_htf_alignment`, `hysteresis_bars`
+  - `MultiTimeframeConfirmation.build_htf_zscore(ltf_df)`: resample LTF spread la HTF și calculează rolling z-score
+  - `confirm(ltf_zscore, htf_zscore)`: confirmă sau blochează entry pe baza alinierii LTF vs HTF
+  - `confirm_from_df(...)`: pipeline complet cu lookup automat al ultimului HTF bar valid
+  - `batch_confirm(df)`: vectorizat pentru backtesting — returnează `pd.Series[bool]`
+  - Logică neutral band: dacă HTF z-score ∈ ±neutral_band → no opinion → PASS
+  - Previne intrări counter-trend pe semnale LTF zgomotoase
+
+- **`core/volatility_regime.py`** — Volatility Regime Classifier
+  - `RegimeLabel` enum: `LOW | NORMAL | HIGH | EXTREME`
+  - `VolRegimeConfig`: lookback, percentile thresholds (low/high/extreme), size multipliers per regime, hysteresis, block_entry_regime
+  - `VolatilityRegime.update(spread_return)`: online update cu rolling percentile rank
+  - `update_from_prices(y, x, beta, prev_spread)`: convenience wrapper direct din prețuri
+  - Properties: `current_regime`, `size_multiplier`, `entry_allowed`, `percentile`
+  - `as_dict()`: snapshot serializabil pentru dashboard/logs
+  - Hysteresis: N bare consecutive în noul regim înainte de switch (previne flickering)
+  - `EXTREME` regime → `size_multiplier=0.0` → `entry_allowed=False` → no new trades
+
+- **`execution/okx_order_router.py`** — OKX Exchange Router (al 3-lea venue după Bybit + Binance)
+  - `OKXConfig`: api_key, api_secret, passphrase (OKX-specific), testnet, instrument_type, leverage, margin_mode
+  - `OKXOrderRouter`: async CCXT-based, context manager (`async with`)
+  - `connect()` / `close()`: lifecycle management cu sandbox mode pentru testnet
+  - `place_market_order()` / `place_limit_order()`: cu reduce_only, post_only, client_order_id
+  - `cancel_order()` / `cancel_all_orders()` / `get_open_orders()`
+  - `get_positions()` / `get_balance()` / `get_ticker()` / `get_orderbook()`
+  - `get_funding_rate()`: funding rate pentru perpetual SWAP
+  - `set_leverage(symbol, leverage, margin_mode)`: setare leverage + margin mode
+  - `open_pair()` / `close_pair()`: plasare simultană a ambelor picioare cu `asyncio.gather`
+  - `_retry()`: exponential backoff pe rate-limit errors (3 retries default)
+
+- **`tests/test_sprint16_enhancements.py`** — 20 teste Sprint 16
+  - `TestMTFConfig`: import, defaults
+  - `TestMTFConfirmation`: neutral band pass, aligned pass, misaligned block, HTF below min block, alignment disabled, build_htf_zscore, batch_confirm bool series, missing column raises, confirm_from_df
+  - `TestVolRegimeConfig`: import, defaults
+  - `TestVolatilityRegime`: starts normal, insufficient data, extreme vol triggers extreme, low vol triggers low, size multiplier decreases, extreme blocks entry, normal allows entry, percentile range, as_dict keys, reset clears state, update_from_prices, hysteresis delays switch
+  - `TestOKXOrderRouterImport`: import, config defaults, not connected raises, ccxt unavailable raises
+
+---
+
 ## [Sprint 15] — 2026-07-01
 
 ### Added
