@@ -1,5 +1,5 @@
 """
-dashboard/server.py  —  QuantLuna FastAPI Dashboard Server v1.4.3
+dashboard/server.py  —  QuantLuna FastAPI Dashboard Server v1.4.4
 """
 from __future__ import annotations
 
@@ -71,7 +71,6 @@ async def _init_exchange():
 
 
 async def _fetch_ticker_safe(sym: str, is_spot: bool) -> Optional[Dict[str, Any]]:
-    """Fetch ticker for one symbol: tries perp first (unless spot=True), then spot."""
     if _exchange_instance is None:
         return None
     candidates = [f"{sym}/USDT"]
@@ -130,8 +129,26 @@ async def _fetch_balance():
     api_key = os.getenv("BYBIT_API_KEY") or os.getenv("BINANCE_API_KEY") or ""
     if not api_key:
         return
+
+    bal = None
+    # Try UNIFIED first, then CONTRACT
+    for account_type in ["UNIFIED", "CONTRACT"]:
+        try:
+            bal = await _exchange_instance.fetch_balance({"accountType": account_type})
+            usdt = bal.get("USDT") or {}
+            total = float(usdt.get("total") or bal.get("total", {}).get("USDT") or 0)
+            if total > 0 or usdt:
+                logger.info(f"Balance fetched via {account_type}: total={total}")
+                break
+        except Exception as exc:
+            logger.warning(f"fetch_balance [{account_type}] error: {exc}")
+            bal = None
+            continue
+
+    if not bal:
+        return
+
     try:
-        bal   = await _exchange_instance.fetch_balance()
         usdt  = bal.get("USDT") or {}
         total = float(usdt.get("total") or bal.get("total", {}).get("USDT") or 0)
         free  = float(usdt.get("free")  or bal.get("free",  {}).get("USDT") or 0)
@@ -152,7 +169,7 @@ async def _fetch_balance():
         }
         logger.info(f"Balance updated: {total:.4f} USDT (free={free:.4f})")
     except Exception as exc:
-        logger.warning(f"fetch_balance error: {exc}")
+        logger.warning(f"fetch_balance parse error: {exc}")
 
 
 async def _live_data_loop():
@@ -180,7 +197,7 @@ async def lifespan(app: FastAPI):
     logger.info("QuantLuna Dashboard shutting down")
 
 
-app = FastAPI(title="QuantLuna Dashboard", version="1.4.3", lifespan=lifespan)
+app = FastAPI(title="QuantLuna Dashboard", version="1.4.4", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 _static_dir = os.path.join(os.path.dirname(__file__))
