@@ -1,42 +1,33 @@
-# QuantLuna — pip-compile source file
-# Genereaza requirements.txt cu: pip-compile requirements.in --generate-hashes
-#
-# Instalare pip-tools:
-#   pip install pip-tools
-#   pip-compile requirements.in --generate-hashes -o requirements.txt
+# QuantLuna — pinned direct dependencies
+# Run: pip-compile requirements.in -o requirements.txt
 
 # Core
-numpy>=1.26,<3
-pandas>=2.1,<3
-scipy>=1.12,<2
-scikit-learn>=1.4,<2
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.7.0
+httpx>=0.27.0
+aiohttp>=3.9.0
 
-# Trading / exchange
-ccxt>=4.2,<5
+# Data
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.13.0
+pyarrow>=16.0.0
+requests>=2.32.0
 
-# Async / networking
-httpx>=0.27,<1
-websockets>=12,<14
+# Exchange SDKs
+python-binance>=1.0.19
+pybit>=5.8.0
 
-# API
-fastapi>=0.111,<1
-uvicorn[standard]>=0.29,<1
-pydantic>=2.7,<3
-
-# ML / stats
-statsmodels>=0.14,<1
-hmmlearn>=0.3,<1
-optuna>=3.6,<4
-
-# Logging
-loguru>=0.7,<1
+# Redis (optional, for distributed state)
+redis>=5.0.0
 
 # Notifications
-# [REVIEW-5] Widened de la <22 la <23 — evita esecul pip-compile cand v22 este lansat.
-# v22 nu introduce breaking changes fata de interfata folosita de QuantLuna.
-python-telegram-bot>=21,<23
+# aiohttp covers Telegram + Discord (no extra dep)
 
-# Dev / test (not pinned in prod)
-# pytest>=8
-# ruff>=0.4
-# pip-tools>=7
+# Backtesting
+statsmodels>=0.14.0
+
+# Dev / test
+pytest>=8.2.0
+pytest-asyncio>=0.23.0
