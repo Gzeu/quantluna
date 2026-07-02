@@ -1,9 +1,10 @@
 """
 api/__init__.py  —  QuantLuna API package
-
-[FIX-5] __all__ declarat explicit pentru tree-shaking și IDE autocomplete clar.
+Sprint 21: strategy router added to public exports.
 """
-from api.backtest import router as backtest_router  # noqa: F401
+from api.backtest import router as backtest_router          # noqa: F401
+from api.strategy import router as strategy_router          # noqa: F401
+from api.strategy import register_selector, clear_selector  # noqa: F401
 from api.backtest import (
     CompareResponse,  # noqa: F401
     JobSummary,       # noqa: F401
@@ -15,6 +16,9 @@ from api.backtest import (
 
 __all__ = [
     "backtest_router",
+    "strategy_router",
+    "register_selector",
+    "clear_selector",
     "CompareResponse",
     "JobSummary",
     "RadarData",
