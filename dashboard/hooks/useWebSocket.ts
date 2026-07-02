@@ -24,56 +24,37 @@ export function useWebSocket(
   const heartbeatTimerRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const mountedRef = useRef(true)
+  // Store onMessage in a ref so changing the callback never triggers reconnect
+  const onMessageRef = useRef(onMessage)
+  useEffect(() => { onMessageRef.current = onMessage }, [onMessage])
 
   const [status, setStatus] = useState<WsStatus>('disconnected')
   const [lastMessage, setLastMessage] = useState<WsMessage | null>(null)
 
   const clearHeartbeat = () => {
-    if (heartbeatTimerRef.current) {
-      clearInterval(heartbeatTimerRef.current)
-      heartbeatTimerRef.current = null
-    }
+    if (heartbeatTimerRef.current) { clearInterval(heartbeatTimerRef.current); heartbeatTimerRef.current = null }
   }
-
   const clearReconnect = () => {
-    if (reconnectTimerRef.current) {
-      clearTimeout(reconnectTimerRef.current)
-      reconnectTimerRef.current = null
-    }
+    if (reconnectTimerRef.current) { clearTimeout(reconnectTimerRef.current); reconnectTimerRef.current = null }
   }
 
   const connect = useCallback(() => {
     if (!mountedRef.current) return
     clearHeartbeat()
     clearReconnect()
-
-    if (wsRef.current) {
-      wsRef.current.onclose = null
-      wsRef.current.close()
-      wsRef.current = null
-    }
-
+    if (wsRef.current) { wsRef.current.onclose = null; wsRef.current.close(); wsRef.current = null }
     setStatus('connecting')
-
     let ws: WebSocket
-    try {
-      ws = new WebSocket(url)
-    } catch {
-      setStatus('error')
-      return
-    }
+    try { ws = new WebSocket(url) } catch { setStatus('error'); return }
     wsRef.current = ws
 
     ws.onopen = () => {
       if (!mountedRef.current) return
       reconnectAttemptRef.current = 0
       setStatus('connected')
-
-      // Heartbeat ping every 15s
       heartbeatTimerRef.current = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
+        if (ws.readyState === WebSocket.OPEN)
           ws.send(JSON.stringify({ type: 'ping', payload: null, ts: Date.now() }))
-        }
       }, HEARTBEAT_INTERVAL_MS)
     }
 
@@ -81,35 +62,23 @@ export function useWebSocket(
       if (!mountedRef.current) return
       try {
         const msg = JSON.parse(event.data as string) as WsMessage
-        // ignore pong
         if (msg.type === 'pong') return
         setLastMessage(msg)
-        onMessage?.(msg)
-      } catch {
-        // non-JSON message — ignore
-      }
+        onMessageRef.current?.(msg)
+      } catch { /* non-JSON — ignore */ }
     }
 
-    ws.onerror = () => {
-      if (!mountedRef.current) return
-      setStatus('error')
-    }
+    ws.onerror = () => { if (mountedRef.current) setStatus('error') }
 
     ws.onclose = () => {
       if (!mountedRef.current) return
       clearHeartbeat()
       setStatus('disconnected')
-
-      // Exponential backoff reconnect
-      const attempt = reconnectAttemptRef.current
-      const delay = Math.min(BACKOFF_INITIAL_MS * Math.pow(2, attempt), BACKOFF_MAX_MS)
+      const delay = Math.min(BACKOFF_INITIAL_MS * Math.pow(2, reconnectAttemptRef.current), BACKOFF_MAX_MS)
       reconnectAttemptRef.current += 1
-
-      reconnectTimerRef.current = setTimeout(() => {
-        if (mountedRef.current) connect()
-      }, delay)
+      reconnectTimerRef.current = setTimeout(() => { if (mountedRef.current) connect() }, delay)
     }
-  }, [url, onMessage])
+  }, [url])
 
   useEffect(() => {
     mountedRef.current = true
@@ -118,24 +87,16 @@ export function useWebSocket(
       mountedRef.current = false
       clearHeartbeat()
       clearReconnect()
-      if (wsRef.current) {
-        wsRef.current.onclose = null
-        wsRef.current.close()
-        wsRef.current = null
-      }
+      if (wsRef.current) { wsRef.current.onclose = null; wsRef.current.close(); wsRef.current = null }
     }
   }, [connect])
 
   const send = useCallback((msg: unknown) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
+    if (wsRef.current?.readyState === WebSocket.OPEN)
       wsRef.current.send(JSON.stringify(msg))
-    }
   }, [])
 
-  const reconnect = useCallback(() => {
-    reconnectAttemptRef.current = 0
-    connect()
-  }, [connect])
+  const reconnect = useCallback(() => { reconnectAttemptRef.current = 0; connect() }, [connect])
 
   return { lastMessage, status, send, reconnect }
 }

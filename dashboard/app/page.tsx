@@ -13,9 +13,10 @@ import { formatPrice, formatPercent } from '../lib/formatters'
 import type { WsMessage } from '../types'
 
 export default function DashboardPage() {
-  const { updateFromWsFeed, pairs, markets } = useTradingStore()
+  const updateFromWsFeed = useTradingStore((s) => s.updateFromWsFeed)
+  const pairs            = useTradingStore((s) => s.pairs)
+  const markets          = useTradingStore((s) => s.markets)
 
-  // ── WebSocket → store ──────────────────────────────────────────────────────
   const handleWsMessage = useCallback(
     (msg: WsMessage) => updateFromWsFeed(msg),
     [updateFromWsFeed],
@@ -23,50 +24,43 @@ export default function DashboardPage() {
 
   const { status: wsStatus, reconnect } = useWebSocket(handleWsMessage)
 
-  // ── Panel refs for Ctrl+1..5 focus ─────────────────────────────────────────
-  const panelRefs = {
-    sidebar:  useRef<HTMLDivElement>(null),
-    center:   useRef<HTMLDivElement>(null),
-    right:    useRef<HTMLDivElement>(null),
-    log:      useRef<HTMLDivElement>(null),
-    heatmap:  useRef<HTMLDivElement>(null),
-  }
-  const pausedRef = useRef(false)
+  const sidebarRef  = useRef<HTMLDivElement>(null)
+  const centerRef   = useRef<HTMLDivElement>(null)
+  const rightRef    = useRef<HTMLDivElement>(null)
+  const logRef      = useRef<HTMLDivElement>(null)
+  const heatmapRef  = useRef<HTMLDivElement>(null)
+  const pausedRef   = useRef(false)
 
-  // ── Global keyboard shortcuts ──────────────────────────────────────────────
+  // Global keyboard shortcuts
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (e.ctrlKey && e.key === 'p') {
-        e.preventDefault()
-        pausedRef.current = !pausedRef.current
-      }
-      if (e.ctrlKey && e.key === '1') panelRefs.sidebar.current?.focus()
-      if (e.ctrlKey && e.key === '2') panelRefs.center.current?.focus()
-      if (e.ctrlKey && e.key === '3') panelRefs.right.current?.focus()
-      if (e.ctrlKey && e.key === '4') panelRefs.log.current?.focus()
-      if (e.ctrlKey && e.key === '5') panelRefs.heatmap.current?.focus()
+      if (e.ctrlKey && e.key === 'p')  { e.preventDefault(); pausedRef.current = !pausedRef.current }
+      if (e.ctrlKey && e.key === '1')  sidebarRef.current?.focus()
+      if (e.ctrlKey && e.key === '2')  centerRef.current?.focus()
+      if (e.ctrlKey && e.key === '3')  rightRef.current?.focus()
+      if (e.ctrlKey && e.key === '4')  logRef.current?.focus()
+      if (e.ctrlKey && e.key === '5')  heatmapRef.current?.focus()
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
   }, [])
 
-  // ── REST hydration on mount ────────────────────────────────────────────────
+  // REST hydration on mount
   useEffect(() => {
     const BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
-    const endpoints = [
+    ;[
       { url: `${BASE}/api/balance`, type: 'balance' },
       { url: `${BASE}/api/pairs`,   type: 'pairs'   },
       { url: `${BASE}/api/markets`, type: 'markets' },
       { url: `${BASE}/api/risk`,    type: 'regime'  },
       { url: `${BASE}/api/log`,     type: 'log'     },
-    ]
-    endpoints.forEach(({ url, type }) => {
+    ].forEach(({ url, type }) => {
       fetch(url)
         .then((r) => r.json())
         .then((payload) => updateFromWsFeed({ type, payload, ts: Date.now() }))
-        .catch(() => {/* server offline — store keeps mock data */})
+        .catch(() => {/* server offline — mock data stays */})
     })
-  }, [])
+  }, [updateFromWsFeed])
 
   return (
     <div
@@ -78,19 +72,15 @@ export default function DashboardPage() {
         gridTemplateRows: '44px 1fr 200px',
       }}
     >
-      {/* ── HEADER ─────────────────────────────────────────────────────── */}
-      <div style={{ gridArea: 'header' }}>
-        <RegimeHeader />
-      </div>
+      {/* HEADER */}
+      <div style={{ gridArea: 'header' }}><RegimeHeader /></div>
 
-      {/* ── SIDEBAR ────────────────────────────────────────────────────── */}
+      {/* SIDEBAR */}
       <div
-        ref={panelRefs.sidebar}
-        tabIndex={-1}
+        ref={sidebarRef} tabIndex={-1}
         style={{ gridArea: 'sidebar' }}
         className="flex flex-col gap-2 overflow-y-auto border-r border-bg-border p-2 focus:outline-none"
       >
-        {/* Pairs list */}
         <p className="px-1 font-mono text-[10px] uppercase tracking-widest text-text-muted">Pairs</p>
         {pairs.map((p) => (
           <div key={p.symbol} className="rounded border border-bg-border bg-bg-panel px-3 py-2">
@@ -110,7 +100,6 @@ export default function DashboardPage() {
           </div>
         ))}
 
-        {/* Markets list */}
         <p className="mt-2 px-1 font-mono text-[10px] uppercase tracking-widest text-text-muted">Markets</p>
         {markets.slice(0, 15).map((m) => (
           <div key={m.symbol} className="flex items-center justify-between px-3 py-1 rounded border border-bg-border bg-bg-panel">
@@ -122,33 +111,26 @@ export default function DashboardPage() {
         ))}
       </div>
 
-      {/* ── CENTER ─────────────────────────────────────────────────────── */}
+      {/* CENTER */}
       <div
-        ref={panelRefs.center}
-        tabIndex={-1}
+        ref={centerRef} tabIndex={-1}
         style={{ gridArea: 'center' }}
         className="flex flex-col gap-2 overflow-hidden p-2 focus:outline-none"
       >
-        {/* SpreadMonitorPanel: top 30% */}
-        <div className="h-[30%] min-h-0">
-          <SpreadMonitorPanel />
-        </div>
-        {/* MarketHeatmap: bottom 70% */}
-        <div ref={panelRefs.heatmap} tabIndex={-1} className="flex-1 min-h-0 focus:outline-none">
+        <div className="h-[30%] min-h-0"><SpreadMonitorPanel /></div>
+        <div ref={heatmapRef} tabIndex={-1} className="flex-1 min-h-0 focus:outline-none">
           <MarketHeatmap />
         </div>
       </div>
 
-      {/* ── RIGHT ──────────────────────────────────────────────────────── */}
+      {/* RIGHT */}
       <div
-        ref={panelRefs.right}
-        tabIndex={-1}
+        ref={rightRef} tabIndex={-1}
         style={{ gridArea: 'right' }}
         className="flex flex-col gap-2 overflow-y-auto border-l border-bg-border p-2 focus:outline-none"
       >
         <BalanceTracker />
         <ArbitragePanel />
-        {/* WS reconnect status pill */}
         {wsStatus !== 'connected' && (
           <button
             onClick={reconnect}
@@ -159,10 +141,9 @@ export default function DashboardPage() {
         )}
       </div>
 
-      {/* ── LOG ────────────────────────────────────────────────────────── */}
+      {/* LOG */}
       <div
-        ref={panelRefs.log}
-        tabIndex={-1}
+        ref={logRef} tabIndex={-1}
         style={{ gridArea: 'log' }}
         className="overflow-hidden border-t border-bg-border p-2 focus:outline-none"
       >
