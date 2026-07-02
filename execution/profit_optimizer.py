@@ -1,362 +1,261 @@
 """
-execution/profit_optimizer.py  —  QuantLuna Profit Optimizer
+QuantLuna — Profit Optimizer (Sprint 17)
 
-Scop:
-  Gestionează activ pozițiile adoptate (orfane preluate) pentru profit maxim:
-    1. TrailingStopManager  — trailing stop dinamic per poziție
-    2. ProfitLadder          — închidere parțială la niveluri de profit
-    3. AdaptiveTP            — TP dinamic bazat pe volatilitate reală
-    4. BreakEvenMover        — mută SL la break-even când PnL > 1.5%
-
-Fiecare poziție adoptata e urmărită într-un AdoptedPositionTracker.
-La fiecare tick de preț, `on_price_tick()` e apelat şi returnează
-acțiunea necesara (HOLD / PARTIAL_CLOSE / FULL_CLOSE).
+Manages open adopted positions with:
+  - Take-profit (TP) and stop-loss (SL) monitoring
+  - Break-even SL move after position reaches profit trigger
+  - Profit ladder: partial closes at configurable levels
+  - Trailing stop from peak price
 
 Usage:
-    optimizer = ProfitOptimizer(exchange, alert_cfg)
-    optimizer.register(adoption_result, current_price)
+    opt = ProfitOptimizer(exchange)
+    opt.register(adoption_result, current_price=50000.0)
 
-    # La fiecare tick:
-    actions = await optimizer.on_price_tick({symbol: price})
-    for action in actions:
-        if action.type == 'FULL_CLOSE':
-            # execută close
+    # On each price tick:
+    actions = await opt.tick(prices={"BTC/USDT:USDT": 51200.0})
 """
 from __future__ import annotations
 
 import asyncio
-import logging
-import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from execution.adoption_engine import AdoptionResult
-from execution.position_scanner import ExchangePosition
-
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
-class ActionType(Enum):
+class ActionType(str, Enum):
     HOLD          = "hold"
-    PARTIAL_CLOSE = "partial_close"   # închidem X% din poziție
-    FULL_CLOSE    = "full_close"      # închidem tot
-    MOVE_SL       = "move_sl"         # mută SL (informativ, fara ordin Exchange)
+    FULL_CLOSE    = "full_close"
+    PARTIAL_CLOSE = "partial_close"
+    MOVE_SL       = "move_sl"
 
 
 @dataclass
-class OptimizerAction:
-    symbol: str
+class OptAction:
     action_type: ActionType
-    reason: str
-    close_qty: float = 0.0       # pentru PARTIAL_CLOSE / FULL_CLOSE
-    new_sl: Optional[float] = None
-    current_price: float = 0.0
-    current_pnl: float = 0.0
+    symbol:      str
+    reason:      str = ""
+    close_qty:   float = 0.0
+    new_sl:      Optional[float] = None
 
 
 @dataclass
 class TrackedPosition:
-    symbol: str
-    side: str                   # 'long' sau 'short'
-    qty: float
+    """Internal state for an adopted position being managed."""
+    symbol:      str
+    side:        str
+    qty:         float
     entry_price: float
-    tp_price: float
-    sl_price: float
-    trailing_pct: float
-    trailing_activation_pct: float = 0.02
-    break_even_trigger_pct: float  = 0.015
+    tp_price:    float
+    sl_price:    float
+    trailing_pct: float = 0.015
 
-    # State runtime
-    peak_price: float = 0.0
+    # Break-even
+    break_even_trigger_pct: float = 0.015  # move SL to BE when profit >= this
     sl_moved_to_be: bool = False
-    partial_closed_pct: float = 0.0   # cât % am închis deja
-    registered_at: float = field(default_factory=time.time)
 
-    # Ladder niveluri de partial close: [(profit_pct, close_pct)]
-    ladder: List[tuple] = field(default_factory=lambda: [
-        (0.02, 0.25),   # la +2%  → închide 25% din poziție
-        (0.04, 0.25),   # la +4%  → închide încă 25%
-        (0.07, 0.30),   # la +7%  → închide încă 30%
-        # la +TP  → închide restul 20%
-    ])
-    ladder_executed: int = 0    # câte niveluri din ladder au fost executate
+    # Profit ladder: list of (trigger_pct, close_fraction) tuples
+    ladder: List[Tuple[float, float]] = field(default_factory=list)
+    ladder_executed: int = 0
 
-    def __post_init__(self):
-        self.peak_price = self.entry_price
-
-    @property
-    def remaining_qty(self) -> float:
-        return self.qty * (1 - self.partial_closed_pct)
-
-    def current_pnl_pct(self, current_price: float) -> float:
-        if self.entry_price == 0:
-            return 0.0
-        if self.side == 'long':
-            return (current_price - self.entry_price) / self.entry_price
-        else:
-            return (self.entry_price - current_price) / self.entry_price
-
-    def current_pnl_usdt(self, current_price: float) -> float:
-        pnl_pct = self.current_pnl_pct(current_price)
-        notional = self.entry_price * self.qty
-        return pnl_pct * notional
-
-    def update_peak(self, current_price: float) -> None:
-        if self.side == 'long':
-            self.peak_price = max(self.peak_price, current_price)
-        else:
-            self.peak_price = min(self.peak_price, current_price)
-
-    def trailing_stop_price(self) -> float:
-        """Сalculează nivelul trailing stop curent."""
-        if self.side == 'long':
-            return self.peak_price * (1 - self.trailing_pct)
-        else:
-            return self.peak_price * (1 + self.trailing_pct)
+    # Trailing stop
+    trailing_activation_pct: float = 0.02
+    peak_price: Optional[float] = None
+    trailing_active: bool = False
 
 
 class ProfitOptimizer:
     """
-    Gestionează activ poziții adoptate pentru profit maxim.
+    Monitors open positions and emits close/move-SL actions on price ticks.
 
-    Args:
-        exchange:  ccxt async exchange instance (create_order)
-        alert_cfg: AlertConfig
+    Parameters
+    ----------
+    exchange : async CCXT exchange object
     """
 
-    def __init__(self, exchange, alert_cfg=None) -> None:
+    def __init__(self, exchange: Any) -> None:
         self._exchange  = exchange
-        self._alert     = alert_cfg
         self._positions: Dict[str, TrackedPosition] = {}
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def register(
         self,
-        result: AdoptionResult,
-        current_price: Optional[float] = None,
+        result: Any,  # AdoptionResult
+        current_price: float,
     ) -> None:
         """
-        Înregistrează o poziție adoptată pentru tracking activ.
-        """
-        pos    = result.position
-        entry  = pos.entry_price
-        tp     = result.tp_price or entry * (1.04 if pos.side == 'long' else 0.96)
-        sl     = result.sl_price or entry * (0.97 if pos.side == 'long' else 1.03)
-        trail  = result.trailing_pct or 0.015
+        Register an adopted position for monitoring.
 
+        Parameters
+        ----------
+        result        : AdoptionResult from AdoptionEngine
+        current_price : current mark price
+        """
+        pos = result.position
         tracked = TrackedPosition(
             symbol=pos.symbol,
             side=pos.side,
             qty=pos.qty,
-            entry_price=entry,
-            tp_price=tp,
-            sl_price=sl,
-            trailing_pct=trail,
+            entry_price=pos.entry_price,
+            tp_price=result.tp_price or pos.entry_price * 1.04,
+            sl_price=result.sl_price or pos.entry_price * 0.97,
+            trailing_pct=result.trailing_pct,
+            peak_price=current_price,
         )
-        if current_price:
-            tracked.peak_price = current_price
-
         self._positions[pos.symbol] = tracked
         logger.info(
-            f"[Optimizer] Registered: {pos.symbol} {pos.side} "
-            f"qty={pos.qty:.4f} TP={tp:.4f} SL={sl:.4f} trail={trail:.1%}"
+            f"ProfitOptimizer: registered {pos.symbol} tp={tracked.tp_price:.4f} "
+            f"sl={tracked.sl_price:.4f} trail={tracked.trailing_pct:.2%}"
         )
 
-    async def on_price_tick(
-        self, prices: Dict[str, float]
-    ) -> List[OptimizerAction]:
-        """
-        Apelat la fiecare tick de preț pentru pozițiile gestionate.
-        Returnează lista de acțiuni necesare.
-        """
-        actions = []
-        for symbol, tracked in list(self._positions.items()):
-            price = prices.get(symbol) or prices.get(symbol.split('/')[0])
-            if price is None:
-                continue
-
-            action = self._evaluate(tracked, price)
-            if action.action_type != ActionType.HOLD:
-                actions.append(action)
-                await self._execute_action(action, tracked)
-
-        return actions
-
-    def _evaluate(
-        self, tracked: TrackedPosition, price: float
-    ) -> OptimizerAction:
-        tracked.update_peak(price)
-        pnl_pct  = tracked.current_pnl_pct(price)
-        pnl_usdt = tracked.current_pnl_usdt(price)
-        trailing_stop = tracked.trailing_stop_price()
-
-        # 1. Stop-Loss hit
-        if tracked.side == 'long' and price <= tracked.sl_price:
-            return OptimizerAction(
-                symbol=tracked.symbol,
-                action_type=ActionType.FULL_CLOSE,
-                reason=f"SL hit: price={price:.4f} <= sl={tracked.sl_price:.4f}",
-                close_qty=tracked.remaining_qty,
-                current_price=price, current_pnl=pnl_usdt,
-            )
-        if tracked.side == 'short' and price >= tracked.sl_price:
-            return OptimizerAction(
-                symbol=tracked.symbol,
-                action_type=ActionType.FULL_CLOSE,
-                reason=f"SL hit: price={price:.4f} >= sl={tracked.sl_price:.4f}",
-                close_qty=tracked.remaining_qty,
-                current_price=price, current_pnl=pnl_usdt,
-            )
-
-        # 2. Take-Profit hit
-        if tracked.side == 'long' and price >= tracked.tp_price:
-            return OptimizerAction(
-                symbol=tracked.symbol,
-                action_type=ActionType.FULL_CLOSE,
-                reason=f"TP hit: price={price:.4f} >= tp={tracked.tp_price:.4f}",
-                close_qty=tracked.remaining_qty,
-                current_price=price, current_pnl=pnl_usdt,
-            )
-        if tracked.side == 'short' and price <= tracked.tp_price:
-            return OptimizerAction(
-                symbol=tracked.symbol,
-                action_type=ActionType.FULL_CLOSE,
-                reason=f"TP hit: price={price:.4f} <= tp={tracked.tp_price:.4f}",
-                close_qty=tracked.remaining_qty,
-                current_price=price, current_pnl=pnl_usdt,
-            )
-
-        # 3. Trailing stop hit (dupa activare)
-        if pnl_pct >= tracked.trailing_activation_pct:
-            if tracked.side == 'long' and price <= trailing_stop:
-                return OptimizerAction(
-                    symbol=tracked.symbol,
-                    action_type=ActionType.FULL_CLOSE,
-                    reason=f"Trailing stop: price={price:.4f} <= trail={trailing_stop:.4f} | peak={tracked.peak_price:.4f}",
-                    close_qty=tracked.remaining_qty,
-                    current_price=price, current_pnl=pnl_usdt,
-                )
-            if tracked.side == 'short' and price >= trailing_stop:
-                return OptimizerAction(
-                    symbol=tracked.symbol,
-                    action_type=ActionType.FULL_CLOSE,
-                    reason=f"Trailing stop: price={price:.4f} >= trail={trailing_stop:.4f} | peak={tracked.peak_price:.4f}",
-                    close_qty=tracked.remaining_qty,
-                    current_price=price, current_pnl=pnl_usdt,
-                )
-
-        # 4. Break-even move (o singura data)
-        if not tracked.sl_moved_to_be and pnl_pct >= tracked.break_even_trigger_pct:
-            new_sl = tracked.entry_price * (1.001 if tracked.side == 'long' else 0.999)
-            tracked.sl_price    = new_sl
-            tracked.sl_moved_to_be = True
-            logger.info(
-                f"[Optimizer] Break-even: {tracked.symbol} SL → {new_sl:.4f} "
-                f"(PnL={pnl_pct:+.1%})"
-            )
-            return OptimizerAction(
-                symbol=tracked.symbol,
-                action_type=ActionType.MOVE_SL,
-                reason=f"Break-even: PnL={pnl_pct:+.1%} >= {tracked.break_even_trigger_pct:.1%}",
-                new_sl=new_sl,
-                current_price=price, current_pnl=pnl_usdt,
-            )
-
-        # 5. Profit ladder — partial close
-        if tracked.ladder_executed < len(tracked.ladder):
-            level_pct, close_pct = tracked.ladder[tracked.ladder_executed]
-            if pnl_pct >= level_pct:
-                close_qty = tracked.qty * close_pct
-                tracked.partial_closed_pct += close_pct
-                tracked.ladder_executed += 1
-                logger.info(
-                    f"[Optimizer] Ladder L{tracked.ladder_executed}: "
-                    f"{tracked.symbol} close {close_pct:.0%} qty={close_qty:.4f} "
-                    f"(PnL={pnl_pct:+.1%})"
-                )
-                return OptimizerAction(
-                    symbol=tracked.symbol,
-                    action_type=ActionType.PARTIAL_CLOSE,
-                    reason=f"Profit ladder L{tracked.ladder_executed}: PnL={pnl_pct:+.1%} >= {level_pct:.1%}",
-                    close_qty=close_qty,
-                    current_price=price, current_pnl=pnl_usdt,
-                )
-
-        return OptimizerAction(
-            symbol=tracked.symbol,
-            action_type=ActionType.HOLD,
-            reason="",
-            current_price=price, current_pnl=pnl_usdt,
-        )
-
-    async def _execute_action(
-        self, action: OptimizerAction, tracked: TrackedPosition
-    ) -> None:
-        if action.action_type == ActionType.MOVE_SL:
-            # SL e soft (gestionat de bot, nu ordin exchange)
-            return
-
-        if action.action_type in (ActionType.FULL_CLOSE, ActionType.PARTIAL_CLOSE):
-            close_side = 'sell' if tracked.side == 'long' else 'buy'
-            try:
-                order = await self._exchange.create_order(
-                    symbol=action.symbol,
-                    type='market',
-                    side=close_side,
-                    amount=action.close_qty,
-                    params={'reduceOnly': True},
-                )
-                logger.info(
-                    f"[Optimizer] {action.action_type.value}: {action.symbol} "
-                    f"{close_side} qty={action.close_qty:.4f} "
-                    f"| reason={action.reason} "
-                    f"| order={order.get('id', 'unknown')}"
-                )
-                if action.action_type == ActionType.FULL_CLOSE:
-                    self._positions.pop(action.symbol, None)
-                await self._send_alert(action)
-            except Exception as exc:
-                logger.error(
-                    f"[Optimizer] execute_action FAILED: {action.symbol} "
-                    f"{action.action_type.value}: {exc}"
-                )
-
-    async def _send_alert(self, action: OptimizerAction) -> None:
-        if not self._alert:
-            return
-        emoji = '✅' if action.current_pnl >= 0 else '🔴'
-        msg = (
-            f"{emoji} Optimizer [{action.action_type.value.upper()}]\n"
-            f"Symbol: {action.symbol}\n"
-            f"Qty closed: {action.close_qty:.4f} @ {action.current_price:.4f}\n"
-            f"PnL: {action.current_pnl:+.2f} USDT\n"
-            f"Motiv: {action.reason}"
-        )
-        try:
-            from execution.live_trader import _send_alert
-            await _send_alert(self._alert, msg)
-        except Exception as exc:
-            logger.warning(f"[Optimizer] alert failed: {exc}")
+    def unregister(self, symbol: str) -> None:
+        self._positions.pop(symbol, None)
 
     @property
     def active_count(self) -> int:
         return len(self._positions)
 
-    def position_summary(self) -> List[dict]:
-        return [
-            {
-                'symbol': t.symbol,
-                'side': t.side,
-                'qty': t.qty,
-                'remaining_qty': t.remaining_qty,
-                'entry': t.entry_price,
-                'tp': t.tp_price,
-                'sl': t.sl_price,
-                'peak': t.peak_price,
-                'trailing_stop': t.trailing_stop_price(),
-                'sl_at_be': t.sl_moved_to_be,
-                'ladder_level': t.ladder_executed,
-                'partial_closed': t.partial_closed_pct,
-            }
-            for t in self._positions.values()
-        ]
+    async def tick(self, prices: Dict[str, float]) -> List[OptAction]:
+        """
+        Evaluate all tracked positions against current prices.
+        Returns list of actions to execute.
+        """
+        actions: List[OptAction] = []
+        for symbol, tracked in list(self._positions.items()):
+            price = prices.get(symbol)
+            if price is None:
+                continue
+            action = self._evaluate(tracked, price)
+            if action.action_type != ActionType.HOLD:
+                actions.append(action)
+                await self._execute(action, tracked, price)
+                if action.action_type == ActionType.FULL_CLOSE:
+                    self.unregister(symbol)
+        return actions
+
+    # ------------------------------------------------------------------
+    # Evaluation logic
+    # ------------------------------------------------------------------
+
+    def _evaluate(self, t: TrackedPosition, price: float) -> OptAction:
+        """Evaluate a single position. Returns the recommended action."""
+        is_long = t.side == "long"
+
+        # Update peak
+        if t.peak_price is None:
+            t.peak_price = price
+        if is_long:
+            t.peak_price = max(t.peak_price, price)
+        else:
+            t.peak_price = min(t.peak_price, price)
+
+        # 1. SL hit
+        if is_long and price <= t.sl_price:
+            return OptAction(ActionType.FULL_CLOSE, t.symbol, f"SL hit at {price:.4f}")
+        if not is_long and price >= t.sl_price:
+            return OptAction(ActionType.FULL_CLOSE, t.symbol, f"SL hit at {price:.4f}")
+
+        # 2. TP hit
+        if is_long and price >= t.tp_price:
+            return OptAction(ActionType.FULL_CLOSE, t.symbol, f"TP hit at {price:.4f}")
+        if not is_long and price <= t.tp_price:
+            return OptAction(ActionType.FULL_CLOSE, t.symbol, f"TP hit at {price:.4f}")
+
+        # 3. Break-even move
+        if not t.sl_moved_to_be:
+            profit_pct = (
+                (price - t.entry_price) / t.entry_price if is_long
+                else (t.entry_price - price) / t.entry_price
+            )
+            if profit_pct >= t.break_even_trigger_pct:
+                # Move SL to entry + 1 tick
+                new_sl = t.entry_price * (1.0 + 0.0001) if is_long else t.entry_price * (1.0 - 0.0001)
+                t.sl_price       = new_sl
+                t.sl_moved_to_be = True
+                logger.info(f"ProfitOptimizer: BE move {t.symbol} new_sl={new_sl:.4f}")
+                return OptAction(ActionType.MOVE_SL, t.symbol, "Break-even SL move", new_sl=new_sl)
+
+        # 4. Profit ladder
+        if t.ladder and t.ladder_executed < len(t.ladder):
+            trigger_pct, close_frac = t.ladder[t.ladder_executed]
+            profit_pct = (
+                (price - t.entry_price) / t.entry_price if is_long
+                else (t.entry_price - price) / t.entry_price
+            )
+            if profit_pct >= trigger_pct:
+                close_qty = t.qty * close_frac
+                t.qty             -= close_qty
+                t.ladder_executed += 1
+                logger.info(
+                    f"ProfitOptimizer: ladder L{t.ladder_executed} {t.symbol} "
+                    f"close {close_frac:.0%} qty={close_qty:.6f}"
+                )
+                return OptAction(
+                    ActionType.PARTIAL_CLOSE, t.symbol,
+                    f"Ladder L{t.ladder_executed}",
+                    close_qty=close_qty,
+                )
+
+        # 5. Trailing stop
+        activation_pct = t.trailing_activation_pct
+        peak = t.peak_price
+        if is_long:
+            activated = (peak - t.entry_price) / t.entry_price >= activation_pct
+            trail_sl  = peak * (1.0 - t.trailing_pct)
+            if activated and price <= trail_sl:
+                return OptAction(
+                    ActionType.FULL_CLOSE, t.symbol,
+                    f"Trailing stop hit at {price:.4f} (trail from {peak:.4f})",
+                )
+        else:
+            activated = (t.entry_price - peak) / t.entry_price >= activation_pct
+            trail_sl  = peak * (1.0 + t.trailing_pct)
+            if activated and price >= trail_sl:
+                return OptAction(
+                    ActionType.FULL_CLOSE, t.symbol,
+                    f"Trailing stop hit at {price:.4f} (trail from {peak:.4f})",
+                )
+
+        return OptAction(ActionType.HOLD, t.symbol, "hold")
+
+    # ------------------------------------------------------------------
+    # Execution
+    # ------------------------------------------------------------------
+
+    async def _execute(self, action: OptAction, tracked: TrackedPosition, price: float) -> None:
+        """Execute the action against the exchange."""
+        if action.action_type == ActionType.HOLD:
+            return
+
+        side = "sell" if tracked.side == "long" else "buy"
+
+        if action.action_type == ActionType.FULL_CLOSE:
+            try:
+                await self._exchange.create_order(
+                    tracked.symbol, "market", side, tracked.qty,
+                    params={"reduceOnly": True},
+                )
+                logger.info(f"ProfitOptimizer: FULL_CLOSE {tracked.symbol} reason={action.reason}")
+            except Exception as exc:
+                logger.error(f"ProfitOptimizer: FULL_CLOSE failed {tracked.symbol}: {exc}")
+
+        elif action.action_type == ActionType.PARTIAL_CLOSE:
+            try:
+                await self._exchange.create_order(
+                    tracked.symbol, "market", side, action.close_qty,
+                    params={"reduceOnly": True},
+                )
+                logger.info(
+                    f"ProfitOptimizer: PARTIAL_CLOSE {tracked.symbol} "
+                    f"qty={action.close_qty:.6f} reason={action.reason}"
+                )
+            except Exception as exc:
+                logger.error(f"ProfitOptimizer: PARTIAL_CLOSE failed {tracked.symbol}: {exc}")
+
+        elif action.action_type == ActionType.MOVE_SL:
+            # SL moves are managed locally (no exchange cancel/replace needed for market SL)
+            pass

@@ -1,330 +1,344 @@
 """
-execution/order_manager.py  —  QuantLuna Sprint 4 v2
+QuantLuna — Order Manager (Sprint 17)
 
-Responsabilities:
-  - Submit pair legs (market or limit postOnly)
-  - Dynamic slippage model: base + size_impact, capped
-  - Exponential backoff retry on transient exchange errors
-  - Idempotent close()
-  - FillPair dataclass for dashboard analytics
+Centralised order lifecycle management across all venues (Bybit, Binance, OKX).
+Abstracts over individual routers — callers use OrderManager instead of
+calling each router directly.
+
+Responsibilities:
+  - Route orders to the correct exchange based on symbol / config
+  - Track open orders with local state (pending, filled, cancelled, failed)
+  - Automatic cancel-on-timeout for stale open orders
+  - Emit events via StateBus on fill / cancel / error
+  - Thread-safe for use from async tasks
+
+Usage:
+    mgr = OrderManager(config)
+    await mgr.connect_all()
+    order_id = await mgr.submit(OrderRequest(symbol="BTCUSDT", side="buy", qty=0.01, venue="bybit"))
+    status   = mgr.get_status(order_id)
 """
-
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
+import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from enum import Enum
+from typing import Any, Dict, List, Optional
 
-import ccxt.async_support as ccxt_async
-
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
-# ---------------------------------------------------------------------------
-# Dataclasses
-# ---------------------------------------------------------------------------
+class OrderStatus(str, Enum):
+    PENDING    = "pending"
+    SUBMITTED  = "submitted"
+    FILLED     = "filled"
+    PARTIALLY  = "partially_filled"
+    CANCELLED  = "cancelled"
+    FAILED     = "failed"
+    TIMED_OUT  = "timed_out"
 
-@dataclass
-class Fill:
-    symbol: str
-    side: str                     # 'buy' | 'sell'
-    qty: float
-    ref_price: float
-    fill_price: float
-    slippage_bps: float
-    fee_usdt: float
-    order_id: str = ""
-    order_type: str = "market"
-    timestamp_ms: int = 0
 
-    @property
-    def cost_usdt(self) -> float:
-        return self.fill_price * self.qty
+class OrderSide(str, Enum):
+    BUY  = "buy"
+    SELL = "sell"
+
+
+class OrderType(str, Enum):
+    MARKET = "market"
+    LIMIT  = "limit"
 
 
 @dataclass
-class FillPair:
-    leg_y: Fill
-    leg_x: Fill
-    entry_ts_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+class OrderRequest:
+    """Describes an order to be placed."""
+    symbol:      str
+    side:        str            # 'buy' | 'sell'
+    qty:         float
+    venue:       str            # 'bybit' | 'binance' | 'okx'
+    order_type:  str = "market"  # 'market' | 'limit'
+    price:       Optional[float] = None
+    reduce_only: bool = False
+    post_only:   bool = False
+    client_id:   Optional[str] = None
+    tag:         str = ""        # e.g. 'pair_y', 'pair_x', 'close_y'
 
-    @property
-    def total_cost_usdt(self) -> float:
-        return self.leg_y.cost_usdt + self.leg_x.cost_usdt
-
-    @property
-    def net_notional(self) -> float:
-        """Signed: positive = long Y / short X."""
-        sign_y = 1.0 if self.leg_y.side == "buy" else -1.0
-        sign_x = 1.0 if self.leg_x.side == "buy" else -1.0
-        return sign_y * self.leg_y.cost_usdt + sign_x * self.leg_x.cost_usdt
-
-    @property
-    def execution_lag_ms(self) -> int:
-        if self.leg_x.timestamp_ms and self.leg_y.timestamp_ms:
-            return abs(self.leg_x.timestamp_ms - self.leg_y.timestamp_ms)
-        return 0
-
-    @property
-    def total_fee_usdt(self) -> float:
-        return self.leg_y.fee_usdt + self.leg_x.fee_usdt
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 
 @dataclass
-class ExecutionConfig:
-    exchange_id: str = "bybit"          # ccxt exchange id
-    api_key: str = ""
-    api_secret: str = ""
-    testnet: bool = True
-    paper_mode: bool = False
+class OrderRecord:
+    """Tracks lifecycle of a submitted order."""
+    local_id:    str
+    request:     OrderRequest
+    status:      OrderStatus = OrderStatus.PENDING
+    exchange_id: Optional[str] = None
+    submitted_at: float = field(default_factory=time.time)
+    filled_at:   Optional[float] = None
+    fill_price:  Optional[float] = None
+    fill_qty:    float = 0.0
+    error:       Optional[str] = None
+    raw_response: Optional[Dict] = None
 
-    # Slippage model
-    slippage_bps: float = 3.0           # base slippage
-    size_impact_scale: float = 50_000.0 # USDT: full impact at this notional
-    max_slippage_bps: float = 15.0      # hard cap
+    @property
+    def age_seconds(self) -> float:
+        return time.time() - self.submitted_at
 
-    # Order type
-    order_type: str = "market"          # 'market' | 'limit'
-    limit_ttl_s: float = 30.0           # limit order TTL before market fallback
-    limit_offset_bps: float = 1.0       # limit price offset from mid
+    def as_dict(self) -> Dict:
+        return {
+            "local_id":    self.local_id,
+            "exchange_id": self.exchange_id,
+            "symbol":      self.request.symbol,
+            "venue":       self.request.venue,
+            "side":        self.request.side,
+            "qty":         self.request.qty,
+            "order_type":  self.request.order_type,
+            "status":      self.status.value,
+            "fill_price":  self.fill_price,
+            "fill_qty":    self.fill_qty,
+            "age_s":       round(self.age_seconds, 2),
+            "error":       self.error,
+            "tag":         self.request.tag,
+        }
 
-    # Fees (maker / taker)
-    fee_rate_taker: float = 0.00055     # Bybit perp taker
-    fee_rate_maker: float = 0.00020     # Bybit perp maker
 
-    # Retry
-    max_retries: int = 3
+@dataclass
+class OrderManagerConfig:
+    # Max seconds to wait for a market order fill before timing out
+    market_timeout_s: float = 30.0
+    # Max seconds to wait for a limit order fill before cancelling
+    limit_timeout_s: float = 120.0
+    # How often (seconds) to check for stale orders
+    monitor_interval_s: float = 5.0
+    # Max records kept in history (oldest dropped)
+    max_history: int = 1000
+    # Dry-run: log orders but never actually submit
+    dry_run: bool = False
 
-
-# ---------------------------------------------------------------------------
-# OrderManager
-# ---------------------------------------------------------------------------
 
 class OrderManager:
     """
-    Async pair execution engine.
+    Centralised order router and lifecycle tracker.
 
-    Usage:
-        async with OrderManager(config) as om:
-            fill_pair = await om.execute_pair(
-                sym_y, side_y, qty_y, price_y,
-                sym_x, side_x, qty_x, price_x,
-            )
+    Parameters
+    ----------
+    config   : OrderManagerConfig
+    routers  : dict of venue_name → router object (must have place_market_order /
+               place_limit_order / cancel_order coroutines)
     """
 
-    def __init__(self, config: ExecutionConfig):
-        self.cfg = config
-        self._exchange: Optional[ccxt_async.Exchange] = None
+    def __init__(
+        self,
+        config: Optional[OrderManagerConfig] = None,
+        routers: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.cfg     = config or OrderManagerConfig()
+        self.routers: Dict[str, Any] = routers or {}
+        self._orders: Dict[str, OrderRecord] = {}  # local_id → record
+        self._lock   = asyncio.Lock()
+        self._monitor_task: Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
-    # Context manager
+    # Lifecycle
     # ------------------------------------------------------------------
 
-    async def __aenter__(self) -> "OrderManager":
-        await self._init_exchange()
-        return self
+    def register_router(self, venue: str, router: Any) -> None:
+        """Register (or replace) a venue router at runtime."""
+        self.routers[venue] = router
+        logger.info(f"OrderManager: registered router for venue='{venue}'")
 
-    async def __aexit__(self, *_):
-        await self.close()
+    async def start_monitor(self) -> None:
+        """Start background task that cancels timed-out orders."""
+        if self._monitor_task is None or self._monitor_task.done():
+            self._monitor_task = asyncio.create_task(self._timeout_loop())
+            logger.info("OrderManager: monitor task started")
 
-    async def _init_exchange(self):
-        cls = getattr(ccxt_async, self.cfg.exchange_id)
-        self._exchange = cls({
-            "apiKey": self.cfg.api_key,
-            "secret": self.cfg.api_secret,
-            "enableRateLimit": True,
-            "options": {"defaultType": "future"},
-        })
-        if self.cfg.testnet:
-            self._exchange.set_sandbox_mode(True)
-        logger.info(
-            f"OrderManager init: {self.cfg.exchange_id} "
-            f"| testnet={self.cfg.testnet} | paper={self.cfg.paper_mode}"
-        )
-
-    async def close(self):
-        """Idempotent — safe to call multiple times."""
-        if self._exchange:
+    async def stop_monitor(self) -> None:
+        """Stop background monitor task."""
+        if self._monitor_task and not self._monitor_task.done():
+            self._monitor_task.cancel()
             try:
-                await self._exchange.close()
-            except Exception:
+                await self._monitor_task
+            except asyncio.CancelledError:
                 pass
-            finally:
-                self._exchange = None
+            logger.info("OrderManager: monitor task stopped")
 
     # ------------------------------------------------------------------
-    # Public API
+    # Order submission
     # ------------------------------------------------------------------
 
-    async def execute_pair(
-        self,
-        sym_y: str, side_y: str, qty_y: float, price_y: float,
-        sym_x: str, side_x: str, qty_x: float, price_x: float,
-    ) -> FillPair:
+    async def submit(self, req: OrderRequest) -> str:
         """
-        Submit both legs concurrently (market) or sequentially (limit).
-        Returns FillPair with full fill metadata.
+        Submit an order and return a local_id for tracking.
+
+        Parameters
+        ----------
+        req : OrderRequest
+
+        Returns
+        -------
+        local_id : str  (use this to query status)
         """
-        fill_y, fill_x = await asyncio.gather(
-            self._execute_leg_with_retry(sym_y, side_y, qty_y, price_y),
-            self._execute_leg_with_retry(sym_x, side_x, qty_x, price_x),
-        )
-        pair = FillPair(leg_y=fill_y, leg_x=fill_x)
-        logger.info(
-            f"FillPair | Y={sym_y} {side_y} {qty_y:.4f}@{fill_y.fill_price:.4f} "
-            f"| X={sym_x} {side_x} {qty_x:.4f}@{fill_x.fill_price:.4f} "
-            f"| lag={pair.execution_lag_ms}ms | fees={pair.total_fee_usdt:.4f} USDT"
-        )
-        return pair
+        local_id = req.client_id or str(uuid.uuid4())[:16]
+        record = OrderRecord(local_id=local_id, request=req)
 
-    # ------------------------------------------------------------------
-    # Internal: retry wrapper
-    # ------------------------------------------------------------------
+        async with self._lock:
+            self._orders[local_id] = record
 
-    async def _execute_leg_with_retry(
-        self,
-        symbol: str, side: str, qty: float, ref_price: float,
-    ) -> Fill:
-        last_exc: Exception = RuntimeError("No attempts made")
-        for attempt in range(self.cfg.max_retries):
-            try:
-                return await self._execute_leg(symbol, side, qty, ref_price)
-            except (
-                ccxt_async.NetworkError,
-                ccxt_async.ExchangeNotAvailable,
-                ccxt_async.RequestTimeout,
-            ) as exc:
-                last_exc = exc
-                if attempt == self.cfg.max_retries - 1:
-                    break
-                wait = 0.5 * (2 ** attempt)   # 0.5s, 1s, 2s
-                logger.warning(
-                    f"Retry {attempt + 1}/{self.cfg.max_retries} for {symbol} "
-                    f"after {wait:.1f}s: {exc}"
-                )
-                await asyncio.sleep(wait)
-        raise last_exc
+        if self.cfg.dry_run:
+            logger.info(f"[DRY-RUN] OrderManager: {req.side} {req.qty} {req.symbol} @ {req.venue}")
+            record.status      = OrderStatus.FILLED
+            record.fill_price  = req.price or 0.0
+            record.fill_qty    = req.qty
+            record.filled_at   = time.time()
+            return local_id
 
-    # ------------------------------------------------------------------
-    # Internal: single leg execution
-    # ------------------------------------------------------------------
+        router = self.routers.get(req.venue)
+        if router is None:
+            record.status = OrderStatus.FAILED
+            record.error  = f"No router registered for venue='{req.venue}'"
+            logger.error(record.error)
+            return local_id
 
-    async def _execute_leg(
-        self, symbol: str, side: str, qty: float, ref_price: float
-    ) -> Fill:
-        slippage_bps = self._estimate_slippage_bps(ref_price, side, qty * ref_price)
-
-        if self.cfg.paper_mode:
-            return self._paper_fill(symbol, side, qty, ref_price, slippage_bps)
-
-        ts_before = int(time.time() * 1000)
-
-        if self.cfg.order_type == "limit":
-            fill = await self._limit_leg(symbol, side, qty, ref_price, slippage_bps)
-        else:
-            fill = await self._market_leg(symbol, side, qty, ref_price, slippage_bps)
-
-        fill.timestamp_ms = ts_before
-        return fill
-
-    async def _market_leg(
-        self, symbol: str, side: str, qty: float, ref_price: float, slippage_bps: float
-    ) -> Fill:
-        order = await self._exchange.create_order(symbol, "market", side, qty)
-        fill_price = self._safe_fill_price(order, ref_price, symbol)
-        fee = fill_price * qty * self.cfg.fee_rate_taker
-        return Fill(
-            symbol=symbol, side=side, qty=qty,
-            ref_price=ref_price, fill_price=fill_price,
-            slippage_bps=slippage_bps, fee_usdt=fee,
-            order_id=str(order.get("id", "")),
-            order_type="market",
-        )
-
-    async def _limit_leg(
-        self, symbol: str, side: str, qty: float, ref_price: float, slippage_bps: float
-    ) -> Fill:
-        limit_price = self._limit_price(ref_price, side)
-        order = await self._exchange.create_order(
-            symbol, "limit", side, qty, limit_price,
-            params={"postOnly": True, "timeInForce": "GTX"},
-        )
-        order_id = str(order.get("id", ""))
-
-        deadline = time.monotonic() + self.cfg.limit_ttl_s
-        while time.monotonic() < deadline:
-            await asyncio.sleep(0.5)
-            fetched = await self._exchange.fetch_order(order_id, symbol)
-            status = fetched.get("status", "")
-            if status == "closed":
-                fill_price = self._safe_fill_price(fetched, ref_price, symbol)
-                fee = fill_price * qty * self.cfg.fee_rate_maker
-                return Fill(
-                    symbol=symbol, side=side, qty=qty,
-                    ref_price=ref_price, fill_price=fill_price,
-                    slippage_bps=slippage_bps, fee_usdt=fee,
-                    order_id=order_id, order_type="limit",
-                )
-            if status in ("canceled", "rejected", "expired"):
-                break
-
-        # TTL expired or rejected — cancel and fallback to market
-        logger.warning(
-            f"Limit order {order_id} for {symbol} expired/rejected — "
-            f"falling back to market order"
-        )
         try:
-            await self._exchange.cancel_order(order_id, symbol)
-        except Exception:
-            pass
-        return await self._market_leg(symbol, side, qty, ref_price, slippage_bps)
+            record.status = OrderStatus.SUBMITTED
+            if req.order_type == OrderType.LIMIT and req.price is not None:
+                resp = await router.place_limit_order(
+                    req.symbol, req.side, req.qty, req.price,
+                    reduce_only=req.reduce_only,
+                    post_only=req.post_only,
+                    client_order_id=local_id,
+                )
+            else:
+                resp = await router.place_market_order(
+                    req.symbol, req.side, req.qty,
+                    reduce_only=req.reduce_only,
+                    client_order_id=local_id,
+                )
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    def _estimate_slippage_bps(
-        self, ref_price: float, side: str, qty_usdt: float
-    ) -> float:
-        """Dynamic slippage: base + linear size impact, capped at max."""
-        base = self.cfg.slippage_bps
-        size_component = (qty_usdt / self.cfg.size_impact_scale) * base
-        return min(base + size_component, self.cfg.max_slippage_bps)
-
-    def _limit_price(self, ref_price: float, side: str) -> float:
-        offset = ref_price * self.cfg.limit_offset_bps / 10_000
-        return ref_price - offset if side == "buy" else ref_price + offset
-
-    def _safe_fill_price(
-        self, order: dict, ref_price: float, symbol: str
-    ) -> float:
-        price = order.get("average") or order.get("price")
-        if price is None:
-            logger.warning(
-                f"Fill price unavailable for {symbol} — falling back to ref_price={ref_price:.6f}. "
-                f"Slippage computation may be inaccurate."
+            record.exchange_id   = resp.get("id") or resp.get("orderId")
+            record.raw_response  = resp
+            # Assume market orders fill immediately
+            if req.order_type == OrderType.MARKET:
+                record.status    = OrderStatus.FILLED
+                record.fill_price = (
+                    resp.get("average") or resp.get("price") or req.price or 0.0
+                )
+                record.fill_qty  = float(resp.get("filled") or req.qty)
+                record.filled_at = time.time()
+            logger.info(
+                f"OrderManager: submitted {req.side} {req.qty} {req.symbol} "
+                f"venue={req.venue} local_id={local_id} exch_id={record.exchange_id}"
             )
-            return ref_price
-        return float(price)
+        except Exception as exc:
+            record.status = OrderStatus.FAILED
+            record.error  = str(exc)
+            logger.error(f"OrderManager: order failed local_id={local_id} err={exc}")
 
-    def _paper_fill(
-        self, symbol: str, side: str, qty: float,
-        ref_price: float, slippage_bps: float
-    ) -> Fill:
-        """Simulate fill with dynamic slippage applied to ref_price."""
-        multiplier = 1.0 + slippage_bps / 10_000 if side == "buy" else 1.0 - slippage_bps / 10_000
-        fill_price = ref_price * multiplier
-        fee = fill_price * qty * self.cfg.fee_rate_taker
-        return Fill(
-            symbol=symbol, side=side, qty=qty,
-            ref_price=ref_price, fill_price=fill_price,
-            slippage_bps=slippage_bps, fee_usdt=fee,
-            order_id="paper", order_type="paper",
-            timestamp_ms=int(time.time() * 1000),
+        return local_id
+
+    async def submit_pair(
+        self,
+        req_y: OrderRequest,
+        req_x: OrderRequest,
+    ) -> Dict[str, str]:
+        """Submit both legs of a pairs trade concurrently."""
+        id_y, id_x = await asyncio.gather(
+            self.submit(req_y),
+            self.submit(req_x),
         )
+        return {"leg_y": id_y, "leg_x": id_x}
+
+    async def cancel(self, local_id: str) -> bool:
+        """Cancel an open order by local_id. Returns True if cancel was sent."""
+        record = self._orders.get(local_id)
+        if record is None:
+            logger.warning(f"OrderManager: cancel — unknown local_id={local_id}")
+            return False
+        if record.status not in (OrderStatus.SUBMITTED, OrderStatus.PARTIALLY):
+            return False
+
+        router = self.routers.get(record.request.venue)
+        if router is None or record.exchange_id is None:
+            record.status = OrderStatus.CANCELLED
+            return True
+
+        try:
+            await router.cancel_order(record.exchange_id, record.request.symbol)
+            record.status = OrderStatus.CANCELLED
+            logger.info(f"OrderManager: cancelled local_id={local_id}")
+            return True
+        except Exception as exc:
+            logger.error(f"OrderManager: cancel failed local_id={local_id} err={exc}")
+            return False
+
+    # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
+
+    def get_status(self, local_id: str) -> Optional[OrderStatus]:
+        rec = self._orders.get(local_id)
+        return rec.status if rec else None
+
+    def get_record(self, local_id: str) -> Optional[OrderRecord]:
+        return self._orders.get(local_id)
+
+    def open_orders(self) -> List[OrderRecord]:
+        """Return all orders in SUBMITTED or PARTIALLY state."""
+        return [
+            r for r in self._orders.values()
+            if r.status in (OrderStatus.SUBMITTED, OrderStatus.PARTIALLY)
+        ]
+
+    def all_records(self) -> List[OrderRecord]:
+        return list(self._orders.values())
+
+    def summary(self) -> Dict:
+        counts: Dict[str, int] = {}
+        for r in self._orders.values():
+            counts[r.status.value] = counts.get(r.status.value, 0) + 1
+        return {"total": len(self._orders), "by_status": counts}
+
+    # ------------------------------------------------------------------
+    # Background timeout monitor
+    # ------------------------------------------------------------------
+
+    async def _timeout_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self.cfg.monitor_interval_s)
+            await self._check_timeouts()
+
+    async def _check_timeouts(self) -> None:
+        async with self._lock:
+            stale = [
+                r for r in self._orders.values()
+                if r.status in (OrderStatus.SUBMITTED, OrderStatus.PARTIALLY)
+            ]
+        for record in stale:
+            otype   = record.request.order_type
+            timeout = (
+                self.cfg.market_timeout_s
+                if otype == OrderType.MARKET
+                else self.cfg.limit_timeout_s
+            )
+            if record.age_seconds > timeout:
+                logger.warning(
+                    f"OrderManager: timeout local_id={record.local_id} "
+                    f"age={record.age_seconds:.1f}s > {timeout}s — cancelling"
+                )
+                cancelled = await self.cancel(record.local_id)
+                if not cancelled:
+                    record.status = OrderStatus.TIMED_OUT
+
+    def _prune_history(self) -> None:
+        """Keep only the most recent max_history terminal records."""
+        terminal = [
+            (lid, r) for lid, r in self._orders.items()
+            if r.status in (
+                OrderStatus.FILLED, OrderStatus.CANCELLED,
+                OrderStatus.FAILED, OrderStatus.TIMED_OUT
+            )
+        ]
+        if len(terminal) > self.cfg.max_history:
+            terminal.sort(key=lambda x: x[1].submitted_at)
+            for lid, _ in terminal[:len(terminal) - self.cfg.max_history]:
+                del self._orders[lid]
