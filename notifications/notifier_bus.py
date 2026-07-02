@@ -1,251 +1,158 @@
 """
-QuantLuna — NotifierBus
-Sprint 26
+QuantLuna — Notifier Bus (Sprint 18)
 
-Fan-out notifier: trimite simultan pe Telegram + Discord.
-Single call din LiveTrader / Optimizer — zero duplicare de cod.
+Fan-out notification bus: sends every message to ALL registered notifiers.
+Notifiers are registered by name and can be enabled/disabled at runtime.
+
+Supported notifiers (all optional — only those configured are used):
+  - Telegram  (notifications/telegram.py)
+  - Slack     (notifications/slack_notifier.py)
+
+Design:
+  - fire_and_forget: errors in one notifier don't block others
+  - Async-first: all send methods are coroutines
+  - Runtime enable/disable per notifier name
 
 Usage:
-    from notifications.notifier_bus import NotifierBus, build_bus_from_env
+    bus = NotifierBus()
+    bus.register("slack",    SlackNotifier(SlackConfig(webhook_url=...)))
+    bus.register("telegram", TelegramNotifier(TelegramConfig(...)))
 
-    # Construire automata din env vars:
-    bus = build_bus_from_env()
-
-    # In LiveTrader (async context):
-    await bus.trade_entry(pair="BTC/ETH", side_y="buy", zscore=-2.3,
-                          notional_usd=100.0, hedge_ratio=0.05,
-                          active_strategy="BollingerBands", regime="ranging")
-    await bus.stop_loss(pair="BTC/ETH", loss_usd=-3.5, loss_pct=-0.035,
-                        trigger_price=29800.0, regime="breakout")
-    await bus.regime_change(pair="BTC/ETH", old_regime="ranging",
-                            new_regime="trending", active_strategy="ZScoreMomentum")
-    await bus.optimizer_result(n_folds=5, avg_sharpe=1.23,
-                               best_params={...}, regime_params={...})
-
-Env vars required:
-  Telegram: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-  Discord:  DISCORD_WEBHOOK_URL
+    await bus.send_entry_signal("BTCUSDT", "LONG", 2.4)
+    await bus.send_alert("CircuitBreaker tripped", level="critical")
 """
 from __future__ import annotations
 
 import asyncio
-import logging
-import os
 from typing import Any, Dict, Optional
 
-from notifications.discord_notifier import DiscordConfig, DiscordNotifier
-from notifications.telegram_notifier import NotifierConfig, TelegramNotifier
-
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 
 class NotifierBus:
     """
-    Fan-out to Telegram + Discord simultaneously.
-    Each channel is optional — unconfigured channels are silently skipped.
-    All methods are async and non-blocking (errors are caught internally).
+    Fan-out bus: dispatches notification calls to all registered notifiers.
+
+    Parameters
+    ----------
+    fail_silent : If True (default), errors in individual notifiers are logged
+                  but never raised. Set False to let errors propagate (tests).
     """
 
-    def __init__(
-        self,
-        telegram: Optional[TelegramNotifier] = None,
-        discord:  Optional[DiscordNotifier]  = None,
-    ) -> None:
-        self._telegram = telegram
-        self._discord  = discord
-
-    async def _fan_out(self, *coros) -> None:
-        """Run all coroutines concurrently, suppress individual errors."""
-        results = await asyncio.gather(*coros, return_exceptions=True)
-        for r in results:
-            if isinstance(r, Exception):
-                logger.warning(f"NotifierBus delivery error: {r}")
+    def __init__(self, fail_silent: bool = True) -> None:
+        self._notifiers: Dict[str, Any] = {}
+        self._enabled:   Dict[str, bool] = {}
+        self.fail_silent = fail_silent
 
     # ------------------------------------------------------------------
-    # Trade events
+    # Registration
     # ------------------------------------------------------------------
 
-    async def trade_entry(
+    def register(self, name: str, notifier: Any) -> None:
+        """Register a notifier under a given name."""
+        self._notifiers[name] = notifier
+        self._enabled[name]   = True
+        logger.info(f"NotifierBus: registered notifier '{name}'")
+
+    def enable(self, name: str) -> None:
+        """Enable a registered notifier."""
+        if name in self._enabled:
+            self._enabled[name] = True
+
+    def disable(self, name: str) -> None:
+        """Disable a registered notifier without removing it."""
+        if name in self._enabled:
+            self._enabled[name] = False
+            logger.info(f"NotifierBus: disabled notifier '{name}'")
+
+    @property
+    def active_notifiers(self) -> list:
+        return [n for n, en in self._enabled.items() if en]
+
+    # ------------------------------------------------------------------
+    # Fan-out helpers
+    # ------------------------------------------------------------------
+
+    async def _fan_out(self, method: str, *args, **kwargs) -> None:
+        """Call method(*args, **kwargs) on all active notifiers concurrently."""
+        tasks = []
+        for name, notifier in self._notifiers.items():
+            if not self._enabled.get(name, False):
+                continue
+            fn = getattr(notifier, method, None)
+            if fn is None:
+                continue
+            tasks.append(self._safe_call(name, fn, *args, **kwargs))
+        if tasks:
+            await asyncio.gather(*tasks)
+
+    async def _safe_call(self, name: str, fn, *args, **kwargs) -> None:
+        try:
+            await fn(*args, **kwargs)
+        except Exception as exc:
+            msg = f"NotifierBus: '{name}'.{fn.__name__} failed: {exc}"
+            if self.fail_silent:
+                logger.warning(msg)
+            else:
+                raise
+
+    # ------------------------------------------------------------------
+    # Notification API (mirrors individual notifier interface)
+    # ------------------------------------------------------------------
+
+    async def send_entry_signal(
         self,
-        pair:             str,
-        side_y:           str,
-        zscore:           float,
-        notional_usd:     float,
-        hedge_ratio:      float,
-        method:           str = "kelly",
-        active_strategy:  str = "",
-        regime:           str = "",
+        symbol: str,
+        side: str,
+        zscore: float,
+        confidence: float = 0.0,
+        venue: str = "",
     ) -> None:
-        coros = []
-        if self._telegram:
-            coros.append(self._telegram.send_trade_entry(
-                pair=pair, side_y=side_y, zscore=zscore,
-                notional_usd=notional_usd, hedge_ratio=hedge_ratio, method=method,
-            ))
-        if self._discord:
-            coros.append(self._discord.send_trade_entry(
-                pair=pair, side_y=side_y, zscore=zscore,
-                notional_usd=notional_usd, hedge_ratio=hedge_ratio, method=method,
-                active_strategy=active_strategy, regime=regime,
-            ))
-        if coros:
-            await self._fan_out(*coros)
+        await self._fan_out(
+            "send_entry_signal",
+            symbol=symbol, side=side, zscore=zscore,
+            confidence=confidence, venue=venue,
+        )
 
-    async def trade_exit(
+    async def send_exit_signal(
         self,
-        pair:        str,
-        pnl_usd:     float,
-        pnl_pct:     float,
-        trade_count: int,
-        reason:      str   = "signal",
-        fees_usd:    float = 0.0,
+        symbol: str,
+        reason: str,
+        pnl: Optional[float] = None,
     ) -> None:
-        coros = []
-        if self._telegram:
-            coros.append(self._telegram.send_trade_exit(
-                pair=pair, pnl_usd=pnl_usd, pnl_pct=pnl_pct,
-                trade_count=trade_count, reason=reason, fees_usd=fees_usd,
-            ))
-        if self._discord:
-            coros.append(self._discord.send_trade_exit(
-                pair=pair, pnl_usd=pnl_usd, pnl_pct=pnl_pct,
-                trade_count=trade_count, reason=reason, fees_usd=fees_usd,
-            ))
-        if coros:
-            await self._fan_out(*coros)
+        await self._fan_out("send_exit_signal", symbol=symbol, reason=reason, pnl=pnl)
 
-    async def stop_loss(
+    async def send_alert(
         self,
-        pair:          str,
-        loss_usd:      float,
-        loss_pct:      float,
-        trigger_price: float = 0.0,
-        regime:        str   = "",
+        title: str,
+        detail: str = "",
+        level: str = "warning",
     ) -> None:
-        coros = []
-        if self._telegram:
-            coros.append(self._telegram.send_halt(
-                reason="STOP_LOSS",
-                details=f"Loss: {loss_usd:.2f} USDT ({loss_pct:.2%})",
-                pair=pair,
-            ))
-        if self._discord:
-            coros.append(self._discord.send_stop_loss(
-                pair=pair, loss_usd=loss_usd, loss_pct=loss_pct,
-                trigger_price=trigger_price, regime=regime,
-            ))
-        if coros:
-            await self._fan_out(*coros)
+        await self._fan_out("send_alert", title=title, detail=detail, level=level)
 
-    async def halt(
+    async def send_circuit_breaker_trip(
         self,
-        reason:  str,
-        details: str = "",
-        pair:    str = "",
+        reason: str,
+        detail: str,
+        cooldown_s: float = 0.0,
     ) -> None:
-        coros = []
-        if self._telegram:
-            coros.append(self._telegram.send_halt(reason=reason, details=details, pair=pair))
-        if self._discord:
-            coros.append(self._discord.send_halt(reason=reason, details=details, pair=pair))
-        if coros:
-            await self._fan_out(*coros)
+        await self._fan_out(
+            "send_circuit_breaker_trip",
+            reason=reason, detail=detail, cooldown_s=cooldown_s,
+        )
 
-    async def regime_change(
+    async def send_daily_summary(
         self,
-        pair:            str,
-        old_regime:      str,
-        new_regime:      str,
-        active_strategy: str = "",
-        bars_in_regime:  int = 0,
+        trades: int,
+        total_pnl: float,
+        win_rate: float,
+        sharpe: Optional[float] = None,
     ) -> None:
-        coros = []
-        if self._discord:
-            coros.append(self._discord.send_regime_change(
-                pair=pair, old_regime=old_regime, new_regime=new_regime,
-                active_strategy=active_strategy, bars_in_regime=bars_in_regime,
-            ))
-        # Telegram regime change — use custom message (lightweight)
-        if self._telegram:
-            coros.append(self._telegram.send_custom(
-                f"*Regime Change — {pair}*\n"
-                f"`{old_regime}` → `{new_regime}`\n"
-                + (f"Strategie: `{active_strategy}`" if active_strategy else "")
-            ))
-        if coros:
-            await self._fan_out(*coros)
+        await self._fan_out(
+            "send_daily_summary",
+            trades=trades, total_pnl=total_pnl,
+            win_rate=win_rate, sharpe=sharpe,
+        )
 
-    async def daily_summary(
-        self,
-        realized_pnl: float,
-        trade_count:  int,
-        win_rate:     float,
-        max_dd:       float,
-        open_pairs:   int   = 0,
-        capital_usd:  float = 0.0,
-    ) -> None:
-        coros = []
-        if self._telegram:
-            coros.append(self._telegram.send_daily_summary(
-                realized_pnl=realized_pnl, trade_count=trade_count,
-                win_rate=win_rate, max_dd=max_dd,
-                open_pairs=open_pairs, capital_usd=capital_usd,
-            ))
-        if self._discord:
-            coros.append(self._discord.send_daily_summary(
-                realized_pnl=realized_pnl, trade_count=trade_count,
-                win_rate=win_rate, max_dd=max_dd,
-                open_pairs=open_pairs, capital_usd=capital_usd,
-            ))
-        if coros:
-            await self._fan_out(*coros)
-
-    async def optimizer_result(
-        self,
-        n_folds:       int,
-        avg_sharpe:    float,
-        best_params:   Dict[str, Any],
-        regime_params: Dict[str, Dict[str, Any]],
-    ) -> None:
-        coros = []
-        if self._discord:
-            coros.append(self._discord.send_optimizer_result(
-                n_folds=n_folds, avg_sharpe=avg_sharpe,
-                best_params=best_params, regime_params=regime_params,
-            ))
-        if self._telegram:
-            param_str = ", ".join(f"{k}={v}" for k, v in best_params.items())
-            coros.append(self._telegram.send_custom(
-                f"*WalkForward Done*\nFolds: `{n_folds}` | Sharpe: `{avg_sharpe:.3f}`\nBest: `{param_str}`"
-            ))
-        if coros:
-            await self._fan_out(*coros)
-
-
-def build_bus_from_env() -> NotifierBus:
-    """
-    Build NotifierBus from environment variables.
-    Returns a bus with whichever channels are configured.
-    Unconfigured channels are None (silently skipped).
-    """
-    telegram = None
-    discord  = None
-
-    tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    tg_chat  = os.getenv("TELEGRAM_CHAT_ID",   "")
-    if tg_token and tg_chat:
-        telegram = TelegramNotifier(NotifierConfig(
-            bot_token=tg_token, chat_id=tg_chat,
-        ))
-        logger.info("NotifierBus: Telegram configurata")
-    else:
-        logger.info("NotifierBus: Telegram neconfigurat (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID lipsa)")
-
-    dsc_url = os.getenv("DISCORD_WEBHOOK_URL", "")
-    if dsc_url:
-        discord = DiscordNotifier(DiscordConfig(webhook_url=dsc_url))
-        logger.info("NotifierBus: Discord configurat")
-    else:
-        logger.info("NotifierBus: Discord neconfigurat (DISCORD_WEBHOOK_URL lipsa)")
-
-    return NotifierBus(telegram=telegram, discord=discord)
+    async def send_raw(self, text: str, level: str = "info") -> None:
+        await self._fan_out("send_raw", text=text, level=level)

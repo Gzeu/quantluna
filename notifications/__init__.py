@@ -1,5 +1,20 @@
-"""QuantLuna — Notifications module."""
-from notifications.alert_dispatcher import AlertDispatcher
-from notifications.event_types import AlertEvent, EventType, Severity
+"""
+notifications package — public exports
+"""
+from notifications.slack_notifier import SlackNotifier, SlackConfig
 
-__all__ = ["AlertDispatcher", "AlertEvent", "EventType", "Severity"]
+try:
+    from notifications.telegram import TelegramNotifier  # type: ignore[attr-defined]
+except Exception:
+    TelegramNotifier = None  # type: ignore[assignment]
+
+try:
+    from notifications.notifier_bus import NotifierBus  # type: ignore[attr-defined]
+except Exception:
+    NotifierBus = None  # type: ignore[assignment]
+
+__all__ = [
+    "SlackNotifier", "SlackConfig",
+    "TelegramNotifier",
+    "NotifierBus",
+]

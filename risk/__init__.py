@@ -1,40 +1,20 @@
 """
-QuantLuna — risk package
-
-Sprint 4 (original):
-  PortfolioRisk, PairExposure
-  PositionSizer
-
-Sprint 10 (nou):
-  SpreadCorrelationMatrix, CorrelationMatrixConfig
-  KellyCrossPair, KellyConfig, KellyResult
-  DrawdownController, DDConfig, DDLevel, DDSnapshot
-  PortfolioAllocator, AllocatorConfig, AllocationDecision
+risk package — public exports
 """
+from risk.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, TripReason, TripEvent
 
-from .portfolio_risk import PortfolioRisk, PairExposure
-from .position_sizer import PositionSizer
-from .correlation_matrix import SpreadCorrelationMatrix, CorrelationMatrixConfig
-from .kelly import KellyCrossPair, KellyConfig, KellyResult
-from .drawdown_controller import DrawdownController, DDConfig, DDLevel, DDSnapshot
-from .multi_pair_allocator import PortfolioAllocator, AllocatorConfig, AllocationDecision
+try:
+    from risk.kelly import KellySizer  # type: ignore[attr-defined]
+except Exception:
+    KellySizer = None  # type: ignore[assignment]
+
+try:
+    from risk.portfolio_risk import PortfolioRisk  # type: ignore[attr-defined]
+except Exception:
+    PortfolioRisk = None  # type: ignore[assignment]
 
 __all__ = [
-    # Sprint 4
+    "CircuitBreaker", "CircuitBreakerConfig", "TripReason", "TripEvent",
+    "KellySizer",
     "PortfolioRisk",
-    "PairExposure",
-    "PositionSizer",
-    # Sprint 10
-    "SpreadCorrelationMatrix",
-    "CorrelationMatrixConfig",
-    "KellyCrossPair",
-    "KellyConfig",
-    "KellyResult",
-    "DrawdownController",
-    "DDConfig",
-    "DDLevel",
-    "DDSnapshot",
-    "PortfolioAllocator",
-    "AllocatorConfig",
-    "AllocationDecision",
 ]
