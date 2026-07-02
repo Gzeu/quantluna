@@ -1,31 +1,50 @@
-import type { Config } from 'tailwindcss';
+import type { Config } from 'tailwindcss'
 
 const config: Config = {
   content: [
-    './app/**/*.{ts,tsx}',
-    './components/**/*.{ts,tsx}',
+    './pages/**/*.{js,ts,jsx,tsx,mdx}',
+    './components/**/*.{js,ts,jsx,tsx,mdx}',
+    './app/**/*.{js,ts,jsx,tsx,mdx}',
+    './hooks/**/*.{js,ts,jsx,tsx}',
+    './lib/**/*.{js,ts,jsx,tsx}',
   ],
   theme: {
     extend: {
       colors: {
-        brand: {
-          DEFAULT: '#6366f1',  // indigo-500
-          dark:    '#4f46e5',
-          light:   '#a5b4fc',
+        bg: {
+          primary: '#08080F',
+          panel:   '#0D0D1A',
+          border:  '#1A1A3E',
         },
-        success:  '#22c55e',
-        warning:  '#f59e0b',
-        danger:   '#ef4444',
-        surface:  '#0f172a',
-        card:     '#1e293b',
-        border:   '#334155',
+        neon: {
+          green:   '#00FF88',
+          magenta: '#FF00AA',
+          blue:    '#0088FF',
+        },
+        alert: {
+          warn:   '#FFAA00',
+          danger: '#FF2244',
+        },
+        text: {
+          primary: '#E0E0F0',
+          muted:   '#666688',
+        },
       },
       fontFamily: {
-        mono: ['JetBrains Mono', 'Fira Mono', 'monospace'],
+        mono: ['JetBrains Mono', 'Fira Code', 'monospace'],
+      },
+      keyframes: {
+        pulse: {
+          '0%, 100%': { opacity: '1' },
+          '50%':       { opacity: '0.4' },
+        },
+      },
+      animation: {
+        pulse: 'pulse 2s ease-in-out infinite',
       },
     },
   },
   plugins: [],
-};
+}
 
-export default config;
+export default config

@@ -2,24 +2,78 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ── CSS Variables ─────────────────────────────────────────── */
 :root {
-  color-scheme: dark;
+  --bg-primary:  #08080F;
+  --bg-panel:    #0D0D1A;
+  --bg-border:   #1A1A3E;
+  --neon-green:  #00FF88;
+  --neon-mag:    #FF00AA;
+  --neon-blue:   #0088FF;
+  --warn:        #FFAA00;
+  --danger:      #FF2244;
+  --text-pri:    #E0E0F0;
+  --text-muted:  #666688;
 }
 
+/* ── Body + scanline overlay ───────────────────────────────── */
 body {
-  background-color: #0f172a;
-  color: #f1f5f9;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  background-color: var(--bg-primary);
+  color: var(--text-pri);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  position: relative;
+  overflow: hidden;
 }
 
-/* Scrollbar dark */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(255, 255, 255, 0.02) 2px,
+    rgba(255, 255, 255, 0.02) 3px
+  );
+  z-index: 9999;
+}
+
+/* ── Glow utility ──────────────────────────────────────────── */
+.glow-green {
+  box-shadow: 0 0 12px #00FF8866;
+}
+
+.glow-magenta {
+  box-shadow: 0 0 12px #FF00AA66;
+}
+
+.glow-blue {
+  box-shadow: 0 0 12px #0088FF66;
+}
+
+/* ── Pulse keyframe ────────────────────────────────────────── */
+@keyframes quantPulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+
+.pulse-open {
+  animation: quantPulse 2s ease-in-out infinite;
+}
+
+/* ── Scrollbar ─────────────────────────────────────────────── */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 4px;
+  height: 4px;
 }
-::-webkit-scrollbar-track  { background: #1e293b; }
-::-webkit-scrollbar-thumb  { background: #334155; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #475569; }
+::-webkit-scrollbar-track  { background: var(--bg-primary); }
+::-webkit-scrollbar-thumb  { background: var(--bg-border); border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: #2a2a5e; }
 
-/* Recharts override */
-.recharts-default-tooltip { border-radius: 8px !important; }
+/* ── Selection ─────────────────────────────────────────────── */
+::selection {
+  background: #00FF8830;
+  color: var(--text-pri);
+}
