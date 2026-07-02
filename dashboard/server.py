@@ -1,5 +1,5 @@
 """
-dashboard/server.py  —  QuantLuna FastAPI Dashboard Server v1.4.1
+dashboard/server.py  —  QuantLuna FastAPI Dashboard Server v1.4.2
 """
 from __future__ import annotations
 
@@ -22,10 +22,28 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-_SYMBOLS = [
-    "BTC", "ETH", "SOL", "BNB", "AVAX", "POL", "DOT", "ADA",
-    "LINK", "UNI", "ATOM", "NEAR", "ALGO", "XRP",
-    "LTC", "DOGE", "SHIB", "ARB", "OP", "TON",
+# spot=True => no linear perpetual on Bybit, use spot ticker
+_SYMBOLS: List[Dict[str, Any]] = [
+    {"sym": "BTC",  "spot": False},
+    {"sym": "ETH",  "spot": False},
+    {"sym": "SOL",  "spot": False},
+    {"sym": "BNB",  "spot": False},
+    {"sym": "AVAX", "spot": False},
+    {"sym": "POL",  "spot": False},
+    {"sym": "DOT",  "spot": False},
+    {"sym": "ADA",  "spot": False},
+    {"sym": "LINK", "spot": False},
+    {"sym": "UNI",  "spot": False},
+    {"sym": "ATOM", "spot": False},
+    {"sym": "NEAR", "spot": False},
+    {"sym": "ALGO", "spot": False},
+    {"sym": "XRP",  "spot": False},
+    {"sym": "LTC",  "spot": False},
+    {"sym": "DOGE", "spot": False},
+    {"sym": "SHIB", "spot": True},
+    {"sym": "ARB",  "spot": False},
+    {"sym": "OP",   "spot": False},
+    {"sym": "TON",  "spot": False},
 ]
 
 _live_markets: List[Dict[str, Any]] = []
@@ -45,7 +63,6 @@ async def _init_exchange():
         if api_key and api_secret:
             params["apiKey"] = api_key
             params["secret"] = api_secret
-        # NO load_markets() here — it calls private endpoints and can fail with 10003
         _exchange_instance = cls(params)
         logger.info(f"Exchange initialised: {exchange_name} (keys={'yes' if api_key else 'no'})")
     except Exception as exc:
@@ -58,23 +75,33 @@ async def _fetch_markets():
     if _exchange_instance is None:
         return
     try:
-        # Fetch specific symbols directly — public endpoint, no auth needed
-        pairs = [f"{s}/USDT:USDT" for s in _SYMBOLS]
-        tickers = await _exchange_instance.fetch_tickers(pairs)
+        perp_pairs = [f"{s['sym']}/USDT:USDT" for s in _SYMBOLS if not s["spot"]]
+        spot_pairs = [f"{s['sym']}/USDT"       for s in _SYMBOLS if s["spot"]]
+
+        tickers: Dict[str, Any] = {}
+        if perp_pairs:
+            t = await _exchange_instance.fetch_tickers(perp_pairs)
+            tickers.update(t)
+        if spot_pairs:
+            t = await _exchange_instance.fetch_tickers(spot_pairs)
+            tickers.update(t)
+
         markets = []
-        for sym in _SYMBOLS:
+        for item in _SYMBOLS:
+            sym = item["sym"]
             t = tickers.get(f"{sym}/USDT:USDT") or tickers.get(f"{sym}/USDT")
             if not t:
                 continue
-            last    = float(t.get("last") or 0)
-            change  = float(t.get("percentage") or 0)
+            last    = float(t.get("last")        or 0)
+            change  = float(t.get("percentage")  or 0)
             vol     = float(t.get("quoteVolume") or t.get("baseVolume") or 0)
             funding = 0.0
-            try:
-                fi = await _exchange_instance.fetch_funding_rate(f"{sym}/USDT:USDT")
-                funding = float(fi.get("fundingRate") or 0)
-            except Exception:
-                pass
+            if not item["spot"]:
+                try:
+                    fi = await _exchange_instance.fetch_funding_rate(f"{sym}/USDT:USDT")
+                    funding = float(fi.get("fundingRate") or 0)
+                except Exception:
+                    pass
             markets.append({
                 "symbol":      sym,
                 "price":       round(last, 8),
@@ -146,19 +173,8 @@ async def lifespan(app: FastAPI):
     logger.info("QuantLuna Dashboard shutting down")
 
 
-app = FastAPI(
-    title="QuantLuna Dashboard",
-    description="Adaptive Kalman Filter Pairs Trading",
-    version="1.4.1",
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="QuantLuna Dashboard", version="1.4.2", lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 _static_dir = os.path.join(os.path.dirname(__file__))
 try:
@@ -202,125 +218,66 @@ async def root() -> HTMLResponse:
     except FileNotFoundError:
         return HTMLResponse(content="<h1>QuantLuna Dashboard</h1>")
 
-
-@app.get("/api/status")
-async def api_status() -> Dict[str, Any]:
-    return bus.snapshot_dict()
-
+@app.get("/api/status")  
+async def api_status() -> Dict[str, Any]: return bus.snapshot_dict()
 
 @app.get("/api/positions")
 async def api_positions() -> Dict[str, Any]:
     positions = bus.get_positions()
-    return {
-        "count": len(positions),
-        "positions": [
-            {
-                "pair": p.pair, "direction": p.direction,
-                "qty_y": p.qty_y, "qty_x": p.qty_x,
-                "notional_usdt": p.notional_usdt,
-                "hedge_ratio": p.hedge_ratio, "entry_ts": p.entry_ts,
-            }
-            for p in positions
-        ],
-    }
-
+    return {"count": len(positions), "positions": [{"pair": p.pair, "direction": p.direction, "qty_y": p.qty_y, "qty_x": p.qty_x, "notional_usdt": p.notional_usdt, "hedge_ratio": p.hedge_ratio, "entry_ts": p.entry_ts} for p in positions]}
 
 @app.get("/api/performance")
 async def api_performance() -> Dict[str, Any]:
-    return {
-        "equity_curve":  bus.get_equity_curve(),
-        "recent_trades": bus.get_recent_trades()[-50:],
-    }
-
+    return {"equity_curve": bus.get_equity_curve(), "recent_trades": bus.get_recent_trades()[-50:]}
 
 @app.get("/api/health")
 async def api_health() -> Dict[str, Any]:
     state = bus.snapshot_dict()
     status = state.get("status", "UNKNOWN")
     return {
-        "status":             "ok" if status in ("RUNNING", "IDLE") else "error",
-        "trading_status":     status,
-        "pnl_usdt":           state.get("pnl_usdt", 0.0),
-        "drawdown":           state.get("drawdown", 0.0),
-        "n_trades":           state.get("n_trades", 0),
-        "last_update":        state.get("last_update"),
-        "exchange_connected": _exchange_instance is not None,
-        "markets_cached":     len(_live_markets),
-        "balance_live":       bool(_live_balance),
+        "status": "ok" if status in ("RUNNING", "IDLE") else "error",
+        "trading_status": status, "pnl_usdt": state.get("pnl_usdt", 0.0),
+        "drawdown": state.get("drawdown", 0.0), "n_trades": state.get("n_trades", 0),
+        "last_update": state.get("last_update"), "exchange_connected": _exchange_instance is not None,
+        "markets_cached": len(_live_markets), "balance_live": bool(_live_balance),
     }
 
-
 @app.get("/api/balance")
-async def api_balance() -> Dict[str, Any]:
-    return _balance_response()
-
+async def api_balance() -> Dict[str, Any]: return _balance_response()
 
 @app.get("/api/pairs")
 async def api_pairs() -> List[Dict[str, Any]]:
     try:
         positions = bus.get_positions()
         if positions:
-            return [
-                {
-                    "symbol":       p.pair,
-                    "zscore":       getattr(p, "zscore",    0.0),
-                    "spread":       getattr(p, "spread",    0.0),
-                    "halfLife":     getattr(p, "half_life", 0.0),
-                    "position":     getattr(p, "direction", "FLAT"),
-                    "pnl":          getattr(p, "pnl",       0.0),
-                    "spreadHealth": "HEALTHY",
-                }
-                for p in positions
-            ]
+            return [{"symbol": p.pair, "zscore": getattr(p, "zscore", 0.0), "spread": getattr(p, "spread", 0.0), "halfLife": getattr(p, "half_life", 0.0), "position": getattr(p, "direction", "FLAT"), "pnl": getattr(p, "pnl", 0.0), "spreadHealth": "HEALTHY"} for p in positions]
     except Exception:
         pass
     return []
 
-
 @app.get("/api/markets")
-async def api_markets() -> List[Dict[str, Any]]:
-    return _live_markets
-
+async def api_markets() -> List[Dict[str, Any]]: return _live_markets
 
 @app.get("/api/risk")
 async def api_risk() -> Dict[str, Any]:
     state = bus.snapshot_dict()
-    return {
-        "regime":      state.get("volatility_regime", "NORMAL"),
-        "cb_open":     state.get("status") in ("HALT", "HARD_STOP"),
-        "cb_cooldown": state.get("cb_cooldown", 0),
-    }
-
+    return {"regime": state.get("volatility_regime", "NORMAL"), "cb_open": state.get("status") in ("HALT", "HARD_STOP"), "cb_cooldown": state.get("cb_cooldown", 0)}
 
 @app.get("/api/log")
 async def api_log() -> List[Dict[str, Any]]:
     try:
         trades = bus.get_recent_trades()
         if trades:
-            return [
-                {
-                    "ts":      int(time.time() * 1000) - i * 1000,
-                    "level":   "BUY" if "BUY" in str(t).upper() else "SELL" if "SELL" in str(t).upper() else "INFO",
-                    "module":  "Executor",
-                    "message": str(t),
-                }
-                for i, t in enumerate(trades[-20:])
-            ]
+            return [{"ts": int(time.time() * 1000) - i * 1000, "level": "BUY" if "BUY" in str(t).upper() else "SELL" if "SELL" in str(t).upper() else "INFO", "module": "Executor", "message": str(t)} for i, t in enumerate(trades[-20:])]
     except Exception:
         pass
     return []
 
-
 @app.get("/api/optimize/results")
-async def api_optimize_results(
-    storage: Optional[str] = Query(default=None),
-    study_name: str = Query(default="quantluna_opt"),
-    top_n: int = Query(default=50, ge=1, le=500),
-) -> Dict[str, Any]:
+async def api_optimize_results(storage: Optional[str] = Query(default=None), study_name: str = Query(default="quantluna_opt"), top_n: int = Query(default=50, ge=1, le=500)) -> Dict[str, Any]:
     if not storage:
         for default in ["sqlite:///optuna.db", "sqlite:///data/optuna.db"]:
-            db_path = default.replace("sqlite:///", "")
-            if os.path.exists(db_path):
+            if os.path.exists(default.replace("sqlite:///", "")):
                 storage = default
                 break
     if not storage:
@@ -329,46 +286,26 @@ async def api_optimize_results(
         import optuna
         optuna.logging.set_verbosity(optuna.logging.WARNING)
         study = optuna.load_study(study_name=study_name, storage=storage)
-        completed = sorted(
-            [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE],
-            key=lambda t: t.value or 0, reverse=True,
-        )
-        return {
-            "study_name":  study_name,
-            "n_trials":    len(study.trials),
-            "best_value":  round(study.best_value, 4) if completed else None,
-            "best_params": study.best_params if completed else {},
-            "trials":      [{"number": t.number, "value": t.value, "params": t.params} for t in completed[:top_n]],
-        }
+        completed = sorted([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE], key=lambda t: t.value or 0, reverse=True)
+        return {"study_name": study_name, "n_trials": len(study.trials), "best_value": round(study.best_value, 4) if completed else None, "best_params": study.best_params if completed else {}, "trials": [{"number": t.number, "value": t.value, "params": t.params} for t in completed[:top_n]]}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 class _WSManager:
-    def __init__(self):
-        self.active: List[WebSocket] = []
-
+    def __init__(self): self.active: List[WebSocket] = []
     async def connect(self, ws: WebSocket):
-        await ws.accept()
-        self.active.append(ws)
-
+        await ws.accept(); self.active.append(ws)
     def disconnect(self, ws: WebSocket):
-        if ws in self.active:
-            self.active.remove(ws)
-
+        if ws in self.active: self.active.remove(ws)
     async def broadcast(self, data: Dict):
         dead = []
         for ws in self.active:
-            try:
-                await ws.send_json(data)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.active.remove(ws)
-
+            try: await ws.send_json(data)
+            except Exception: dead.append(ws)
+        for ws in dead: self.active.remove(ws)
 
 _ws_manager = _WSManager()
-
 
 @app.websocket("/ws/live")
 async def websocket_live(websocket: WebSocket):
@@ -377,11 +314,8 @@ async def websocket_live(websocket: WebSocket):
         while True:
             await asyncio.sleep(1.0)
             await websocket.send_json(bus.snapshot_dict())
-    except WebSocketDisconnect:
+    except (WebSocketDisconnect, Exception):
         _ws_manager.disconnect(websocket)
-    except Exception:
-        _ws_manager.disconnect(websocket)
-
 
 @app.websocket("/ws/feed")
 async def websocket_feed(websocket: WebSocket):
@@ -389,48 +323,20 @@ async def websocket_feed(websocket: WebSocket):
     try:
         while True:
             await asyncio.sleep(2.0)
-            now   = int(time.time() * 1000)
+            now = int(time.time() * 1000)
             state = bus.snapshot_dict()
-            bal   = _balance_response()
+            bal = _balance_response()
             pairs: List[Dict] = []
             try:
-                positions = bus.get_positions()
-                pairs = [
-                    {
-                        "symbol":       p.pair,
-                        "zscore":       getattr(p, "zscore",    0.0),
-                        "spread":       getattr(p, "spread",    0.0),
-                        "halfLife":     getattr(p, "half_life", 0.0),
-                        "position":     getattr(p, "direction", "FLAT"),
-                        "pnl":          getattr(p, "pnl",       0.0),
-                        "spreadHealth": "HEALTHY",
-                    }
-                    for p in positions
-                ]
+                pairs = [{"symbol": p.pair, "zscore": getattr(p, "zscore", 0.0), "spread": getattr(p, "spread", 0.0), "halfLife": getattr(p, "half_life", 0.0), "position": getattr(p, "direction", "FLAT"), "pnl": getattr(p, "pnl", 0.0), "spreadHealth": "HEALTHY"} for p in bus.get_positions()]
             except Exception:
                 pass
             for msg in [
                 {"type": "balance", "payload": bal, "ts": now},
                 {"type": "pairs",   "payload": pairs, "ts": now},
                 {"type": "markets", "payload": _live_markets, "ts": now},
-                {
-                    "type": "regime",
-                    "payload": {
-                        "regime":      state.get("volatility_regime", "NORMAL"),
-                        "cb_open":     state.get("status") in ("HALT", "HARD_STOP"),
-                        "cb_cooldown": state.get("cb_cooldown", 0),
-                    },
-                    "ts": now,
-                },
-                {
-                    "type": "ws_status",
-                    "payload": {
-                        "bybit":   _exchange_instance is not None,
-                        "binance": False,
-                        "okx":     False,
-                    },
-                    "ts": now,
-                },
+                {"type": "regime",  "payload": {"regime": state.get("volatility_regime", "NORMAL"), "cb_open": state.get("status") in ("HALT", "HARD_STOP"), "cb_cooldown": state.get("cb_cooldown", 0)}, "ts": now},
+                {"type": "ws_status", "payload": {"bybit": _exchange_instance is not None, "binance": False, "okx": False}, "ts": now},
             ]:
                 await websocket.send_json(msg)
     except WebSocketDisconnect:
