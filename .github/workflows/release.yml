@@ -1,0 +1,52 @@
+# QuantLuna — Release Pipeline
+# Sprint 29 | GitHub Actions
+#
+# Trigger: push tag v* (ex: v0.29.0)
+# Jobs:
+#   1. Build Docker image
+#   2. Push la ghcr.io/gzeu/quantluna:tag + :latest
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  docker:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/gzeu/quantluna
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
