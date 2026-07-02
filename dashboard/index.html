@@ -69,6 +69,7 @@
     }
     .card-label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
     .card-value { font-size: 22px; font-weight: 600; margin-top: 4px; }
+    .card-sub   { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
     .positive { color: var(--green); }
     .negative { color: var(--red); }
     .neutral  { color: var(--text); }
@@ -411,6 +412,11 @@
 
   <!-- Stat Cards -->
   <div class="cards">
+    <div class="card">
+      <div class="card-label">Balance (USDT)</div>
+      <div class="card-value neutral" id="card-balance">—</div>
+      <div class="card-sub" id="card-balance-avail"></div>
+    </div>
     <div class="card">
       <div class="card-label">PnL (USDT)</div>
       <div class="card-value neutral" id="card-pnl">—</div>
@@ -795,7 +801,7 @@
 
 <script>
 // ============================================================
-// QuantLuna Dashboard — Sprint 17
+// QuantLuna Dashboard — Sprint 17 + balance fix
 // ============================================================
 
 const API = '';
@@ -829,23 +835,64 @@ function switchTab(name) {
 }
 
 // ============================================================
-// WebSocket live feed
+// WebSocket — /ws/feed (balance + pairs + markets + regime)
 // ============================================================
 function connectWS() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  wsConn = new WebSocket(`${proto}://${location.host}/ws/live`);
+  wsConn = new WebSocket(`${proto}://${location.host}/ws/feed`);
   wsConn.onmessage = (evt) => {
-    const state = JSON.parse(evt.data);
-    updateCards(state);
-    updateStatusBadge(state.status);
+    const msg = JSON.parse(evt.data);
     document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+    if (msg.type === 'balance') {
+      updateBalanceCards(msg.payload);
+    } else if (!msg.type) {
+      // fallback: /ws/live format — state snapshot
+      updateCards(msg);
+      updateStatusBadge(msg.status);
+    }
   };
   wsConn.onclose = () => { setTimeout(connectWS, 3000); };
   wsConn.onerror = () => wsConn.close();
 }
 
+// Also keep /ws/live for status + zscore + pnl
+let wsLive = null;
+function connectWSLive() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  wsLive = new WebSocket(`${proto}://${location.host}/ws/live`);
+  wsLive.onmessage = (evt) => {
+    const state = JSON.parse(evt.data);
+    updateCards(state);
+    updateStatusBadge(state.status);
+    document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+  };
+  wsLive.onclose = () => { setTimeout(connectWSLive, 3000); };
+  wsLive.onerror = () => wsLive.close();
+}
+
 // ============================================================
-// State cards
+// Balance cards (from /ws/feed or /api/balance poll)
+// ============================================================
+function updateBalanceCards(d) {
+  if (!d) return;
+  const total = parseFloat(d.totalBalance || 0);
+  const avail = parseFloat(d.availableBalance || 0);
+  const upnl  = parseFloat(d.unrealizedPnl || 0);
+  setCard('card-balance', `$${total.toFixed(2)}`, 'neutral');
+  const sub = document.getElementById('card-balance-avail');
+  if (sub) sub.textContent = `avail $${avail.toFixed(2)}  uPnL ${upnl >= 0 ? '+' : ''}$${upnl.toFixed(2)}`;
+}
+
+async function loadBalance() {
+  try {
+    const r = await fetch(`${API}/api/balance`);
+    const d = await r.json();
+    updateBalanceCards(d);
+  } catch(e) { console.warn('balance fetch:', e); }
+}
+
+// ============================================================
+// State cards (trading metrics from /ws/live)
 // ============================================================
 function updateCards(s) {
   const pnl = parseFloat(s.pnl_usdt || 0);
@@ -1021,6 +1068,7 @@ async function loadHealth() {
       ['Drawdown', `${(parseFloat(d.drawdown||0)*100).toFixed(2)}%`, parseFloat(d.drawdown)<-0.05?'pill-red':'pill-green'],
       ['N Trades', d.n_trades, 'pill-blue'],
       ['Last Update', d.last_update||'—', 'pill-yellow'],
+      ['Balance Live', d.balance_live ? 'YES' : 'NO', d.balance_live ? 'pill-green' : 'pill-red'],
     ].map(([label,value,cls]) =>
       `<tr><td>${label}</td><td><span class="pill ${cls}">${value}</span></td><td>—</td></tr>`
     ).join('');
@@ -1028,17 +1076,13 @@ async function loadHealth() {
 }
 
 // ============================================================
-// ============================================================
-//  BACKTEST TAB  —  Sprint 17
-// ============================================================
+// BACKTEST TAB  —  Sprint 17
 // ============================================================
 
 let _btCurrentJobId = null;
 let _btPollTimer    = null;
-let _btAllTrades    = [];   // raw trades from last done job
-let _btJobList      = [];   // [{job_id, status, sharpe, sym_y, sym_x, created_at}]
-
-// ── Helpers ─────────────────────────────────────────────────
+let _btAllTrades    = [];
+let _btJobList      = [];
 
 function btSetStatus(msg, cls) {
   const el = document.getElementById('bt-status-msg');
@@ -1112,16 +1156,12 @@ function btResetForm() {
   btSetStatus('Ready — configure parameters and click Run.', '');
 }
 
-// ── Run backtest ─────────────────────────────────────────────
-
 async function btRunBacktest() {
   const params = btReadForm();
   if (!btValidateForm(params)) return;
-
   document.getElementById('bt-run-btn').disabled = true;
   btSetStatus('Launching backtest job…', 'running');
   btSetProgress(5, true);
-
   try {
     const resp = await fetch(`${API}/api/backtest/run`, {
       method: 'POST',
@@ -1145,8 +1185,6 @@ async function btRunBacktest() {
   }
 }
 
-// ── Polling ──────────────────────────────────────────────────
-
 function btStartPolling(jobId) {
   if (_btPollTimer) clearInterval(_btPollTimer);
   let ticks = 0;
@@ -1156,27 +1194,20 @@ function btStartPolling(jobId) {
       const r = await fetch(`${API}/api/backtest/jobs/${jobId}`);
       if (!r.ok) { clearInterval(_btPollTimer); return; }
       const job = await r.json();
-
-      // Animate progress: 15% → 90% while running
       if (job.status === 'running' || job.status === 'queued') {
         const pct = Math.min(15 + ticks * 3, 88);
         btSetProgress(pct, true);
         btSetStatus(`Job ${jobId} — ${job.status}… (${ticks}s)`, 'running');
       }
-
       if (job.status === 'done') {
         clearInterval(_btPollTimer);
         btSetProgress(100, true);
         setTimeout(() => btSetProgress(0, false), 800);
-        btSetStatus(
-          `✓ Done in ${job.duration_s?.toFixed(1)}s — Sharpe: ${job.metrics?.sharpe?.toFixed(3) ?? '—'}`,
-          'done'
-        );
+        btSetStatus(`✓ Done in ${job.duration_s?.toFixed(1)}s — Sharpe: ${job.metrics?.sharpe?.toFixed(3) ?? '—'}`, 'done');
         document.getElementById('bt-run-btn').disabled = false;
         btRenderResults(job);
         btRefreshJobList();
       }
-
       if (job.status === 'error') {
         clearInterval(_btPollTimer);
         btSetProgress(0, false);
@@ -1184,70 +1215,47 @@ function btStartPolling(jobId) {
         document.getElementById('bt-run-btn').disabled = false;
         btRefreshJobList();
       }
-
-      // Timeout after 3 minutes
       if (ticks > 180) {
         clearInterval(_btPollTimer);
         btSetStatus('⚠ Timeout — job is taking too long. Check server logs.', 'error');
         document.getElementById('bt-run-btn').disabled = false;
         btSetProgress(0, false);
       }
-    } catch(e) {
-      console.warn('poll error:', e);
-    }
+    } catch(e) { console.warn('poll error:', e); }
   }, 1000);
 }
-
-// ── Render results ───────────────────────────────────────────
 
 function btRenderResults(job) {
   const m = job.metrics;
   if (!m) return;
-
   document.getElementById('bt-results-section').classList.add('visible');
-
-  // ── Metric cards ──
   function setMetric(id, val, fmt, cls) {
     const el = document.getElementById(id);
     if (!el) return;
     el.textContent = typeof fmt === 'function' ? fmt(val) : val;
     el.className = 'bt-metric-value ' + (cls || btColorFor(val, id));
   }
-
   setMetric('bm-sharpe-val',  m.sharpe,          v => v.toFixed(3));
   setMetric('bm-sortino-val', m.sortino,         v => v.toFixed(3));
   setMetric('bm-calmar-val',  m.calmar,          v => v.toFixed(3));
   setMetric('bm-maxdd-val',   m.max_drawdown_pct,v => v.toFixed(2) + '%', m.max_drawdown_pct < -5 ? 'negative' : 'neutral');
   document.getElementById('bm-maxdd-sub').textContent = `$${m.max_drawdown?.toFixed(0)}`;
-
-  setMetric('bm-winrate-val', m.win_rate,        v => (v*100).toFixed(1) + '%',
-    m.win_rate >= 0.5 ? 'positive' : m.win_rate >= 0.4 ? 'neutral' : 'negative');
+  setMetric('bm-winrate-val', m.win_rate,        v => (v*100).toFixed(1) + '%', m.win_rate >= 0.5 ? 'positive' : m.win_rate >= 0.4 ? 'neutral' : 'negative');
   document.getElementById('bm-trades-sub').textContent = `${m.n_trades} trades`;
-
-  setMetric('bm-pf-val', m.profit_factor,        v => v.toFixed(3),
-    m.profit_factor >= 1.2 ? 'positive' : m.profit_factor >= 1.0 ? 'neutral' : 'negative');
+  setMetric('bm-pf-val', m.profit_factor,        v => v.toFixed(3), m.profit_factor >= 1.2 ? 'positive' : m.profit_factor >= 1.0 ? 'neutral' : 'negative');
   document.getElementById('bm-pnl-sub').textContent = `Net $${m.total_net_pnl?.toFixed(0)}`;
-
-  setMetric('bm-annret-val', m.ann_return,       v => '$' + v.toFixed(0),
-    m.ann_return >= 0 ? 'positive' : 'negative');
-
+  setMetric('bm-annret-val', m.ann_return,       v => '$' + v.toFixed(0), m.ann_return >= 0 ? 'positive' : 'negative');
   document.getElementById('bm-nfolds-sub').textContent = `${m.n_folds} folds`;
   const ovBadge = document.getElementById('bm-overfit-badge');
   if (m.overfit_flag) {
-    ovBadge.textContent = '⚠ Overfit';
-    ovBadge.className = 'overfit-flag overfit-warn';
+    ovBadge.textContent = '⚠ Overfit'; ovBadge.className = 'overfit-flag overfit-warn';
   } else {
-    ovBadge.textContent = '✓ OK';
-    ovBadge.className = 'overfit-flag overfit-ok';
+    ovBadge.textContent = '✓ OK'; ovBadge.className = 'overfit-flag overfit-ok';
   }
-
-  // ── Charts from trades ──
   const trades = job.trades || [];
   _btAllTrades = trades;
   btRenderCharts(trades, m);
   btRenderTradesTable(trades);
-
-  // Enable CSV download
   const csvBtn = document.getElementById('bt-csv-btn');
   csvBtn.disabled = false;
   csvBtn.dataset.jobId = job.job_id;
@@ -1261,15 +1269,9 @@ function btColorFor(val, id) {
   return 'neutral';
 }
 
-// ── Charts ───────────────────────────────────────────────────
-
 function btRenderCharts(trades, metrics) {
   const oosTrades = trades.filter(t => t.split === 'OOS' || t.split == null);
-
-  // Sort by exit bar
   oosTrades.sort((a, b) => (a.exit_bar ?? 0) - (b.exit_bar ?? 0));
-
-  // ── 1. OOS Equity curve ──
   if (oosTrades.length > 0) {
     let equity = 0;
     const eqX = [], eqY = [], ddY = [];
@@ -1281,52 +1283,29 @@ function btRenderCharts(trades, metrics) {
       peak = Math.max(peak, equity);
       ddY.push(parseFloat((peak > 0 ? ((equity - peak) / peak * 100) : 0).toFixed(3)));
     });
-
     Plotly.react('bt-chart-equity', [{
-      x: eqX, y: eqY,
-      type: 'scatter', mode: 'lines',
-      line: { color: '#3fb950', width: 2 },
-      fill: 'tozeroy',
+      x: eqX, y: eqY, type: 'scatter', mode: 'lines',
+      line: { color: '#3fb950', width: 2 }, fill: 'tozeroy',
       fillcolor: eqY[eqY.length-1] >= 0 ? 'rgba(63,185,80,0.08)' : 'rgba(248,81,73,0.08)',
       name: 'Cumulative Net P&L',
     }], {
       ...LAYOUT_BASE,
       yaxis: { ...LAYOUT_BASE.yaxis, tickprefix: '$', title: { text: 'Net P&L (USD)', font: { size: 10 } } },
       xaxis: { ...LAYOUT_BASE.xaxis, title: { text: 'Trade exit', font: { size: 10 } } },
-      shapes: [{ type: 'line', x0: eqX[0], x1: eqX[eqX.length-1], y0: 0, y1: 0,
-        line: { color: '#30363d', width: 1, dash: 'dot' } }],
+      shapes: [{ type: 'line', x0: eqX[0], x1: eqX[eqX.length-1], y0: 0, y1: 0, line: { color: '#30363d', width: 1, dash: 'dot' } }],
     }, CONFIG);
-
-    // ── 2. Drawdown chart ──
     Plotly.react('bt-chart-dd', [{
-      x: eqX, y: ddY,
-      type: 'scatter', mode: 'lines',
-      fill: 'tozeroy',
-      fillcolor: 'rgba(248,81,73,0.15)',
-      line: { color: '#f85149', width: 1.5 },
-      name: 'Drawdown %',
-    }], {
-      ...LAYOUT_BASE,
-      yaxis: { ...LAYOUT_BASE.yaxis, ticksuffix: '%', title: { text: 'Drawdown (%)', font: { size: 10 } } },
-    }, CONFIG);
-
+      x: eqX, y: ddY, type: 'scatter', mode: 'lines', fill: 'tozeroy',
+      fillcolor: 'rgba(248,81,73,0.15)', line: { color: '#f85149', width: 1.5 }, name: 'Drawdown %',
+    }], { ...LAYOUT_BASE, yaxis: { ...LAYOUT_BASE.yaxis, ticksuffix: '%', title: { text: 'Drawdown (%)', font: { size: 10 } } } }, CONFIG);
   } else {
     ['bt-chart-equity', 'bt-chart-dd'].forEach(id => {
-      document.getElementById(id).innerHTML =
-        '<div style="padding:40px;text-align:center;color:var(--text-muted);font-size:12px;">No OOS trades</div>';
+      document.getElementById(id).innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted);font-size:12px;">No OOS trades</div>';
     });
   }
-
-  // ── 3. Per-fold Sharpe bar chart ──
-  // Compute from OOS trades grouped by fold
   const foldMap = {};
-  oosTrades.forEach(t => {
-    const f = t.fold ?? 0;
-    if (!foldMap[f]) foldMap[f] = [];
-    foldMap[f].push(t.net_pnl ?? 0);
-  });
+  oosTrades.forEach(t => { const f = t.fold ?? 0; if (!foldMap[f]) foldMap[f] = []; foldMap[f].push(t.net_pnl ?? 0); });
   const foldKeys = Object.keys(foldMap).map(Number).sort((a,b)=>a-b);
-
   if (foldKeys.length > 0) {
     const foldSharpes = foldKeys.map(f => {
       const pnls = foldMap[f];
@@ -1335,41 +1314,25 @@ function btRenderCharts(trades, metrics) {
       return std > 0 ? (mean / std * Math.sqrt(252)) : 0;
     });
     Plotly.react('bt-chart-folds', [{
-      x: foldKeys.map(f => `Fold ${f+1}`),
-      y: foldSharpes,
-      type: 'bar',
-      marker: {
-        color: foldSharpes.map(s => s >= 1.0 ? '#3fb950' : s >= 0 ? '#58a6ff' : '#f85149'),
-      },
-      text: foldSharpes.map(s => s.toFixed(2)),
-      textposition: 'outside',
-      textfont: { size: 10, color: '#8b949e' },
+      x: foldKeys.map(f => `Fold ${f+1}`), y: foldSharpes, type: 'bar',
+      marker: { color: foldSharpes.map(s => s >= 1.0 ? '#3fb950' : s >= 0 ? '#58a6ff' : '#f85149') },
+      text: foldSharpes.map(s => s.toFixed(2)), textposition: 'outside', textfont: { size: 10, color: '#8b949e' },
     }], {
       ...LAYOUT_BASE,
-      yaxis: { ...LAYOUT_BASE.yaxis, title: { text: 'Sharpe', font: { size: 10 } },
-        zeroline: true, zerolinecolor: '#30363d', zerolinewidth: 1 },
-      shapes: [{ type: 'line', x0: -0.5, x1: foldKeys.length - 0.5, y0: 0, y1: 0,
-        line: { color: '#30363d', width: 1 } }],
+      yaxis: { ...LAYOUT_BASE.yaxis, title: { text: 'Sharpe', font: { size: 10 } }, zeroline: true, zerolinecolor: '#30363d', zerolinewidth: 1 },
+      shapes: [{ type: 'line', x0: -0.5, x1: foldKeys.length - 0.5, y0: 0, y1: 0, line: { color: '#30363d', width: 1 } }],
     }, CONFIG);
   } else {
-    document.getElementById('bt-chart-folds').innerHTML =
-      '<div style="padding:30px;text-align:center;color:var(--text-muted);">No fold data</div>';
+    document.getElementById('bt-chart-folds').innerHTML = '<div style="padding:30px;text-align:center;color:var(--text-muted);">No fold data</div>';
   }
-
-  // ── 4. P&L histogram ──
   const pnls = oosTrades.map(t => t.net_pnl ?? 0).filter(v => isFinite(v));
   if (pnls.length > 0) {
     Plotly.react('bt-chart-hist', [{
-      x: pnls,
-      type: 'histogram',
-      nbinsx: Math.min(30, Math.ceil(pnls.length / 3)),
-      marker: { color: '#58a6ff', opacity: 0.75, line: { color: '#30363d', width: 0.5 } },
-      name: 'Net P&L',
+      x: pnls, type: 'histogram', nbinsx: Math.min(30, Math.ceil(pnls.length / 3)),
+      marker: { color: '#58a6ff', opacity: 0.75, line: { color: '#30363d', width: 0.5 } }, name: 'Net P&L',
     }, {
-      x: [0, 0], y: [0, null],
-      type: 'scatter', mode: 'lines',
-      line: { color: '#f85149', dash: 'dot', width: 1.5 },
-      showlegend: false, yaxis: 'y',
+      x: [0, 0], y: [0, null], type: 'scatter', mode: 'lines',
+      line: { color: '#f85149', dash: 'dot', width: 1.5 }, showlegend: false, yaxis: 'y',
     }], {
       ...LAYOUT_BASE,
       xaxis: { ...LAYOUT_BASE.xaxis, tickprefix: '$', title: { text: 'Net P&L per trade', font: { size: 10 } } },
@@ -1378,15 +1341,12 @@ function btRenderCharts(trades, metrics) {
   }
 }
 
-// ── Trades table ─────────────────────────────────────────────
-
 function btRenderTradesTable(trades) {
   const filter = document.getElementById('bt-trades-filter').value;
   const filtered = filter === 'ALL' ? trades : trades.filter(t => t.split === filter);
   const tbody = document.getElementById('bt-trades-tbody');
   document.getElementById('bt-trades-count').textContent = filtered.length;
-
-  const display = filtered.slice(0, 200);  // max 200 rows in DOM
+  const display = filtered.slice(0, 200);
   tbody.innerHTML = display.map(t => {
     const netPnl = parseFloat(t.net_pnl ?? 0);
     const grossPnl = parseFloat(t.gross_pnl ?? 0);
@@ -1412,25 +1372,19 @@ function btRenderTradesTable(trades) {
       <td style="font-size:11px;color:var(--text-muted)">${t.exit_reason ?? '—'}</td>
     </tr>`;
   }).join('');
-
   if (filtered.length > 200) {
     tbody.innerHTML += `<tr><td colspan="14" style="text-align:center;color:var(--text-muted);font-size:11px;">Showing 200 of ${filtered.length} trades — download CSV for full data</td></tr>`;
   }
 }
 
-function btFilterTrades() {
-  btRenderTradesTable(_btAllTrades);
-}
-
-// ── CSV download ─────────────────────────────────────────────
+function btFilterTrades() { btRenderTradesTable(_btAllTrades); }
 
 async function btDownloadCSV() {
   const btn = document.getElementById('bt-csv-btn');
   const csvUrl = btn.dataset.csvUrl;
   if (!csvUrl) return;
   try {
-    btn.disabled = true;
-    btn.textContent = '⏳ Downloading…';
+    btn.disabled = true; btn.textContent = '⏳ Downloading…';
     const resp = await fetch(`${API}${csvUrl}`);
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const blob = await resp.blob();
@@ -1439,19 +1393,14 @@ async function btDownloadCSV() {
     const cd = resp.headers.get('content-disposition') || '';
     const match = cd.match(/filename="([^"]+)"/);
     a.download = match ? match[1] : 'quantluna_trades.csv';
-    a.href = url;
-    document.body.appendChild(a);
-    a.click();
+    a.href = url; document.body.appendChild(a); a.click();
     setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
   } catch(e) {
     btSetStatus(`CSV error: ${e.message}`, 'error');
   } finally {
-    btn.disabled = false;
-    btn.textContent = '⬇ Download CSV';
+    btn.disabled = false; btn.textContent = '⬇ Download CSV';
   }
 }
-
-// ── Job history list ─────────────────────────────────────────
 
 async function btRefreshJobList() {
   try {
@@ -1460,11 +1409,9 @@ async function btRefreshJobList() {
     _btJobList = await r.json();
     const container = document.getElementById('bt-jobs-list');
     const section   = document.getElementById('bt-jobs-section');
-
     if (_btJobList.length === 0) { section.style.display = 'none'; return; }
     section.style.display = 'block';
     document.getElementById('bt-jobs-count').textContent = _btJobList.length;
-
     container.innerHTML = _btJobList.map(j => {
       const dotCls = `job-dot-${j.status}`;
       const sharpeStr = j.sharpe != null ? ` — Sharpe ${j.sharpe.toFixed(3)}` : '';
@@ -1473,10 +1420,8 @@ async function btRefreshJobList() {
       const active = j.job_id === _btCurrentJobId ? ' active' : '';
       return `<div class="bt-job-item${active}" onclick="btLoadJob('${j.job_id}')">
         <div class="bt-job-dot ${dotCls}"></div>
-        <div style="flex:1;">
-          <span style="font-size:12px;font-weight:600;color:var(--text);">${j.job_id}</span>
-          <span style="color:var(--text-muted);font-size:11px;"> ${j.sym_y}/${j.sym_x} ${j.bar_freq}${sharpeStr}${dur}</span>
-        </div>
+        <div style="flex:1;"><span style="font-size:12px;font-weight:600;color:var(--text);">${j.job_id}</span>
+        <span style="color:var(--text-muted);font-size:11px;"> ${j.sym_y}/${j.sym_x} ${j.bar_freq}${sharpeStr}${dur}</span></div>
         <div style="font-size:10px;color:var(--text-muted);">${ts}</div>
       </div>`;
     }).join('');
@@ -1490,15 +1435,11 @@ async function btLoadJob(jobId) {
     const job = await r.json();
     _btCurrentJobId = jobId;
     if (job.status === 'done') {
-      btSetStatus(
-        `Loaded job ${jobId} — Sharpe: ${job.metrics?.sharpe?.toFixed(3) ?? '—'}`, 'done'
-      );
+      btSetStatus(`Loaded job ${jobId} — Sharpe: ${job.metrics?.sharpe?.toFixed(3) ?? '—'}`, 'done');
       btRenderResults(job);
     } else {
       btSetStatus(`Job ${jobId} — ${job.status}`, job.status === 'error' ? 'error' : 'running');
-      if (job.status === 'running' || job.status === 'queued') {
-        btStartPolling(jobId);
-      }
+      if (job.status === 'running' || job.status === 'queued') btStartPolling(jobId);
     }
     btRefreshJobList();
   } catch(e) { console.warn('btLoadJob error:', e); }
@@ -1517,8 +1458,11 @@ window.addEventListener('DOMContentLoaded', () => {
   Plotly.newPlot('bt-chart-folds', [], LAYOUT_BASE, CONFIG);
   Plotly.newPlot('bt-chart-hist', [], LAYOUT_BASE, CONFIG);
 
-  connectWS();
+  connectWS();       // /ws/feed — balance
+  connectWSLive();   // /ws/live — status + pnl + zscore
+  loadBalance();     // fetch imediat
   loadPerformance();
+  setInterval(loadBalance, 10_000);      // refresh balance la 10s
   setInterval(loadPerformance, 10_000);
 });
 </script>
