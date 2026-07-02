@@ -1,0 +1,22 @@
+name: Lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  ruff:
+    name: Ruff linter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install ruff
+        run: pip install ruff
+      - name: Run ruff check
+        run: ruff check . --select E,F,W --ignore E501,F401 --exclude tests/
