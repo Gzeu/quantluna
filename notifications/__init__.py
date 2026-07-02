@@ -1,11 +1,13 @@
 """
-notifications/ — QuantLuna Notification System
-
-Exports:
-    TelegramNotifier  — Telegram bot alerts (trade, HALT, daily PnL)
-    NotifierConfig    — configuration dataclass
-    AlertLevel        — severity enum
+QuantLuna — Notifications Package
+Sprint 11 (Telegram) + Sprint 26 (Discord + NotifierBus)
 """
-from .telegram_notifier import TelegramNotifier, NotifierConfig, AlertLevel
+from notifications.discord_notifier import DiscordConfig, DiscordNotifier
+from notifications.notifier_bus import NotifierBus, build_bus_from_env
+from notifications.telegram_notifier import AlertLevel, NotifierConfig, TelegramNotifier
 
-__all__ = ["TelegramNotifier", "NotifierConfig", "AlertLevel"]
+__all__ = [
+    "TelegramNotifier", "NotifierConfig", "AlertLevel",
+    "DiscordNotifier",  "DiscordConfig",
+    "NotifierBus",      "build_bus_from_env",
+]

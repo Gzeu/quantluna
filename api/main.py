@@ -1,6 +1,6 @@
 """
 QuantLuna — FastAPI Application Entry Point
-Sprint 21 + Sprint 24 + Sprint 25 (optimize router)
+Sprint 21 + Sprint 24 + Sprint 25 + Sprint 26 (data router)
 
 Ruleaza cu:
     uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
@@ -10,6 +10,7 @@ Endpoints expuse:
   /strategy/*   — AutoSelector scores, list, switch, context
   /live/*       — LiveTrader start/stop/status/SSE stream
   /optimize/*   — WalkForwardOptimizer jobs
+  /data/*       — OHLCV fetch, cache management
   /health       — health + uptime + version
   /docs         — Swagger UI
 """
@@ -23,6 +24,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.backtest import router as backtest_router
+from api.data import router as data_router
 from api.health import router as health_router
 from api.live import router as live_router
 from api.optimize import router as optimize_router
@@ -49,9 +51,10 @@ QuantLuna — Crypto Pairs Trading Engine
 - **Strategy** — AutoSelector scores, manual switch, MarketContext per job
 - **Live** — Binance WebSocket live trader (paper/live/dry mode), SSE stream
 - **Optimize** — WalkForward parameter optimizer, per-regime best config
+- **Data** — OHLCV historical fetch, Parquet cache, pair alignment
 - **Health** — uptime, version, system status
     """,
-    version="0.25.0",
+    version="0.26.0",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
@@ -69,6 +72,7 @@ app.include_router(backtest_router)
 app.include_router(strategy_router)
 app.include_router(live_router)
 app.include_router(optimize_router)
+app.include_router(data_router)
 app.include_router(health_router)
 
 
@@ -76,8 +80,8 @@ app.include_router(health_router)
 def root():
     return {
         "name":    "QuantLuna API",
-        "version": "0.25.0",
+        "version": "0.26.0",
         "uptime_seconds": round(time.time() - _START_TIME, 1),
-        "modules": ["/backtest", "/strategy", "/live", "/optimize", "/health"],
-        "docs": "/docs",
+        "modules": ["/backtest", "/strategy", "/live", "/optimize", "/data", "/health"],
+        "docs":    "/docs",
     }
