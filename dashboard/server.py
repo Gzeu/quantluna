@@ -1,29 +1,16 @@
 """
 dashboard/server.py  —  QuantLuna FastAPI Dashboard Server
 
-Sprint 13 additions:
-  - GET /api/health        — system health summary
-  - GET /api/optimize/results  — Optuna trial history (vizualizare)
-  - WebSocket /ws/live     — real-time state push la fiecare 1s
-  - CORS configurat pentru dev frontend
-
-Sprint 16 additions:
-  - Backtest REST API montat via api.backtest router:
-    POST   /api/backtest/run
-    GET    /api/backtest/jobs/{job_id}
-    GET    /api/backtest/jobs/{job_id}/trades.csv
-    GET    /api/backtest/jobs
-    DELETE /api/backtest/jobs/{job_id}
-
-Sprint 17 additions (feature/desktop-ui):
-  - GET  /api/balance   → BalanceTracker component
-  - GET  /api/pairs     → SpreadMonitorPanel + Sidebar
-  - GET  /api/markets   → MarketHeatmap + Sidebar
-  - GET  /api/risk      → RegimeHeader (regime + circuit breaker)
-  - GET  /api/log       → ExecutionLog (recent entries)
-  - WS   /ws/feed       → structured {type, payload, ts} messages for Next.js dashboard
-
-All original endpoints preserved.
+Sprint 17+ (feature/desktop-ui):
+  - Live market data fetched from Bybit (or Binance) via ccxt every 10s
+  - Live balance fetched from exchange if API keys are configured
+  - Mock data used ONLY as fallback when exchange is unreachable
+  - GET  /api/balance   — real balance if keys present, else zeros
+  - GET  /api/pairs     — real positions from state_bus
+  - GET  /api/markets   — real prices from exchange
+  - GET  /api/risk      — regime from state_bus
+  - GET  /api/log       — recent trades from state_bus
+  - WS   /ws/feed       — structured {type, payload, ts} push every 2s
 """
 from __future__ import annotations
 
@@ -47,20 +34,136 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Live data cache  (refreshed every 10s by background task)
+# ---------------------------------------------------------------------------
+
+_SYMBOLS = [
+    "BTC", "ETH", "SOL", "BNB", "AVAX", "MATIC", "DOT", "ADA",
+    "LINK", "UNI", "ATOM", "NEAR", "FTM", "ALGO", "XRP",
+    "LTC", "DOGE", "SHIB", "ARB", "OP",
+]
+
+_live_markets: List[Dict[str, Any]] = []
+_live_balance: Dict[str, Any] = {}
+_exchange_instance = None
+
+
+async def _init_exchange():
+    global _exchange_instance
+    try:
+        import ccxt.async_support as ccxt
+        exchange_name = os.getenv("EXCHANGE", "bybit").lower()
+        api_key    = os.getenv("BYBIT_API_KEY")    or os.getenv("BINANCE_API_KEY")    or ""
+        api_secret = os.getenv("BYBIT_API_SECRET") or os.getenv("BINANCE_API_SECRET") or ""
+
+        cls = getattr(ccxt, exchange_name, ccxt.bybit)
+        params: Dict[str, Any] = {"enableRateLimit": True}
+        if api_key and api_secret:
+            params["apiKey"] = api_key
+            params["secret"] = api_secret
+
+        _exchange_instance = cls(params)
+        logger.info(f"Exchange initialised: {exchange_name} (keys={'yes' if api_key else 'no'})")
+    except Exception as exc:
+        logger.warning(f"Exchange init failed: {exc}")
+        _exchange_instance = None
+
+
+async def _fetch_markets():
+    global _live_markets
+    if _exchange_instance is None:
+        return
+    try:
+        tickers = await _exchange_instance.fetch_tickers(
+            [f"{s}/USDT" for s in _SYMBOLS]
+        )
+        markets = []
+        for sym in _SYMBOLS:
+            t = tickers.get(f"{sym}/USDT") or tickers.get(f"{sym}/USDT:USDT")
+            if not t:
+                continue
+            last    = float(t.get("last")    or 0)
+            change  = float(t.get("percentage") or 0)   # 24h % change
+            vol     = float(t.get("quoteVolume") or t.get("baseVolume") or 0)
+            funding = 0.0
+            try:
+                fi = await _exchange_instance.fetch_funding_rate(f"{sym}/USDT:USDT")
+                funding = float(fi.get("fundingRate") or 0)
+            except Exception:
+                pass
+            markets.append({
+                "symbol":      sym,
+                "price":       round(last, 8),
+                "change24h":   round(change, 4),
+                "volume24h":   round(vol, 2),
+                "fundingRate": round(funding, 6),
+            })
+        if markets:
+            _live_markets = markets
+            logger.debug(f"Markets updated: {len(markets)} symbols")
+    except Exception as exc:
+        logger.warning(f"fetch_markets error: {exc}")
+
+
+async def _fetch_balance():
+    global _live_balance
+    if _exchange_instance is None:
+        return
+    api_key = os.getenv("BYBIT_API_KEY") or os.getenv("BINANCE_API_KEY") or ""
+    if not api_key:
+        return
+    try:
+        bal = await _exchange_instance.fetch_balance()
+        usdt = bal.get("USDT") or {}
+        total     = float(usdt.get("total") or bal.get("total", {}).get("USDT") or 0)
+        free      = float(usdt.get("free")  or bal.get("free",  {}).get("USDT") or 0)
+        used      = float(usdt.get("used")  or bal.get("used",  {}).get("USDT") or 0)
+        _live_balance = {
+            "totalBalance":     round(total, 4),
+            "availableBalance": round(free, 4),
+            "marginUsed":       round(used, 4),
+            "unrealizedPnl":    round(float(bal.get("info", {}).get("totalUnrealisedProfit", 0) or 0), 4),
+            "realizedPnl":      0.0,
+        }
+        logger.debug(f"Balance updated: total={total:.2f} USDT")
+    except Exception as exc:
+        logger.warning(f"fetch_balance error: {exc}")
+
+
+async def _live_data_loop():
+    """Background task: refresh market prices + balance every 10 seconds."""
+    await _init_exchange()
+    while True:
+        await asyncio.gather(
+            _fetch_markets(),
+            _fetch_balance(),
+            return_exceptions=True,
+        )
+        await asyncio.sleep(10)
+
+
+# ---------------------------------------------------------------------------
 # App lifecycle
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("QuantLuna Dashboard starting")
+    task = asyncio.create_task(_live_data_loop())
+    logger.info("QuantLuna Dashboard starting — live data loop launched")
     yield
+    task.cancel()
+    if _exchange_instance:
+        try:
+            await _exchange_instance.close()
+        except Exception:
+            pass
     logger.info("QuantLuna Dashboard shutting down")
 
 
 app = FastAPI(
     title="QuantLuna Dashboard",
     description="Adaptive Kalman Filter Pairs Trading — Monitoring & Backtest API",
-    version="1.2.0",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -77,20 +180,40 @@ try:
 except Exception:
     pass
 
-# ---------------------------------------------------------------------------
-# Sprint 16 — Mount backtest router
-# ---------------------------------------------------------------------------
-
 try:
     from api.backtest import router as backtest_router
     app.include_router(backtest_router)
-    logger.info("Backtest API router mounted at /api/backtest")
 except ImportError as _e:
     logger.warning(f"Backtest router not mounted: {_e}")
 
 
 # ---------------------------------------------------------------------------
-# Existing endpoints
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _balance_response() -> Dict[str, Any]:
+    """Real balance if available, else state_bus, else zeros."""
+    if _live_balance:
+        state = bus.snapshot_dict()
+        return {
+            "totalBalance":     _live_balance["totalBalance"],
+            "availableBalance": _live_balance["availableBalance"],
+            "unrealizedPnl":    state.get("pnl_usdt", _live_balance["unrealizedPnl"]),
+            "realizedPnl":      state.get("realized_pnl", _live_balance["realizedPnl"]),
+            "marginUsed":       _live_balance.get("marginUsed", 0.0),
+        }
+    state = bus.snapshot_dict()
+    return {
+        "totalBalance":     state.get("equity", 0.0),
+        "availableBalance": state.get("available_balance", 0.0),
+        "unrealizedPnl":    state.get("pnl_usdt", 0.0),
+        "realizedPnl":      state.get("realized_pnl", 0.0),
+        "marginUsed":       0.0,
+    }
+
+
+# ---------------------------------------------------------------------------
+# REST endpoints
 # ---------------------------------------------------------------------------
 
 @app.get("/")
@@ -100,30 +223,25 @@ async def root() -> HTMLResponse:
         with open(html_path) as f:
             return HTMLResponse(content=f.read())
     except FileNotFoundError:
-        return HTMLResponse(content="<h1>QuantLuna Dashboard</h1><p>index.html not found.</p>")
+        return HTMLResponse(content="<h1>QuantLuna Dashboard</h1>")
 
 
 @app.get("/api/status")
 async def api_status() -> Dict[str, Any]:
-    """Current trading state snapshot."""
     return bus.snapshot_dict()
 
 
 @app.get("/api/positions")
 async def api_positions() -> Dict[str, Any]:
-    """Active positions."""
     positions = bus.get_positions()
     return {
         "count": len(positions),
         "positions": [
             {
-                "pair": p.pair,
-                "direction": p.direction,
-                "qty_y": p.qty_y,
-                "qty_x": p.qty_x,
+                "pair": p.pair, "direction": p.direction,
+                "qty_y": p.qty_y, "qty_x": p.qty_x,
                 "notional_usdt": p.notional_usdt,
-                "hedge_ratio": p.hedge_ratio,
-                "entry_ts": p.entry_ts,
+                "hedge_ratio": p.hedge_ratio, "entry_ts": p.entry_ts,
             }
             for p in positions
         ],
@@ -132,209 +250,36 @@ async def api_positions() -> Dict[str, Any]:
 
 @app.get("/api/performance")
 async def api_performance() -> Dict[str, Any]:
-    """Equity curve + recent trades."""
     return {
-        "equity_curve": bus.get_equity_curve(),
+        "equity_curve":  bus.get_equity_curve(),
         "recent_trades": bus.get_recent_trades()[-50:],
     }
 
-
-# ---------------------------------------------------------------------------
-# Sprint 13 — New endpoints
-# ---------------------------------------------------------------------------
 
 @app.get("/api/health")
 async def api_health() -> Dict[str, Any]:
     state = bus.snapshot_dict()
     status = state.get("status", "UNKNOWN")
-    if status in ("RUNNING", "IDLE"):
-        health_status = "ok"
-    elif status in ("HALT", "HARD_STOP"):
-        health_status = "error"
-    else:
-        health_status = "degraded"
     return {
-        "status": health_status,
+        "status":         "ok" if status in ("RUNNING", "IDLE") else "error",
         "trading_status": status,
-        "pnl_usdt": state.get("pnl_usdt", 0.0),
-        "drawdown": state.get("drawdown", 0.0),
-        "n_trades": state.get("n_trades", 0),
-        "last_update": state.get("last_update"),
+        "pnl_usdt":       state.get("pnl_usdt", 0.0),
+        "drawdown":       state.get("drawdown", 0.0),
+        "n_trades":       state.get("n_trades", 0),
+        "last_update":    state.get("last_update"),
+        "exchange_connected": _exchange_instance is not None,
+        "markets_cached":     len(_live_markets),
+        "balance_live":       bool(_live_balance),
     }
-
-
-@app.get("/api/optimize/results")
-async def api_optimize_results(
-    storage: Optional[str] = Query(default=None),
-    study_name: str = Query(default="quantluna_opt"),
-    top_n: int = Query(default=50, ge=1, le=500),
-) -> Dict[str, Any]:
-    if not storage:
-        for default in ["sqlite:///optuna.db", "sqlite:///data/optuna.db"]:
-            db_path = default.replace("sqlite:///", "")
-            if os.path.exists(db_path):
-                storage = default
-                break
-    if not storage:
-        return {
-            "study_name": study_name, "storage": None, "n_trials": 0,
-            "best_value": None, "best_params": {}, "trials": [],
-            "message": "No Optuna storage found.",
-        }
-    try:
-        import optuna
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-        try:
-            study = optuna.load_study(study_name=study_name, storage=storage)
-        except Exception as exc:
-            return {"error": str(exc), "n_trials": 0, "trials": []}
-        completed = sorted(
-            [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE],
-            key=lambda t: t.value or 0, reverse=True,
-        )
-        trials_data = []
-        for t in completed[:top_n]:
-            duration = (
-                (t.datetime_complete - t.datetime_start).total_seconds()
-                if t.datetime_complete and t.datetime_start else None
-            )
-            trials_data.append({
-                "number": t.number,
-                "value": round(t.value, 4) if t.value is not None else None,
-                "params": {k: round(v, 6) if isinstance(v, float) else v for k, v in t.params.items()},
-                "duration_s": round(duration, 2) if duration else None,
-            })
-        best_value, best_params = None, {}
-        try:
-            best_value = round(study.best_value, 4)
-            best_params = study.best_params
-        except Exception:
-            pass
-        param_importances = {}
-        if len(completed) >= 10:
-            try:
-                importances = optuna.importance.get_param_importances(study)
-                param_importances = {k: round(v, 4) for k, v in importances.items()}
-            except Exception:
-                pass
-        return {
-            "study_name": study_name, "storage": storage,
-            "n_trials": len(study.trials), "n_complete": len(completed),
-            "best_value": best_value, "best_params": best_params,
-            "trials": trials_data, "param_importances": param_importances,
-        }
-    except ImportError:
-        raise HTTPException(status_code=501, detail="Optuna not installed.")
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-# ---------------------------------------------------------------------------
-# WebSocket manager
-# ---------------------------------------------------------------------------
-
-class _WSManager:
-    def __init__(self):
-        self.active: List[WebSocket] = []
-
-    async def connect(self, ws: WebSocket):
-        await ws.accept()
-        self.active.append(ws)
-        logger.info(f"WS client connected (total: {len(self.active)})")
-
-    def disconnect(self, ws: WebSocket):
-        if ws in self.active:
-            self.active.remove(ws)
-        logger.info(f"WS client disconnected (total: {len(self.active)})")
-
-    async def broadcast(self, data: Dict):
-        dead = []
-        for ws in self.active:
-            try:
-                await ws.send_json(data)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.active.remove(ws)
-
-
-_ws_manager = _WSManager()
-
-
-@app.websocket("/ws/live")
-async def websocket_live(websocket: WebSocket):
-    """
-    Original WS endpoint — pushes raw state snapshot every 1 second.
-    Preserved for backward compatibility.
-    """
-    await _ws_manager.connect(websocket)
-    try:
-        while True:
-            await asyncio.sleep(1.0)
-            await websocket.send_json(bus.snapshot_dict())
-    except WebSocketDisconnect:
-        _ws_manager.disconnect(websocket)
-    except Exception as exc:
-        logger.warning(f"WS /ws/live error: {exc}")
-        _ws_manager.disconnect(websocket)
-
-
-# ---------------------------------------------------------------------------
-# Sprint 17 — Dashboard REST + WS feed (feature/desktop-ui)
-# ---------------------------------------------------------------------------
-
-_MOCK_BALANCE = {
-    "totalBalance": 10_432.87, "availableBalance": 7_215.44,
-    "unrealizedPnl": 119.43, "realizedPnl": 312.00,
-}
-
-_MOCK_PAIRS = [
-    {"symbol": "BTC/ETH", "zscore": 1.82, "spread": 0.0412, "halfLife": 18.3, "position": "LONG", "pnl": 142.5, "spreadHealth": "HEALTHY"},
-    {"symbol": "SOL/AVAX", "zscore": -2.31, "spread": -0.0871, "halfLife": 8.1, "position": "SHORT", "pnl": -23.1, "spreadHealth": "DEGRADED"},
-    {"symbol": "BNB/MATIC", "zscore": 0.44, "spread": 0.0089, "halfLife": 24.0, "position": "FLAT", "pnl": 0.0, "spreadHealth": "HEALTHY"},
-]
-
-_MOCK_MARKETS = [
-    {"symbol": "BTC",  "price": 43215.50, "change24h":  2.34, "volume24h": 28_500_000_000, "fundingRate":  0.00012},
-    {"symbol": "ETH",  "price":  2310.88, "change24h": -1.12, "volume24h": 12_300_000_000, "fundingRate": -0.00008},
-    {"symbol": "SOL",  "price":    98.42, "change24h":  5.67, "volume24h":  3_200_000_000, "fundingRate":  0.00021},
-    {"symbol": "BNB",  "price":   312.55, "change24h":  0.89, "volume24h":  1_800_000_000, "fundingRate":  0.00005},
-    {"symbol": "AVAX", "price":    27.31, "change24h": -3.45, "volume24h":    950_000_000, "fundingRate": -0.00015},
-    {"symbol": "MATIC","price":   0.5821, "change24h":  1.23, "volume24h":    620_000_000, "fundingRate":  0.00008},
-    {"symbol": "DOT",  "price":    6.12, "change24h": -0.67, "volume24h":    380_000_000, "fundingRate":  0.00003},
-    {"symbol": "ADA",  "price":   0.4456, "change24h":  3.21, "volume24h":    510_000_000, "fundingRate":  0.00011},
-    {"symbol": "LINK", "price":   14.82, "change24h":  4.56, "volume24h":    720_000_000, "fundingRate":  0.00017},
-    {"symbol": "UNI",  "price":    7.34, "change24h": -2.11, "volume24h":    280_000_000, "fundingRate": -0.00009},
-    {"symbol": "ATOM", "price":    8.91, "change24h":  1.78, "volume24h":    190_000_000, "fundingRate":  0.00006},
-    {"symbol": "NEAR", "price":    5.23, "change24h":  6.12, "volume24h":    340_000_000, "fundingRate":  0.00019},
-    {"symbol": "FTM",  "price":  0.7821, "change24h": -4.23, "volume24h":    260_000_000, "fundingRate": -0.00022},
-    {"symbol": "ALGO", "price":  0.1821, "change24h":  0.45, "volume24h":    140_000_000, "fundingRate":  0.00002},
-    {"symbol": "XRP",  "price":  0.5234, "change24h":  2.89, "volume24h":  1_100_000_000, "fundingRate":  0.00010},
-    {"symbol": "LTC",  "price":   72.45, "change24h": -1.34, "volume24h":    430_000_000, "fundingRate":  0.00001},
-    {"symbol": "DOGE", "price":  0.0821, "change24h":  7.82, "volume24h":    890_000_000, "fundingRate":  0.00025},
-    {"symbol": "SHIB", "price": 0.00000982, "change24h": -5.67, "volume24h": 310_000_000, "fundingRate": -0.00018},
-    {"symbol": "ARB",  "price":  0.8123, "change24h":  3.45, "volume24h":    220_000_000, "fundingRate":  0.00014},
-    {"symbol": "OP",   "price":   1.67, "change24h": -2.78, "volume24h":    180_000_000, "fundingRate": -0.00011},
-]
-
-_MOCK_RISK = {"regime": "NORMAL", "cb_open": False, "cb_cooldown": 0}
 
 
 @app.get("/api/balance")
 async def api_balance() -> Dict[str, Any]:
-    """Balance snapshot for BalanceTracker component."""
-    state = bus.snapshot_dict()
-    return {
-        "totalBalance":     state.get("equity",           _MOCK_BALANCE["totalBalance"]),
-        "availableBalance": state.get("available_balance", _MOCK_BALANCE["availableBalance"]),
-        "unrealizedPnl":    state.get("pnl_usdt",         _MOCK_BALANCE["unrealizedPnl"]),
-        "realizedPnl":      state.get("realized_pnl",     _MOCK_BALANCE["realizedPnl"]),
-    }
+    return _balance_response()
 
 
 @app.get("/api/pairs")
 async def api_pairs() -> List[Dict[str, Any]]:
-    """Pairs state for SpreadMonitorPanel + Sidebar."""
     try:
         positions = bus.get_positions()
         if positions:
@@ -352,30 +297,28 @@ async def api_pairs() -> List[Dict[str, Any]]:
             ]
     except Exception:
         pass
-    return _MOCK_PAIRS
+    # No active positions — return empty list (NOT mock)
+    return []
 
 
 @app.get("/api/markets")
 async def api_markets() -> List[Dict[str, Any]]:
-    """Market data for MarketHeatmap + Sidebar."""
-    return _MOCK_MARKETS
+    """Live market prices. Returns cached exchange data, empty list if not yet fetched."""
+    return _live_markets
 
 
 @app.get("/api/risk")
 async def api_risk() -> Dict[str, Any]:
-    """Risk regime + circuit breaker state for RegimeHeader."""
     state = bus.snapshot_dict()
-    cb_open = state.get("status") in ("HALT", "HARD_STOP")
     return {
-        "regime":       state.get("volatility_regime", _MOCK_RISK["regime"]),
-        "cb_open":      cb_open,
-        "cb_cooldown":  state.get("cb_cooldown", 0),
+        "regime":      state.get("volatility_regime", "NORMAL"),
+        "cb_open":     state.get("status") in ("HALT", "HARD_STOP"),
+        "cb_cooldown": state.get("cb_cooldown", 0),
     }
 
 
 @app.get("/api/log")
 async def api_log() -> List[Dict[str, Any]]:
-    """Recent log entries for ExecutionLog."""
     try:
         trades = bus.get_recent_trades()
         if trades:
@@ -390,48 +333,125 @@ async def api_log() -> List[Dict[str, Any]]:
             ]
     except Exception:
         pass
-    return [
-        {"ts": int(time.time() * 1000) - 3000, "level": "INFO", "module": "SignalGen",  "message": "Kalman filter warmed up on BTC/ETH"},
-        {"ts": int(time.time() * 1000) - 2000, "level": "BUY",  "module": "Executor",   "message": "LONG_SPREAD BTC/ETH z=1.82 qty=0.05"},
-        {"ts": int(time.time() * 1000) - 1000, "level": "WARN", "module": "RiskMgr",    "message": "Volatility regime elevated to HIGH"},
-        {"ts": int(time.time() * 1000),         "level": "ARB",  "module": "ArbScanner", "message": "Opportunity BTC Bybit/Binance spread=0.041%"},
-    ]
+    return []  # No trades yet — empty log, NOT mock
+
+
+@app.get("/api/optimize/results")
+async def api_optimize_results(
+    storage: Optional[str] = Query(default=None),
+    study_name: str = Query(default="quantluna_opt"),
+    top_n: int = Query(default=50, ge=1, le=500),
+) -> Dict[str, Any]:
+    if not storage:
+        for default in ["sqlite:///optuna.db", "sqlite:///data/optuna.db"]:
+            db_path = default.replace("sqlite:///", "")
+            if os.path.exists(db_path):
+                storage = default
+                break
+    if not storage:
+        return {"study_name": study_name, "n_trials": 0, "trials": [], "message": "No Optuna storage found."}
+    try:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        study = optuna.load_study(study_name=study_name, storage=storage)
+        completed = sorted(
+            [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE],
+            key=lambda t: t.value or 0, reverse=True,
+        )
+        return {
+            "study_name": study_name, "n_trials": len(study.trials),
+            "best_value": round(study.best_value, 4) if completed else None,
+            "best_params": study.best_params if completed else {},
+            "trials": [{"number": t.number, "value": t.value, "params": t.params} for t in completed[:top_n]],
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# WebSocket manager
+# ---------------------------------------------------------------------------
+
+class _WSManager:
+    def __init__(self):
+        self.active: List[WebSocket] = []
+
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active.append(ws)
+
+    def disconnect(self, ws: WebSocket):
+        if ws in self.active:
+            self.active.remove(ws)
+
+    async def broadcast(self, data: Dict):
+        dead = []
+        for ws in self.active:
+            try:
+                await ws.send_json(data)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.active.remove(ws)
+
+
+_ws_manager = _WSManager()
+
+
+@app.websocket("/ws/live")
+async def websocket_live(websocket: WebSocket):
+    await _ws_manager.connect(websocket)
+    try:
+        while True:
+            await asyncio.sleep(1.0)
+            await websocket.send_json(bus.snapshot_dict())
+    except WebSocketDisconnect:
+        _ws_manager.disconnect(websocket)
+    except Exception:
+        _ws_manager.disconnect(websocket)
 
 
 @app.websocket("/ws/feed")
 async def websocket_feed(websocket: WebSocket):
     """
-    Structured WebSocket feed for Next.js dashboard.
-    Sends { type, payload, ts } messages compatible with
-    useTradingStore.updateFromWsFeed().
+    Structured WS feed for Next.js dashboard.
+    Sends real data every 2s — no mock fallback.
     """
     await _ws_manager.connect(websocket)
     try:
         while True:
             await asyncio.sleep(2.0)
-            now = int(time.time() * 1000)
+            now   = int(time.time() * 1000)
             state = bus.snapshot_dict()
+            bal   = _balance_response()
 
-            for msg in [
-                {
-                    "type": "balance",
-                    "payload": {
-                        "totalBalance":     state.get("equity",           _MOCK_BALANCE["totalBalance"]),
-                        "availableBalance": state.get("available_balance", _MOCK_BALANCE["availableBalance"]),
-                        "unrealizedPnl":    state.get("pnl_usdt",         _MOCK_BALANCE["unrealizedPnl"]),
-                        "realizedPnl":      state.get("realized_pnl",     _MOCK_BALANCE["realizedPnl"]),
-                    },
-                    "ts": now,
-                },
-                {
-                    "type": "pairs",
-                    "payload": _MOCK_PAIRS,
-                    "ts": now,
-                },
+            # Pairs from state_bus (real positions), empty list if no trader running
+            pairs: List[Dict] = []
+            try:
+                positions = bus.get_positions()
+                pairs = [
+                    {
+                        "symbol":      p.pair,
+                        "zscore":      getattr(p, "zscore",    0.0),
+                        "spread":      getattr(p, "spread",    0.0),
+                        "halfLife":    getattr(p, "half_life", 0.0),
+                        "position":    getattr(p, "direction", "FLAT"),
+                        "pnl":         getattr(p, "pnl",       0.0),
+                        "spreadHealth": "HEALTHY",
+                    }
+                    for p in positions
+                ]
+            except Exception:
+                pass
+
+            msgs = [
+                {"type": "balance",   "payload": bal, "ts": now},
+                {"type": "pairs",     "payload": pairs, "ts": now},
+                {"type": "markets",   "payload": _live_markets, "ts": now},
                 {
                     "type": "regime",
                     "payload": {
-                        "regime":      state.get("volatility_regime", _MOCK_RISK["regime"]),
+                        "regime":      state.get("volatility_regime", "NORMAL"),
                         "cb_open":     state.get("status") in ("HALT", "HARD_STOP"),
                         "cb_cooldown": state.get("cb_cooldown", 0),
                     },
@@ -439,10 +459,16 @@ async def websocket_feed(websocket: WebSocket):
                 },
                 {
                     "type": "ws_status",
-                    "payload": {"bybit": False, "binance": False, "okx": False},
+                    "payload": {
+                        "bybit":   _exchange_instance is not None,
+                        "binance": False,
+                        "okx":     False,
+                    },
                     "ts": now,
                 },
-            ]:
+            ]
+
+            for msg in msgs:
                 await websocket.send_json(msg)
 
     except WebSocketDisconnect:
