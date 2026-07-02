@@ -2,24 +2,205 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ── Google Fonts fallback ── */
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap');
+
 :root {
-  color-scheme: dark;
+  --bg:      #08080F;
+  --panel:   #0D0D1A;
+  --border:  #1A1A3E;
+  --green:   #00FF88;
+  --magenta: #FF00AA;
+  --blue:    #0088FF;
+  --yellow:  #FFAA00;
+  --red:     #FF2244;
+  --text:    #E0E0F0;
+  --text2:   #666688;
+  --violet:  #8844FF;
+  --orange:  #FF6600;
 }
 
-body {
-  background-color: #0f172a;
-  color: #f1f5f9;
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+* {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+  box-sizing: border-box;
 }
 
-/* Scrollbar dark */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  height: 100vh;
+  width: 100vw;
 }
-::-webkit-scrollbar-track  { background: #1e293b; }
-::-webkit-scrollbar-thumb  { background: #334155; border-radius: 3px; }
-::-webkit-scrollbar-thumb:hover { background: #475569; }
 
-/* Recharts override */
-.recharts-default-tooltip { border-radius: 8px !important; }
+/* ── Scan-line overlay ── */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 9999;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.03) 2px,
+    rgba(0, 0, 0, 0.03) 4px
+  );
+}
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: var(--bg); }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--blue); }
+
+/* ── Panel ── */
+.ql-panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.ql-panel-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  color: var(--green);
+  padding: 4px 10px;
+  background: linear-gradient(90deg, rgba(0,255,136,0.1) 0%, transparent 100%);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+/* ── Glow effects ── */
+.glow-green {
+  text-shadow: 0 0 10px var(--green), 0 0 20px rgba(0,255,136,0.5);
+}
+.glow-red   { text-shadow: 0 0 10px var(--red); }
+.glow-blue  { text-shadow: 0 0 10px var(--blue); }
+.glow-magenta { text-shadow: 0 0 10px var(--magenta); }
+
+.glow-box-green {
+  box-shadow: 0 0 8px rgba(0,255,136,0.4), inset 0 0 8px rgba(0,255,136,0.05);
+}
+.glow-box-red {
+  box-shadow: 0 0 8px rgba(255,34,68,0.4), inset 0 0 8px rgba(255,34,68,0.05);
+}
+.glow-box-magenta {
+  box-shadow: 0 0 8px rgba(255,0,170,0.5), inset 0 0 8px rgba(255,0,170,0.08);
+}
+
+/* ── Animations ── */
+@keyframes pulse-border-green {
+  0%, 100% { border-color: rgba(0,255,136,0.25); }
+  50%       { border-color: rgba(0,255,136,0.85); }
+}
+@keyframes pulse-border-red {
+  0%, 100% { border-color: rgba(255,34,68,0.25); }
+  50%       { border-color: rgba(255,34,68,0.85); }
+}
+@keyframes arb-pulse {
+  0%, 100% { background-color: rgba(255,0,170,0.04); }
+  50%       { background-color: rgba(255,0,170,0.18); }
+}
+@keyframes flash-green {
+  0%   { background-color: rgba(0,255,136,0.12); }
+  100% { background-color: transparent; }
+}
+@keyframes flash-red {
+  0%   { background-color: rgba(255,34,68,0.12); }
+  100% { background-color: transparent; }
+}
+@keyframes extreme-pulse {
+  0%, 100% { color: var(--red); opacity: 1; }
+  50%       { color: #ff6688; opacity: 0.7; }
+}
+@keyframes ttl-shrink {
+  from { width: 100%; }
+  to   { width: 0%; }
+}
+@keyframes fade-in-row {
+  from { opacity: 0; transform: translateX(-4px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+
+.pos-open-long  { animation: pulse-border-green 2s ease-in-out infinite; border: 1px solid; }
+.pos-open-short { animation: pulse-border-red   2s ease-in-out infinite; border: 1px solid; }
+.arb-hot        { animation: arb-pulse 1s ease-in-out infinite; }
+.flash-profit   { animation: flash-green 0.6s ease-out; }
+.flash-loss     { animation: flash-red   0.6s ease-out; }
+.regime-extreme { animation: extreme-pulse 0.8s ease-in-out infinite; }
+.log-row-enter  { animation: fade-in-row 0.2s ease-out; }
+
+/* ── Monospace numbers ── */
+.mono { font-variant-numeric: tabular-nums; letter-spacing: 0.02em; }
+
+/* ── Table base ── */
+.ql-table { width: 100%; border-collapse: collapse; font-size: 10px; }
+.ql-table th {
+  background: #0A0A14;
+  color: var(--text2);
+  font-size: 9px;
+  letter-spacing: 1px;
+  padding: 3px 8px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+.ql-table td {
+  padding: 3px 8px;
+  border-bottom: 1px solid rgba(26,26,62,0.5);
+  white-space: nowrap;
+}
+.ql-table tr:hover td { background: rgba(0,136,255,0.06); }
+
+/* ── Button base ── */
+.ql-btn {
+  background: var(--border);
+  border: 1px solid var(--blue);
+  border-radius: 3px;
+  color: var(--text);
+  font-size: 9px;
+  padding: 3px 10px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.ql-btn:hover { background: rgba(0,136,255,0.2); }
+.ql-btn-green {
+  border-color: var(--green);
+  color: var(--green);
+}
+.ql-btn-green:hover { background: rgba(0,255,136,0.15); }
+.ql-btn-red {
+  border-color: var(--red);
+  color: var(--red);
+}
+.ql-btn-red:hover { background: rgba(255,34,68,0.15); }
+
+/* ── Input ── */
+.ql-input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  font-size: 10px;
+  padding: 3px 8px;
+  outline: none;
+}
+.ql-input:focus { border-color: var(--blue); }
+
+/* ── Health orb ── */
+.orb {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+.orb-green   { background: var(--green);   box-shadow: 0 0 6px var(--green); }
+.orb-red     { background: var(--red);     box-shadow: 0 0 6px var(--red); }
+.orb-yellow  { background: var(--yellow);  box-shadow: 0 0 6px var(--yellow); }
+.orb-offline { background: #333355; }
