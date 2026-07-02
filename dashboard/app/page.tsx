@@ -13,9 +13,10 @@ import { formatPrice, formatPercent } from '../lib/formatters'
 import type { WsMessage } from '../types'
 
 export default function DashboardPage() {
-  const updateFromWsFeed = useTradingStore((s) => s.updateFromWsFeed)
-  const pairs            = useTradingStore((s) => s.pairs)
-  const markets          = useTradingStore((s) => s.markets)
+  const updateFromWsFeed  = useTradingStore((s) => s.updateFromWsFeed)
+  const hydrateFromRest   = useTradingStore((s) => s.hydrateFromRest)
+  const pairs             = useTradingStore((s) => s.pairs)
+  const markets           = useTradingStore((s) => s.markets)
 
   const handleWsMessage = useCallback(
     (msg: WsMessage) => updateFromWsFeed(msg),
@@ -45,22 +46,13 @@ export default function DashboardPage() {
     return () => window.removeEventListener('keydown', handler)
   }, [])
 
-  // REST hydration on mount
+  // REST hydration on mount — immediate + retry after 4s
+  // (exchange init via ccxt can take 2-3s on first startup)
   useEffect(() => {
-    const BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
-    ;[
-      { url: `${BASE}/api/balance`, type: 'balance' },
-      { url: `${BASE}/api/pairs`,   type: 'pairs'   },
-      { url: `${BASE}/api/markets`, type: 'markets' },
-      { url: `${BASE}/api/risk`,    type: 'regime'  },
-      { url: `${BASE}/api/log`,     type: 'log'     },
-    ].forEach(({ url, type }) => {
-      fetch(url)
-        .then((r) => r.json())
-        .then((payload) => updateFromWsFeed({ type, payload, ts: Date.now() }))
-        .catch(() => {/* server offline — mock data stays */})
-    })
-  }, [updateFromWsFeed])
+    hydrateFromRest()
+    const t = setTimeout(() => hydrateFromRest(), 4000)
+    return () => clearTimeout(t)
+  }, [hydrateFromRest])
 
   return (
     <div
@@ -82,6 +74,9 @@ export default function DashboardPage() {
         className="flex flex-col gap-2 overflow-y-auto border-r border-bg-border p-2 focus:outline-none"
       >
         <p className="px-1 font-mono text-[10px] uppercase tracking-widest text-text-muted">Pairs</p>
+        {pairs.length === 0 && (
+          <p className="px-3 py-2 font-mono text-[10px] text-text-muted italic">No active positions</p>
+        )}
         {pairs.map((p) => (
           <div key={p.symbol} className="rounded border border-bg-border bg-bg-panel px-3 py-2">
             <div className="flex items-center justify-between">
@@ -101,6 +96,9 @@ export default function DashboardPage() {
         ))}
 
         <p className="mt-2 px-1 font-mono text-[10px] uppercase tracking-widest text-text-muted">Markets</p>
+        {markets.length === 0 && (
+          <p className="px-3 py-1 font-mono text-[10px] text-text-muted italic">Loading…</p>
+        )}
         {markets.slice(0, 15).map((m) => (
           <div key={m.symbol} className="flex items-center justify-between px-3 py-1 rounded border border-bg-border bg-bg-panel">
             <span className="font-mono text-[10px] text-text-primary font-semibold">{m.symbol}</span>
