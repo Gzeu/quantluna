@@ -17,11 +17,13 @@ Changes v4 (P0+P1 improvements):
   P1-1: Dynamic cooldown bazat pe half-life
         cooldown_bars = clamp(ceil(hl * factor), cooldown_min, cooldown_max)
         Efect: perechile cu mean-reversion rapid primesc cooldown mai scurt
+        FIX: half_life pasat corect la toate apelurile _exit() din _compute_signal
 
   P1-2: Partial exit la z=0 (configurable)
         La prima traversare a z prin zero, inchide partial_exit_pct% din pozitie
         Restul se inchide la zscore_exit normal
         Efect: realizeaza profit partial chiar daca reversalul e incomplet
+        FIX: eliminat bars_in_trade += 1 din blocul PARTIAL_EXIT (off-by-one)
 
   P1-3: Rolling cointegration re-test hook
         generate_live() accepta `coint_valid: bool` — daca False, blocheaza entry
@@ -153,6 +155,11 @@ class SignalGenerator:
         # P1-2: partial exit state
         self._partial_exit_done: bool = False  # True = partial exit executat in trade curent
         self._entry_side: int = 0              # +1 LONG_SPREAD, -1 SHORT_SPREAD
+
+        # signal_summary v4 cache — updated each bar
+        self._last_vol_rank: float = 0.0
+        self._last_effective_threshold: float = self.cfg.zscore_entry
+        self._last_dz_blocked: bool = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -307,15 +314,21 @@ class SignalGenerator:
         )
 
     def signal_summary(self) -> Dict:
-        """Return current internal state as dict — useful for live dashboard."""
+        """Return current internal state as dict — useful for live dashboard.
+        Includes v4 fields: vol_rank, effective_threshold, dz_blocked.
+        """
         return {
-            "in_trade":            self._in_trade,
-            "current_signal":      self._current_signal.name,
-            "bars_in_trade":       self._bars_in_trade,
-            "cooldown_remaining":  self._cooldown_remaining,
-            "partial_exit_done":   self._partial_exit_done,
-            "vol_buffer_len":      len(self._vol_buffer),
-            "zscore_buffer_len":   len(self._zscore_buffer),
+            "in_trade":             self._in_trade,
+            "current_signal":       self._current_signal.name,
+            "bars_in_trade":        self._bars_in_trade,
+            "cooldown_remaining":   self._cooldown_remaining,
+            "partial_exit_done":    self._partial_exit_done,
+            "vol_buffer_len":       len(self._vol_buffer),
+            "zscore_buffer_len":    len(self._zscore_buffer),
+            # v4 fields
+            "vol_rank":             round(self._last_vol_rank, 4),
+            "effective_threshold":  round(self._last_effective_threshold, 4),
+            "dz_blocked":           self._last_dz_blocked,
         }
 
     def reset(self) -> None:
@@ -339,6 +352,10 @@ class SignalGenerator:
         Returneaza float in [0, 1]: 0=linistit, 1=agitat.
         """
         if len(self._vol_buffer) < 10:
+            logger.debug(
+                f"vol_buffer insuficient ({len(self._vol_buffer)} < 10) "
+                "— vol_rank=0.0, threshold neajustat"
+            )
             return 0.0  # insuficient istoric → nu ajustam
         buf = list(self._vol_buffer)
         current_vol = buf[-1] if buf else 0.0
@@ -443,10 +460,13 @@ class SignalGenerator:
          13. Hold
         """
         # Pre-calcule pentru meta
-        vol_rank           = self._compute_vol_rank()
+        vol_rank            = self._compute_vol_rank()
         effective_threshold = self._effective_entry_threshold(vol_rank)
-        dz_blocked         = False
-        partial_close_pct  = 0.0
+        partial_close_pct   = 0.0
+
+        # Cache pentru signal_summary()
+        self._last_vol_rank            = vol_rank
+        self._last_effective_threshold = effective_threshold
 
         meta_base = {
             "effective_threshold": effective_threshold,
@@ -457,31 +477,33 @@ class SignalGenerator:
 
         # 1. Uncertainty gate
         if uncertainty > self.cfg.max_uncertainty:
-            sig, conf, reason = self._exit_if_needed("high_uncertainty")
+            sig, conf, reason = self._exit_if_needed("high_uncertainty", half_life)
             return sig, conf, reason, meta_base
 
         # 2. Regime breakdown
         if regime_multiplier <= 0.0:
-            sig, conf, reason = self._exit_if_needed("regime_breakdown")
+            sig, conf, reason = self._exit_if_needed("regime_breakdown", half_life)
             return sig, conf, reason, meta_base
 
         # 3. P1-3: Cointegration stale — blocheaza entry (nu forteaza exit)
         if not coint_valid and not self._in_trade:
             return Signal.EXIT, 0.0, "stale_pair", meta_base
 
-        # 4. Hard stop
+        # 4. Hard stop — FIX: pasat half_life pentru dynamic cooldown corect
         if abs(z) >= self.cfg.zscore_stop:
-            sig, conf, reason = self._exit("hard_stop")
+            sig, conf, reason = self._exit("hard_stop", half_life)
             return sig, conf, reason, meta_base
 
-        # 5. Time stop
+        # 5. Time stop — FIX: pasat half_life pentru dynamic cooldown corect
         if self._in_trade and not math.isnan(half_life):
             time_stop_bars = max(4, math.ceil(2.0 * half_life))
             if self._bars_in_trade > time_stop_bars:
-                sig, conf, reason = self._exit("time_stop")
+                sig, conf, reason = self._exit("time_stop", half_life)
                 return sig, conf, reason, meta_base
 
         # 6. P1-2: Partial exit la z aproape de zero
+        # FIX: eliminat bars_in_trade += 1 din acest bloc (off-by-one)
+        # incrementul ramane exclusiv in step 13 (hold)
         if (
             self.cfg.partial_exit_enabled
             and self._in_trade
@@ -500,13 +522,12 @@ class SignalGenerator:
                     f"z={z:.3f} side={self._entry_side}"
                 )
                 meta = {**meta_base, "partial_close_pct": partial_close_pct}
-                self._bars_in_trade += 1
                 conf = float(np.clip(1.0 - abs(z) / max(self.cfg.zscore_entry, 1e-9), 0.0, 1.0))
                 return Signal.PARTIAL_EXIT, conf, "partial_exit_z0", meta
 
-        # 7. Mean-reversion exit
+        # 7. Mean-reversion exit — FIX: pasat half_life pentru dynamic cooldown corect
         if self._in_trade and abs(z) <= self.cfg.zscore_exit:
-            sig, conf, reason = self._exit("mean_reversion")
+            sig, conf, reason = self._exit("mean_reversion", half_life)
             return sig, conf, reason, meta_base
 
         # 8. Cooldown
@@ -521,6 +542,7 @@ class SignalGenerator:
         # 10 + 11. Entry cu threshold ajustat si delta-z filter
         if not self._in_trade:
             dz_blocked = self._is_dz_blocked(z)
+            self._last_dz_blocked = dz_blocked
             meta_entry = {**meta_base, "dz_blocked": dz_blocked}
 
             if z <= -effective_threshold:
@@ -580,14 +602,16 @@ class SignalGenerator:
         self._bars_in_trade = 0
         self._partial_exit_done = False   # P1-2: reset
         self._entry_side = 0              # P1-2: reset
-        # P1-1: dynamic cooldown
+        # P1-1: dynamic cooldown — half_life pasat corect de la toate call sites
         self._cooldown_remaining = self._dynamic_cooldown(half_life)
         return Signal.EXIT, 1.0, reason
 
-    def _exit_if_needed(self, reason: str) -> Tuple[Signal, float, str]:
+    def _exit_if_needed(
+        self, reason: str, half_life: float = float("nan")
+    ) -> Tuple[Signal, float, str]:
         """Exit only if currently in trade; otherwise block entry without triggering cooldown."""
         if self._in_trade:
-            return self._exit(reason)
+            return self._exit(reason, half_life)
         return Signal.EXIT, 0.0, reason
 
     def _reset_trade_state(self) -> None:
@@ -600,3 +624,6 @@ class SignalGenerator:
         self._vol_buffer.clear()
         self._zscore_buffer.clear()
         self._last_spread_for_vol = None
+        self._last_vol_rank = 0.0
+        self._last_effective_threshold = self.cfg.zscore_entry
+        self._last_dz_blocked = False
