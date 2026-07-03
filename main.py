@@ -49,6 +49,7 @@ Examples:
   python main.py backtest --pair BTCUSDT ETHUSDT --days 365
   python main.py optimize --pair BTCUSDT ETHUSDT --trials 200 --jobs 4
   python main.py dashboard
+  python main.py dashboard --dev
   python main.py health --pair BTCUSDT ETHUSDT --exchange bybit
 """
     )
@@ -94,6 +95,9 @@ Examples:
     dash = sub.add_parser("dashboard", help="Start monitoring dashboard (http://localhost:8000)")
     dash.add_argument("--port", type=int, default=8000)
     dash.add_argument("--host", default="0.0.0.0")
+    # FIX: --reload was previously hardcoded, causing high CPU usage and unexpected
+    # restarts in production. It is now opt-in via --dev flag.
+    dash.add_argument("--dev", action="store_true", help="Enable auto-reload (development only, do NOT use in production)")
 
     # health
     health = sub.add_parser("health", help="Run pre-flight health check")
@@ -124,7 +128,12 @@ def main() -> None:
     args = parse_args()
 
     if args.command == "paper":
-        cmd = [sys.executable, "scripts/run_paper.py", "--pair", *args.pair]
+        # FIX: --exchange is now forwarded to scripts/run_paper.py
+        cmd = [
+            sys.executable, "scripts/run_paper.py",
+            "--pair", *args.pair,
+            "--exchange", args.exchange,
+        ]
         if args.capital:    cmd += ["--capital", str(args.capital)]
         if args.params:     cmd += ["--params", args.params]
         if getattr(args, "telegram_token", ""): cmd += ["--telegram-token", args.telegram_token]
@@ -138,9 +147,11 @@ def main() -> None:
         subprocess.run(cmd, check=True)
 
     elif args.command == "backtest":
+        # FIX: --exchange is now forwarded to scripts/run_backtest.py
         cmd = [
             sys.executable, "scripts/run_backtest.py",
             "--pair", *args.pair,
+            "--exchange", args.exchange,
             "--days", str(args.days),
             "--timeframe", args.timeframe,
             "--capital", str(args.capital),
@@ -161,13 +172,16 @@ def main() -> None:
         subprocess.run(cmd, check=True)
 
     elif args.command == "dashboard":
-        subprocess.run([
+        cmd = [
             sys.executable, "-m", "uvicorn",
             "dashboard.server:app",
             "--host", args.host,
             "--port", str(args.port),
-            "--reload",
-        ], check=True)
+        ]
+        # FIX: --reload is only added when --dev flag is explicitly passed
+        if args.dev:
+            cmd.append("--reload")
+        subprocess.run(cmd, check=True)
 
     elif args.command == "health":
         asyncio.run(cmd_health(args))
