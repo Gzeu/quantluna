@@ -1,48 +1,87 @@
+# QuantLuna .gitignore
+
 # Python
 __pycache__/
 *.py[cod]
+*$py.class
 *.pyo
 *.pyd
 .Python
 build/
 dist/
+develop-eggs/
+.eggs/
 *.egg-info/
 *.egg
-.eggs/
+wheels/
 
 # Virtual environments
-venv/
 .venv/
+venv/
 env/
+ENV/
+.env.bak
+
+# Secrets & credentials — NICIODATA in git!
 .env
+*.pem
+*.key
+*_secret*
+*_credentials*
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Data
-data/raw/
-data/cache/
-*.csv
-*.parquet
+# Data & state — date de piata + stare live
+data/
+state/
+logs/
 *.db
 *.sqlite
-
-# Secrets
-.env
-*.key
-secrets.json
-
-# Logs
-logs/
-*.log
+*.sqlite3
+optuna.db
 
 # Backtest results
-results/
-*.pkl
+backtest_results/
+*.json.bak
+
+# Coverage
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Pytest
+.pytest_cache/
+
+# Mypy
+.mypy_cache/
+
+# Ruff
+.ruff_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
 
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb
+
+# Docker
+.docker/
+
+# Distribution
+SDIST/
+*.tar.gz
+*.whl
+
+# Profiling
+*.prof
+*.lprof
+
+# OS
+.DS_Store
+*.orig
