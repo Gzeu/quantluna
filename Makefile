@@ -1,5 +1,4 @@
 # QuantLuna Makefile
-# Comenzi dev: make install, make test, make lint, make paper, make docker-build
 # Run 'make help' pentru lista completa
 
 .DEFAULT_GOAL := help
@@ -7,18 +6,16 @@ PYTHON       ?= python
 PIP          ?= pip
 UVICORN      ?= uvicorn
 
-# ─── Culori ANSI ─────────────────────────────────────────────────────────────
 BOLD  = \033[1m
 GREEN = \033[32m
 YEL   = \033[33m
 RESET = \033[0m
 
 .PHONY: help install install-dev lint format typecheck test coverage pre-commit \
-        paper live backtest optimize scan health \
-        dashboard docker-build docker-paper docker-live docker-dashboard \
+        paper live backtest optimize scan health dashboard daily-summary \
+        docker-build docker-paper docker-live docker-dashboard \
         clean clean-all
 
-# ─── Help ────────────────────────────────────────────────────────────────────
 help:
 	@echo ""
 	@echo "$(BOLD)QuantLuna — comenzi disponibile$(RESET)"
@@ -28,7 +25,7 @@ help:
 	@echo "  make install-dev     Install dev deps + pre-commit hooks"
 	@echo ""
 	@echo "$(GREEN)Calitate cod:$(RESET)"
-	@echo "  make lint            Ruff check (probleme)"
+	@echo "  make lint            Ruff check"
 	@echo "  make format          Ruff format (fix automat)"
 	@echo "  make typecheck       Mypy type check"
 	@echo "  make pre-commit      Ruleaza toate hook-urile"
@@ -44,6 +41,7 @@ help:
 	@echo "  make optimize        Optuna optimize 150 trials"
 	@echo "  make scan            Scan perechi cointegrate"
 	@echo "  make health          Pre-flight health check"
+	@echo "  make daily-summary   Trimite raport zilnic via NotifierBus"
 	@echo ""
 	@echo "$(GREEN)Dashboard:$(RESET)"
 	@echo "  make dashboard       Start FastAPI dashboard (port 8000)"
@@ -59,7 +57,6 @@ help:
 	@echo "  make clean-all       Sterge tot (include htmlcov, dist)"
 	@echo ""
 
-# ─── Setup ───────────────────────────────────────────────────────────────────
 install:
 	$(PIP) install --upgrade pip
 	$(PIP) install -r requirements.txt
@@ -69,7 +66,6 @@ install-dev: install
 	pre-commit install
 	@echo "$(GREEN)✓ Dev environment gata. pre-commit hooks instalate.$(RESET)"
 
-# ─── Calitate cod ────────────────────────────────────────────────────────────
 lint:
 	ruff check .
 
@@ -83,7 +79,6 @@ typecheck:
 pre-commit:
 	pre-commit run --all-files
 
-# ─── Teste ───────────────────────────────────────────────────────────────────
 test:
 	pytest tests/ -v --tb=short \
 		--ignore=tests/test_live_ws.py \
@@ -97,7 +92,6 @@ coverage:
 		-p no:warnings
 	@echo "$(GREEN)✓ Coverage report: htmlcov/index.html$(RESET)"
 
-# ─── Trading ─────────────────────────────────────────────────────────────────
 paper:
 	$(PYTHON) main.py paper --pair BTCUSDT ETHUSDT --exchange bybit --capital 10000
 
@@ -117,13 +111,14 @@ scan:
 health:
 	$(PYTHON) main.py health --pair BTCUSDT ETHUSDT --exchange bybit
 
-# ─── Dashboard ───────────────────────────────────────────────────────────────
+daily-summary:
+	$(PYTHON) scripts/daily_summary.py --pair BTCUSDT ETHUSDT
+
 dashboard:
 	$(UVICORN) dashboard.server:app --reload --host 0.0.0.0 --port 8000
 
-# ─── Docker ──────────────────────────────────────────────────────────────────
 docker-build:
-	docker build -t quantluna:latest .
+	docker build --target production -t quantluna:latest .
 
 docker-paper:
 	docker compose --profile paper up --build
@@ -134,7 +129,6 @@ docker-live:
 docker-dashboard:
 	docker compose --profile dashboard up --build
 
-# ─── Curatenie ───────────────────────────────────────────────────────────────
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
 	find . -name '*.pyc' -delete 2>/dev/null || true
