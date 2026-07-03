@@ -1,0 +1,23 @@
+# CODEOWNERS — cine aproba modificarile
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Fallback: George Pricop aproba orice modificare
+* @Gzeu
+
+# Core algo — modificari critice
+/core/                     @Gzeu
+/strategy/                 @Gzeu
+/risk/                     @Gzeu
+
+# Execution — ordine reale
+/execution/                @Gzeu
+
+# CI/CD
+/.github/workflows/        @Gzeu
+Dockerfile                 @Gzeu
+docker-compose.yml         @Gzeu
+
+# Dependente
+requirements.txt           @Gzeu
+requirements-dev.txt       @Gzeu
+pyproject.toml             @Gzeu

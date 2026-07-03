@@ -1,52 +1,46 @@
-# QuantLuna — Release Pipeline
-# Sprint 29 | GitHub Actions
-#
-# Trigger: push tag v* (ex: v0.29.0)
-# Jobs:
-#   1. Build Docker image
-#   2. Push la ghcr.io/gzeu/quantluna:tag + :latest
-
 name: Release
 
 on:
   push:
     tags:
-      - "v*"
+      - "v*.*.*"
 
 jobs:
-  docker:
-    name: Docker Build & Push
+  release:
+    name: Create GitHub Release
     runs-on: ubuntu-latest
     permissions:
-      contents: read
-      packages: write
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
-
-      - name: Docker meta
-        id: meta
-        uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/gzeu/quantluna
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest
+          fetch-depth: 0
 
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
-      - name: Build and push
-        uses: docker/build-push-action@v5
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          # Extrage sectiunea din CHANGELOG.md pentru versiunea curenta
+          awk "/^## \\[$VERSION\\]/,/^## \\[/" CHANGELOG.md | head -n -1 > release_notes.md
+          echo "NOTES_FILE=release_notes.md" >> $GITHUB_OUTPUT
+
+      - name: Build distributable
+        run: |
+          pip install build
+          python -m build
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          name: "QuantLuna ${{ steps.version.outputs.VERSION }}"
+          body_path: release_notes.md
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.VERSION, 'alpha') || contains(steps.version.outputs.VERSION, 'beta') || contains(steps.version.outputs.VERSION, 'rc') }}
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

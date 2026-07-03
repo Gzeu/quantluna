@@ -1,118 +1,147 @@
-# QuantLuna — Developer Makefile
-# Usage: make <target>
-# Requires: Python 3.10+, pip, docker, docker-compose
+# QuantLuna Makefile
+# Comenzi dev: make install, make test, make lint, make paper, make docker-build
+# Run 'make help' pentru lista completa
 
-.PHONY: help install test lint format typecheck clean docker-build \
-        paper live backtest scan coverage pre-commit
+.DEFAULT_GOAL := help
+PYTHON       ?= python
+PIP          ?= pip
+UVICORN      ?= uvicorn
 
-PY     ?= python
-PIP    ?= pip
-RUFF   ?= ruff
-MYPY   ?= mypy
-DOCKER ?= docker
+# ─── Culori ANSI ─────────────────────────────────────────────────────────────
+BOLD  = \033[1m
+GREEN = \033[32m
+YEL   = \033[33m
+RESET = \033[0m
 
-help:  ## Show this help
-	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) | \
-	 awk 'BEGIN {FS = ":.*##"}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'
+.PHONY: help install install-dev lint format typecheck test coverage pre-commit \
+        paper live backtest optimize scan health \
+        dashboard docker-build docker-paper docker-live docker-dashboard \
+        clean clean-all
 
-# -----------------------------------------------------------------------
-# Dev setup
-# -----------------------------------------------------------------------
+# ─── Help ────────────────────────────────────────────────────────────────────
+help:
+	@echo ""
+	@echo "$(BOLD)QuantLuna — comenzi disponibile$(RESET)"
+	@echo ""
+	@echo "$(GREEN)Setup:$(RESET)"
+	@echo "  make install         Install dependente productie"
+	@echo "  make install-dev     Install dev deps + pre-commit hooks"
+	@echo ""
+	@echo "$(GREEN)Calitate cod:$(RESET)"
+	@echo "  make lint            Ruff check (probleme)"
+	@echo "  make format          Ruff format (fix automat)"
+	@echo "  make typecheck       Mypy type check"
+	@echo "  make pre-commit      Ruleaza toate hook-urile"
+	@echo ""
+	@echo "$(GREEN)Teste:$(RESET)"
+	@echo "  make test            Pytest all (exclude live/ws)"
+	@echo "  make coverage        Pytest + coverage HTML report"
+	@echo ""
+	@echo "$(GREEN)Trading:$(RESET)"
+	@echo "  make paper           Paper trading BTCUSDT/ETHUSDT bybit"
+	@echo "  make live            Live trading (confirmare necesara)"
+	@echo "  make backtest        Backtest 365 zile BTCUSDT/ETHUSDT"
+	@echo "  make optimize        Optuna optimize 150 trials"
+	@echo "  make scan            Scan perechi cointegrate"
+	@echo "  make health          Pre-flight health check"
+	@echo ""
+	@echo "$(GREEN)Dashboard:$(RESET)"
+	@echo "  make dashboard       Start FastAPI dashboard (port 8000)"
+	@echo ""
+	@echo "$(GREEN)Docker:$(RESET)"
+	@echo "  make docker-build    Build imagine Docker"
+	@echo "  make docker-paper    Paper trader in container"
+	@echo "  make docker-live     Live trader in container"
+	@echo "  make docker-dashboard Dashboard in container"
+	@echo ""
+	@echo "$(GREEN)Curatenie:$(RESET)"
+	@echo "  make clean           Sterge cache-uri Python"
+	@echo "  make clean-all       Sterge tot (include htmlcov, dist)"
+	@echo ""
 
-install:  ## Install all dependencies
+# ─── Setup ───────────────────────────────────────────────────────────────────
+install:
 	$(PIP) install --upgrade pip
 	$(PIP) install -r requirements.txt
 
-install-dev: install  ## Install + dev tools (pre-commit, mypy, ruff)
-	$(PIP) install pre-commit mypy ruff
+install-dev: install
+	$(PIP) install -r requirements-dev.txt
 	pre-commit install
+	@echo "$(GREEN)✓ Dev environment gata. pre-commit hooks instalate.$(RESET)"
 
-# -----------------------------------------------------------------------
-# Tests
-# -----------------------------------------------------------------------
+# ─── Calitate cod ────────────────────────────────────────────────────────────
+lint:
+	ruff check .
 
-test:  ## Run unit tests (excludes live WS tests)
-	$(PY) -m pytest tests/ -v --tb=short \
-	  --ignore=tests/test_live_ws.py \
-	  --ignore=tests/test_live_trader.py \
-	  -p no:warnings
+format:
+	ruff format .
+	ruff check --fix .
 
-coverage:  ## Run tests + coverage report
-	$(PY) -m coverage run -m pytest tests/ \
-	  --ignore=tests/test_live_ws.py \
-	  --ignore=tests/test_live_trader.py -q
-	$(PY) -m coverage report --fail-under=60
-	$(PY) -m coverage html -d htmlcov
-	@echo "Coverage HTML: htmlcov/index.html"
+typecheck:
+	mypy core/ risk/ execution/ strategy/ notifications/ --ignore-missing-imports --no-strict-optional
 
-test-all:  ## Run ALL tests including live (requires live env)
-	$(PY) -m pytest tests/ -v --tb=short
-
-# -----------------------------------------------------------------------
-# Code quality
-# -----------------------------------------------------------------------
-
-lint:  ## Run ruff linter
-	$(RUFF) check .
-
-format:  ## Auto-format with ruff
-	$(RUFF) format .
-
-format-check:  ## Check formatting without modifying files
-	$(RUFF) format --check .
-
-typecheck:  ## Run mypy type checks on core packages
-	$(MYPY) core/ risk/ execution/ strategy/ \
-	  --ignore-missing-imports --no-strict-optional --warn-unused-ignores --pretty \
-	  || true
-
-pre-commit:  ## Run pre-commit on all files
+pre-commit:
 	pre-commit run --all-files
 
-# -----------------------------------------------------------------------
-# Trading commands (local)
-# -----------------------------------------------------------------------
+# ─── Teste ───────────────────────────────────────────────────────────────────
+test:
+	pytest tests/ -v --tb=short \
+		--ignore=tests/test_live_ws.py \
+		--ignore=tests/test_live_trader.py \
+		-p no:warnings
 
-PAIR ?= BTCUSDT ETHUSDT
-EXCHANGE ?= bybit
+coverage:
+	pytest tests/ --cov=. --cov-report=html --cov-report=term-missing \
+		--ignore=tests/test_live_ws.py \
+		--ignore=tests/test_live_trader.py \
+		-p no:warnings
+	@echo "$(GREEN)✓ Coverage report: htmlcov/index.html$(RESET)"
 
-paper:  ## Run paper trader locally
-	$(PY) main.py paper --pair $(PAIR) --exchange $(EXCHANGE)
+# ─── Trading ─────────────────────────────────────────────────────────────────
+paper:
+	$(PYTHON) main.py paper --pair BTCUSDT ETHUSDT --exchange bybit --capital 10000
 
-live:  ## Run live trader locally (requires confirmation)
-	$(PY) main.py live --pair $(PAIR) --exchange $(EXCHANGE)
+live:
+	@echo "$(YEL)ATENTIE: live trading cu bani reali!$(RESET)"
+	$(PYTHON) main.py live --pair BTCUSDT ETHUSDT --exchange bybit
 
-backtest:  ## Run backtest (30 days, 1h)
-	$(PY) main.py backtest --pair $(PAIR) --exchange $(EXCHANGE) --days 30 --timeframe 1h
+backtest:
+	$(PYTHON) main.py backtest --pair BTCUSDT ETHUSDT --days 365 --timeframe 1h
 
-scan:  ## Scan top pairs
-	$(PY) main.py scan --exchange $(EXCHANGE) --top 20
+optimize:
+	$(PYTHON) main.py optimize --pair BTCUSDT ETHUSDT --trials 150 --objective sharpe
 
-# -----------------------------------------------------------------------
-# Docker
-# -----------------------------------------------------------------------
+scan:
+	$(PYTHON) scripts/scan_pairs.py --exchange bybit --top 20
 
-docker-build:  ## Build Docker image
-	$(DOCKER) build -t quantluna:latest .
+health:
+	$(PYTHON) main.py health --pair BTCUSDT ETHUSDT --exchange bybit
 
-docker-paper:  ## Run paper trader in Docker
-	docker-compose up paper
+# ─── Dashboard ───────────────────────────────────────────────────────────────
+dashboard:
+	$(UVICORN) dashboard.server:app --reload --host 0.0.0.0 --port 8000
 
-docker-live:  ## Run live trader in Docker (with profile)
-	docker-compose --profile live up live
+# ─── Docker ──────────────────────────────────────────────────────────────────
+docker-build:
+	docker build -t quantluna:latest .
 
-docker-dashboard:  ## Run dashboard in Docker
-	docker-compose up dashboard
+docker-paper:
+	docker compose --profile paper up --build
 
-docker-clean:  ## Remove all QuantLuna Docker containers
-	$(DOCKER) rm -f quantluna_paper quantluna_live quantluna_dashboard 2>/dev/null || true
+docker-live:
+	docker compose --profile live up --build
 
-# -----------------------------------------------------------------------
-# Cleanup
-# -----------------------------------------------------------------------
+docker-dashboard:
+	docker compose --profile dashboard up --build
 
-clean:  ## Remove cache, build artifacts, coverage
+# ─── Curatenie ───────────────────────────────────────────────────────────────
+clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	find . -name '*.pyc' -delete
-	rm -rf .pytest_cache .mypy_cache htmlcov .coverage coverage.xml dist build
-	@echo "Cleaned."
+	find . -name '*.pyc' -delete 2>/dev/null || true
+	find . -name '*.pyo' -delete 2>/dev/null || true
+	rm -rf .pytest_cache .mypy_cache .ruff_cache
+	@echo "$(GREEN)✓ Cache-uri sterse.$(RESET)"
+
+clean-all: clean
+	rm -rf htmlcov .coverage coverage.xml dist build *.egg-info
+	@echo "$(GREEN)✓ Curatenie completa.$(RESET)"
