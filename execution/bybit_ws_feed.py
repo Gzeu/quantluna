@@ -1,85 +1,96 @@
 """
 QuantLuna — BybitWsFeed
-Sprint 27
+Sprint 27 + July 2026 improvements
 
 WebSocket feed via pybit v5 — kline + orderbook subscriptions.
-Drop-in replacement pentru BinanceWsFeed din perspectiva LiveTrader.
 
-Features:
-  - kline.{interval}.{symbol} subscription — on_bar callback
-  - orderbook.1.{symbol} subscription — on_orderbook callback
-  - Auto-reconnect la disconnect (max 5 încercări, backoff exp)
-  - Watchdog: alert dacă nu s-a primit niciun mesaj în > stale_s secunde
-  - Suport testnet
+Improvements (July 2026):
+  - on_bar / on_orderbook callbacks can now be async coroutines
+  - Reconnect uses jitter (±20%%) to avoid thundering-herd on mass restart
+  - Dead-feed detection: if is_dead fires twice consecutively, force WS reconnect
+    (previously the watchdog only logged; the feed stayed silently dead)
+  - stream_bars() async generator for use in BybitLiveRunner
+    (avoids callback-based push, simplifies runner loop)
+  - MAX_RECONNECT bumped from 5 to configurable via ws_max_reconnects param
+  - Separate queue per subscription (kline vs orderbook) to prevent cross-topic drop
 
 Env vars:
   BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET, BYBIT_CATEGORY
 
 Usage:
-    from execution.bybit_ws_feed import BybitWsFeed
+    # Callback style (legacy):
+    feed = BybitWsFeed(symbol="BTCUSDT", interval="1", on_bar=handle_bar)
+    await feed.start()
 
-    def on_bar(msg: dict):
-        close = float(msg["data"][0]["close"])
-        ...
-
-    feed = BybitWsFeed(symbol="BTCUSDT", interval="1", on_bar=on_bar)
-    await feed.start()   # non-blocking, runs in background task
-    await feed.stop()
+    # Generator style (preferred in BybitLiveRunner):
+    async for bar in feed.stream_bars():
+        process(bar)
 """
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
+import random
 import time
-from typing import Callable, Optional
+from typing import AsyncIterator, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-_MAX_RECONNECT   = 5
-_RECONNECT_BASE  = 1.0   # seconds
-_WATCHDOG_STALE  = 30.0  # seconds without message = stale
-_WATCHDOG_DEAD   = 60.0  # seconds without message = dead
+_RECONNECT_BASE  = 1.0    # seconds
+_RECONNECT_MAX   = 30.0   # seconds cap
+_WATCHDOG_STALE  = 30.0   # seconds without message = stale
+_WATCHDOG_DEAD   = 60.0   # seconds without message = dead (triggers forced reconnect)
+_DEAD_RECONNECT_THRESHOLD = 2  # consecutive dead checks before forced reconnect
 
 
 class BybitWsFeed:
     """
-    Async WebSocket feed pentru Bybit v5.
-    Rulează în background asyncio task.
+    Async WebSocket feed for Bybit v5.
+    Runs in background asyncio task; exposes stream_bars() generator.
     """
 
     def __init__(
         self,
-        symbol:        str,
-        interval:      str = "1",         # "1","3","5","15","60","D"
-        category:      str = "",
-        on_bar:        Optional[Callable] = None,
-        on_orderbook:  Optional[Callable] = None,
-        testnet:       bool = False,
-        api_key:       str  = "",
-        api_secret:    str  = "",
+        symbol:          str,
+        interval:        str = "1",
+        category:        str = "",
+        on_bar:          Optional[Callable] = None,
+        on_orderbook:    Optional[Callable] = None,
+        testnet:         bool = False,
+        api_key:         str  = "",
+        api_secret:      str  = "",
+        ws_max_reconnects: int = 20,
     ) -> None:
-        self.symbol       = symbol
-        self.interval     = interval
-        self.category     = category or os.getenv("BYBIT_CATEGORY", "linear")
-        self.on_bar       = on_bar
-        self.on_orderbook = on_orderbook
-        self.testnet      = testnet or os.getenv("BYBIT_TESTNET", "false").lower() == "true"
-        self.api_key      = api_key      or os.getenv("BYBIT_API_KEY",    "")
-        self.api_secret   = api_secret   or os.getenv("BYBIT_API_SECRET", "")
+        self.symbol           = symbol
+        self.interval         = interval
+        self.category         = category or os.getenv("BYBIT_CATEGORY", "linear")
+        self.on_bar           = on_bar
+        self.on_orderbook     = on_orderbook
+        self.testnet          = testnet or os.getenv("BYBIT_TESTNET", "false").lower() == "true"
+        self.api_key          = api_key      or os.getenv("BYBIT_API_KEY",    "")
+        self.api_secret       = api_secret   or os.getenv("BYBIT_API_SECRET", "")
+        self.ws_max_reconnects = ws_max_reconnects
 
-        self._task:       Optional[asyncio.Task] = None
-        self._running:    bool  = False
-        self._last_msg_ts: float = 0.0
+        self._task:            Optional[asyncio.Task] = None
+        self._running:         bool  = False
+        self._last_msg_ts:     float = 0.0
+        self._dead_count:      int   = 0
+
+        # Separate queues for kline bars and orderbook updates
+        self._bar_queue:   asyncio.Queue = asyncio.Queue(maxsize=500)
+        self._ob_queue:    asyncio.Queue = asyncio.Queue(maxsize=500)
 
     async def start(self) -> None:
-        """Start background WebSocket listener."""
         self._running = True
         self._task    = asyncio.create_task(self._run_loop())
-        logger.info(f"BybitWsFeed started: {self.symbol} {self.interval} (testnet={self.testnet})")
+        logger.info(
+            f"BybitWsFeed started: {self.symbol} interval={self.interval} "
+            f"testnet={self.testnet} category={self.category}"
+        )
 
     async def stop(self) -> None:
-        """Stop feed gracefully."""
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
@@ -104,81 +115,141 @@ class BybitWsFeed:
         return self.last_msg_age_s > _WATCHDOG_DEAD
 
     # ------------------------------------------------------------------
+    # Public: async generator (preferred usage in BybitLiveRunner)
+    # ------------------------------------------------------------------
+
+    async def stream_bars(self) -> AsyncIterator[dict]:
+        """
+        Async generator that yields closed kline bar dicts.
+        Usage:
+            async for bar in feed.stream_bars():
+                # bar = {"symbol": ..., "close": ..., "volume": ..., "ts": ...}
+        Blocks until feed is stopped.
+        """
+        if not self._running:
+            await self.start()
+        while self._running:
+            try:
+                bar = await asyncio.wait_for(self._bar_queue.get(), timeout=5.0)
+                yield bar
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                return
+
+    # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
 
     async def _run_loop(self) -> None:
-        """Main reconnect loop."""
+        """Main reconnect loop with jitter to avoid thundering herd."""
         reconnect_count = 0
         delay = _RECONNECT_BASE
-        while self._running and reconnect_count <= _MAX_RECONNECT:
+        while self._running and reconnect_count <= self.ws_max_reconnects:
             try:
                 await self._connect_and_listen()
-                delay = _RECONNECT_BASE  # reset on clean disconnect
+                delay = _RECONNECT_BASE
                 reconnect_count = 0
+                self._dead_count = 0
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 reconnect_count += 1
                 logger.warning(
-                    f"BybitWsFeed {self.symbol}: error (attempt {reconnect_count}/{_MAX_RECONNECT}): {e}"
+                    f"BybitWsFeed {self.symbol}: error "
+                    f"(attempt {reconnect_count}/{self.ws_max_reconnects}): {e}"
                 )
-                if reconnect_count > _MAX_RECONNECT:
-                    logger.error(f"BybitWsFeed {self.symbol}: max reconnects reached, stopping")
+                if reconnect_count > self.ws_max_reconnects:
+                    logger.error(
+                        f"BybitWsFeed {self.symbol}: max reconnects reached, stopping"
+                    )
                     break
-                await asyncio.sleep(delay)
-                delay = min(delay * 2, 30.0)
+                # Jitter: ±20% of delay to spread reconnects across instances
+                jitter  = delay * 0.2 * (random.random() * 2 - 1)
+                wait    = max(0.5, min(delay + jitter, _RECONNECT_MAX))
+                logger.debug(f"BybitWsFeed {self.symbol}: reconnect in {wait:.1f}s")
+                await asyncio.sleep(wait)
+                delay   = min(delay * 2, _RECONNECT_MAX)
 
     async def _connect_and_listen(self) -> None:
-        """Connect to Bybit WebSocket and process messages."""
-        import threading
+        """Connect to Bybit WebSocket and forward messages to queues."""
         from pybit.unified_trading import WebSocket
 
-        loop     = asyncio.get_event_loop()
-        msg_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        loop = asyncio.get_event_loop()
 
-        def _handle_message(msg: dict) -> None:
+        def _enqueue(q: asyncio.Queue, msg: dict) -> None:
             self._last_msg_ts = time.time()
+            self._dead_count  = 0
             try:
-                loop.call_soon_threadsafe(msg_queue.put_nowait, msg)
-            except Exception:
-                pass
+                loop.call_soon_threadsafe(q.put_nowait, msg)
+            except asyncio.QueueFull:
+                logger.debug(f"BybitWsFeed {self.symbol}: queue full, dropping message")
 
         ws = WebSocket(
             testnet=self.testnet,
             channel_type=self.category,
         )
 
-        # Subscribe
-        topic_kline     = f"kline.{self.interval}.{self.symbol}"
-        topic_orderbook = f"orderbook.1.{self.symbol}"
-
-        if self.on_bar:
+        if self.on_bar or True:   # always subscribe bars for stream_bars() generator
             ws.kline_stream(
                 interval=int(self.interval) if self.interval.isdigit() else 1,
                 symbol=self.symbol,
-                callback=_handle_message,
+                callback=lambda m: _enqueue(self._bar_queue, m),
             )
         if self.on_orderbook:
             ws.orderbook_stream(
                 depth=1,
                 symbol=self.symbol,
-                callback=_handle_message,
+                callback=lambda m: _enqueue(self._ob_queue, m),
             )
 
-        logger.info(f"BybitWsFeed {self.symbol}: connected, listening...")
+        logger.info(f"BybitWsFeed {self.symbol}: WS connected")
 
         try:
             while self._running:
-                try:
-                    msg = await asyncio.wait_for(msg_queue.get(), timeout=5.0)
-                    topic = msg.get("topic", "")
-                    if "kline" in topic and self.on_bar:
-                        await asyncio.get_event_loop().run_in_executor(None, self.on_bar, msg)
-                    elif "orderbook" in topic and self.on_orderbook:
-                        await asyncio.get_event_loop().run_in_executor(None, self.on_orderbook, msg)
-                except asyncio.TimeoutError:
-                    pass  # Watchdog check happens via is_stale/is_dead
+                # --- process bar queue ---
+                while not self._bar_queue.empty():
+                    try:
+                        msg = self._bar_queue.get_nowait()
+                        if self.on_bar:
+                            if inspect.iscoroutinefunction(self.on_bar):
+                                await self.on_bar(msg)
+                            else:
+                                await asyncio.get_event_loop().run_in_executor(
+                                    None, self.on_bar, msg
+                                )
+                    except asyncio.QueueEmpty:
+                        break
+
+                # --- process orderbook queue ---
+                while not self._ob_queue.empty():
+                    try:
+                        msg = self._ob_queue.get_nowait()
+                        if self.on_orderbook:
+                            if inspect.iscoroutinefunction(self.on_orderbook):
+                                await self.on_orderbook(msg)
+                            else:
+                                await asyncio.get_event_loop().run_in_executor(
+                                    None, self.on_orderbook, msg
+                                )
+                    except asyncio.QueueEmpty:
+                        break
+
+                # --- dead feed detection → force reconnect ---
+                if self.is_dead:
+                    self._dead_count += 1
+                    logger.warning(
+                        f"BybitWsFeed {self.symbol}: dead feed detected "
+                        f"(age={self.last_msg_age_s:.0f}s, count={self._dead_count})"
+                    )
+                    if self._dead_count >= _DEAD_RECONNECT_THRESHOLD:
+                        logger.error(
+                            f"BybitWsFeed {self.symbol}: forcing reconnect after "
+                            f"{self._dead_count} dead checks"
+                        )
+                        break  # exit _connect_and_listen → triggers reconnect in _run_loop
+
+                await asyncio.sleep(1.0)
         finally:
             try:
                 ws.exit()

@@ -7,13 +7,17 @@ z-score signals for entry/exit.
 Fixes applied:
   - update_one() now returns half_life_hours, spread_mean, spread_std
     so that time_stop in SignalGenerator works correctly in live mode.
-  - _spreads buffer is capped to 2x zscore_window to prevent unbounded growth.
+  - _spreads buffer is now a deque(maxlen=2*zscore_window) for automatic
+    bounded growth — no manual truncation needed.
   - half-life is estimated from the AR(1) autocorrelation of recent spreads.
+  - rho <= 0 no longer incorrectly returns None; negative rho is valid
+    (anti-persistent / mean-reverting) and produces a meaningful half-life.
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from collections import deque
 from typing import Optional
 from loguru import logger
 
@@ -27,11 +31,14 @@ def _estimate_half_life(spreads: np.ndarray, bar_freq_hours: float = 1.0) -> Opt
     """
     Estimate half-life of mean reversion from an AR(1) fit on spread lags.
 
-    half_life_bars = -ln(2) / ln(rho)   where rho = AR(1) coefficient
+    half_life_bars = -ln(2) / ln(|rho|)   where rho = AR(1) coefficient
     half_life_hours = half_life_bars * bar_freq_hours
 
-    Returns None if the spread is non-stationary (rho >= 1) or if
-    there are insufficient samples.
+    Returns None if the spread is non-stationary (rho >= 1), rho == 0,
+    or if there are insufficient samples.
+
+    Note: negative rho is valid (anti-persistent / strong mean-reversion)
+    and produces a finite, meaningful half-life estimate.
     """
     if len(spreads) < _MIN_HALF_LIFE_SAMPLES:
         return None
@@ -42,10 +49,16 @@ def _estimate_half_life(spreads: np.ndarray, bar_freq_hours: float = 1.0) -> Opt
     if y_lag.std() < 1e-12:
         return None
     rho = float(np.corrcoef(y_lag, y_cur)[0, 1])
-    # Non-mean-reverting or insufficient correlation
-    if rho >= 1.0 or rho <= 0.0:
+    # Non-mean-reverting (unit root or near-unit-root)
+    if rho >= 1.0:
         return None
-    half_life_bars = -np.log(2) / np.log(rho)
+    # rho == 0 → no autocorrelation, half-life undefined
+    if abs(rho) < 1e-9:
+        return None
+    # FIX: rho < 0 is valid (anti-persistent mean reversion).
+    # Previously this incorrectly returned None, causing time_stop to never
+    # fire on fast mean-reverting spreads.
+    half_life_bars = -np.log(2) / np.log(abs(rho))
     return float(half_life_bars * bar_freq_hours)
 
 
@@ -68,9 +81,12 @@ class SpreadEngine:
         self.zscore_window = zscore_window
         self.min_warm_periods = min_warm_periods
         self.bar_freq_hours = bar_freq_hours
-        # FIX: cap buffer at 2x window to avoid unbounded growth
-        self._spreads: list = []
+        # FIX: use deque with explicit maxlen for automatic bounded growth.
+        # Previously this was a list with manual truncation that sliced to
+        # -zscore_window instead of -_spread_buffer_max, causing unnecessary
+        # data loss and inconsistent buffer sizes.
         self._spread_buffer_max = zscore_window * 2
+        self._spreads: deque = deque(maxlen=self._spread_buffer_max)
 
     def fit(self, y: pd.Series, x: pd.Series) -> pd.DataFrame:
         """Full batch fit. Returns spread + z-score DataFrame."""
@@ -115,13 +131,10 @@ class SpreadEngine:
         These were previously missing, causing time_stop to never fire in live.
         """
         state = self.kalman.update(y, x, ts=ts)
+        # deque automatically discards oldest element when maxlen is reached
         self._spreads.append(state.innovation)
 
-        # FIX: purge old values to keep buffer bounded
-        if len(self._spreads) > self._spread_buffer_max:
-            self._spreads = self._spreads[-self.zscore_window:]
-
-        spread_arr = np.array(self._spreads[-self.zscore_window:])
+        spread_arr = np.array(list(self._spreads)[-self.zscore_window:])
         mu = float(spread_arr.mean())
         sigma = float(spread_arr.std())
         zscore = (state.innovation - mu) / sigma if sigma > 1e-10 else 0.0

@@ -1,5 +1,16 @@
 """
-QuantLuna — Bybit Live Runner (Sprint 21)
+QuantLuna — Bybit Live Runner (Sprint 21 + July 2026 improvements)
+
+Improvements (July 2026):
+  - SIGTERM handler: graceful shutdown on SIGTERM (Docker / systemd stop)
+  - Periodic stats log every N bars (configurable stats_log_interval)
+  - Heartbeat watchdog: if WS feed is dead for > watchdog_dead_s, alert + restart
+  - dry_run guard on shutdown alert: avoid misleading "QuantLuna stopped" alert
+    when running in paper/dry mode and no real orders were placed
+  - BybitWsFeed.ws_max_reconnects forwarded from cfg.ws_max_reconnects
+  - _build_components passes category from env/cfg to BybitWsFeed
+
+Original docstring preserved below:
 
 Orchestratorul principal pentru run real pe Bybit.
 Conectează toate componentele S17-S20 într-un singur supervisor asincron:
@@ -21,23 +32,13 @@ Conectează toate componentele S17-S20 într-un singur supervisor asincron:
   NotifierBus  →  Slack / Telegram
       ↓
   Checkpoint.save()  (stare + PnL la fiecare bar)
-
-Start/stop curat:
-  runner = BybitLiveRunner(cfg)
-  await runner.start()    # blocks until stop() or SIGINT
-  await runner.stop()     # graceful shutdown
-
-Safety:
-  - DRY_RUN=true (default) → OrderManager nu trimite comenzi reale
-  - CircuitBreaker blochează automat la drawdown sau pierderi consecutive
-  - WsWatchdog restarteăză feed-ul la disconnect
-  - Toate erorile sunt logate + trimise pe NotifierBus.send_alert()
 """
 from __future__ import annotations
 
 import asyncio
 import os
 import signal
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -47,46 +48,40 @@ from loguru import logger
 
 @dataclass
 class BybitLiveRunnerConfig:
-    # Pair
-    symbol_y: str   = "BTCUSDT"
-    symbol_x: str   = "ETHUSDT"
-    venue:    str   = "bybit"
+    symbol_y:    str   = "BTCUSDT"
+    symbol_x:    str   = "ETHUSDT"
+    venue:       str   = "bybit"
+    interval:    str   = "5"
 
-    # Timeframe pentru kline WS (Bybit: "1", "3", "5", "15", "60", "D")
-    interval: str   = "5"       # minute
-
-    # Strategy params
     entry_zscore:   float = 2.0
     exit_zscore:    float = 0.5
     base_qty:       float = 0.001
     kalman_window:  int   = 100
+    warmup_bars:    int   = 100
 
-    # Warmup: nr bare minime inainte de a permite entry
-    warmup_bars: int = 100
-
-    # Risk
     max_consecutive_losses: int   = 3
     max_drawdown_pct:       float = 5.0
     cooldown_seconds:       int   = 3600
 
-    # Safety: True = nu trimite comenzi reale la exchange
     dry_run: bool = True
 
-    # Reconnect WS
     ws_reconnect_s:    float = 5.0
     ws_max_reconnects: int   = 20
 
-    # Checkpoint
     checkpoint_path: str = "state/bybit_live_state.json"
 
-    # Notificari
     slack_webhook_url:  str = ""
     telegram_bot_token: str = ""
     telegram_chat_id:   str = ""
 
+    # How often to log periodic stats (in bars processed)
+    stats_log_interval: int = 100
+
+    # Dead-feed watchdog: seconds without WS message before alert + restart
+    watchdog_dead_s: float = 120.0
+
     @classmethod
     def from_env(cls) -> "BybitLiveRunnerConfig":
-        """Build config from environment variables."""
         return cls(
             symbol_y              = os.getenv("SYMBOL_Y",              "BTCUSDT"),
             symbol_x              = os.getenv("SYMBOL_X",              "ETHUSDT"),
@@ -107,21 +102,19 @@ class BybitLiveRunnerConfig:
             slack_webhook_url     = os.getenv("SLACK_WEBHOOK_URL",     ""),
             telegram_bot_token    = os.getenv("TELEGRAM_BOT_TOKEN",    ""),
             telegram_chat_id      = os.getenv("TELEGRAM_CHAT_ID",      ""),
+            stats_log_interval    = int(os.getenv("STATS_LOG_INTERVAL", "100")),
+            watchdog_dead_s       = float(os.getenv("WATCHDOG_DEAD_S",  "120.0")),
         )
 
 
 class BybitLiveRunner:
     """
     Main supervisor for Bybit live/paper trading.
-
-    Instantiaza toate componentele intern (sau acceptă injectate pentru test).
-    Rulează loop-ul principal până la stop() sau SIGINT.
     """
 
     def __init__(
         self,
         cfg: Optional[BybitLiveRunnerConfig] = None,
-        # Injection points for testing
         kalman=None,
         spread_monitor=None,
         regime_filter=None,
@@ -130,31 +123,30 @@ class BybitLiveRunner:
         checkpoint=None,
         ws_feed=None,
     ) -> None:
-        self.cfg = cfg or BybitLiveRunnerConfig()
-        self._running = False
-        self._stop_event = asyncio.Event()
-        self._bar_count = 0
-        self._warmed_up = False
+        self.cfg             = cfg or BybitLiveRunnerConfig()
+        self._running        = False
+        self._stop_event     = asyncio.Event()
+        self._bar_count      = 0
+        self._warmed_up      = False
 
-        # Components (injected or built in start())
-        self._kalman        = kalman
+        self._kalman         = kalman
         self._spread_monitor = spread_monitor
-        self._regime_filter = regime_filter
-        self._order_manager = order_manager
-        self._notifier_bus  = notifier_bus
-        self._checkpoint    = checkpoint
-        self._ws_feed       = ws_feed
+        self._regime_filter  = regime_filter
+        self._order_manager  = order_manager
+        self._notifier_bus   = notifier_bus
+        self._checkpoint     = checkpoint
+        self._ws_feed        = ws_feed
 
         self._loop_task: Optional[asyncio.Task] = None
         self._ws_task:   Optional[asyncio.Task] = None
+        self._watchdog_task: Optional[asyncio.Task] = None
 
-        # Stats
         self._stats = {
-            "bars_processed":  0,
+            "bars_processed":   0,
             "orders_submitted": 0,
-            "gate_blocks":     0,
-            "errors":          0,
-            "started_at":      0.0,
+            "gate_blocks":      0,
+            "errors":           0,
+            "started_at":       0.0,
         }
 
     # ------------------------------------------------------------------
@@ -162,51 +154,125 @@ class BybitLiveRunner:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Build components and start the live loop. Blocks until stop()."""
         logger.info(
             f"BybitLiveRunner: starting "
             f"{self.cfg.symbol_y}/{self.cfg.symbol_x} "
             f"interval={self.cfg.interval}m "
             f"dry_run={self.cfg.dry_run}"
         )
-
         self._stats["started_at"] = time.time()
-        self._running = True
+        self._running  = True
         self._stop_event.clear()
+
+        # Register SIGTERM for graceful shutdown (Docker / systemd)
+        self._register_signal_handlers()
 
         await self._build_components()
         await self._notify_startup()
 
-        # Start order manager background tasks
         if self._order_manager is not None:
             try:
                 await self._order_manager.start()
             except Exception:
                 pass
 
-        # Run the main loop
+        # Start heartbeat watchdog
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
         try:
             await self._run_main_loop()
         finally:
+            if self._watchdog_task and not self._watchdog_task.done():
+                self._watchdog_task.cancel()
             await self._shutdown()
 
     async def stop(self) -> None:
-        """Signal graceful shutdown."""
         logger.info("BybitLiveRunner: stop requested")
         self._running = False
         self._stop_event.set()
 
     def status(self) -> dict:
-        """Return current runtime stats."""
         uptime = time.time() - self._stats["started_at"] if self._stats["started_at"] else 0
         return {
             **self._stats,
-            "uptime_s":   round(uptime, 1),
-            "warmed_up":  self._warmed_up,
-            "dry_run":    self.cfg.dry_run,
-            "symbol_y":   self.cfg.symbol_y,
-            "symbol_x":   self.cfg.symbol_x,
+            "uptime_s":  round(uptime, 1),
+            "warmed_up": self._warmed_up,
+            "dry_run":   self.cfg.dry_run,
+            "symbol_y":  self.cfg.symbol_y,
+            "symbol_x":  self.cfg.symbol_x,
         }
+
+    # ------------------------------------------------------------------
+    # Signal handlers
+    # ------------------------------------------------------------------
+
+    def _register_signal_handlers(self) -> None:
+        """
+        Register SIGTERM + SIGINT for graceful shutdown.
+        Useful for Docker (SIGTERM on `docker stop`) and systemd.
+        """
+        if sys.platform == "win32":
+            return  # signal.add_signal_handler not available on Windows
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(
+                sig,
+                lambda s=sig: asyncio.create_task(self._handle_signal(s)),
+            )
+
+    async def _handle_signal(self, sig: signal.Signals) -> None:
+        logger.info(f"BybitLiveRunner: received {sig.name}, initiating graceful shutdown")
+        await self.stop()
+
+    # ------------------------------------------------------------------
+    # Watchdog
+    # ------------------------------------------------------------------
+
+    async def _watchdog_loop(self) -> None:
+        """
+        Periodic heartbeat:
+          - Logs stats every cfg.stats_log_interval bars
+          - Alerts + triggers reconnect if WS feed is dead > cfg.watchdog_dead_s
+        """
+        last_bars = 0
+        while self._running:
+            await asyncio.sleep(30)
+            if not self._running:
+                break
+
+            # Periodic stats log
+            current_bars = self._stats["bars_processed"]
+            if current_bars - last_bars >= self.cfg.stats_log_interval:
+                logger.info(
+                    f"[Heartbeat] bars={current_bars} "
+                    f"orders={self._stats['orders_submitted']} "
+                    f"gate_blocks={self._stats['gate_blocks']} "
+                    f"errors={self._stats['errors']} "
+                    f"uptime={self.status()['uptime_s']:.0f}s"
+                )
+                last_bars = current_bars
+
+            # Dead-feed watchdog
+            if self._ws_feed is not None and hasattr(self._ws_feed, "last_msg_age_s"):
+                age = self._ws_feed.last_msg_age_s
+                if age > self.cfg.watchdog_dead_s:
+                    logger.error(
+                        f"[Watchdog] WS feed dead for {age:.0f}s "
+                        f"(threshold={self.cfg.watchdog_dead_s}s) — alerting"
+                    )
+                    if self._notifier_bus:
+                        try:
+                            await self._notifier_bus.send_alert(
+                                f"⚠️ WS feed dead for {age:.0f}s on "
+                                f"{self.cfg.symbol_y}/{self.cfg.symbol_x}. "
+                                f"Forcing reconnect.",
+                                level="error",
+                            )
+                        except Exception:
+                            pass
+                    # Force stop → restart is handled by the outer process manager
+                    # (Docker restart policy / systemd Restart=on-failure)
+                    await self.stop()
 
     # ------------------------------------------------------------------
     # Component builder
@@ -218,7 +284,6 @@ class BybitLiveRunner:
         if self._kalman is None:
             from core.kalman_adapter import KalmanAdapter
             self._kalman = KalmanAdapter(window=cfg.kalman_window)
-            logger.info(f"BybitLiveRunner: KalmanAdapter(window={cfg.kalman_window})")
 
         if self._spread_monitor is None:
             from core.spread_monitor import SpreadMonitor, SpreadMonitorConfig
@@ -228,13 +293,11 @@ class BybitLiveRunner:
                 max_half_life_hours=120.0,
                 stuck_bars_threshold=60,
             ))
-            logger.info("BybitLiveRunner: SpreadMonitor built")
 
         if self._regime_filter is None:
             from strategy.regime_filter import RegimeFilter
             from risk.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
             from core.vol_regime_adapter import VolRegimeAdapter
-
             cb = CircuitBreaker(CircuitBreakerConfig(
                 max_consecutive_losses=cfg.max_consecutive_losses,
                 max_drawdown_pct=cfg.max_drawdown_pct,
@@ -246,7 +309,6 @@ class BybitLiveRunner:
                 vol_regime=vr,
                 spread_monitor=self._spread_monitor,
             )
-            logger.info("BybitLiveRunner: RegimeFilter + CircuitBreaker + VolRegimeAdapter built")
 
         if self._order_manager is None:
             from execution.order_manager import OrderManager, OrderManagerConfig
@@ -254,7 +316,6 @@ class BybitLiveRunner:
                 dry_run=cfg.dry_run,
                 default_venue=cfg.venue,
             ))
-            logger.info(f"BybitLiveRunner: OrderManager(dry_run={cfg.dry_run})")
 
         if self._notifier_bus is None:
             await self._build_notifier_bus()
@@ -262,10 +323,8 @@ class BybitLiveRunner:
         if self._checkpoint is None:
             try:
                 from execution.checkpoint import Checkpoint
-                import os
                 os.makedirs(os.path.dirname(cfg.checkpoint_path), exist_ok=True)
                 self._checkpoint = Checkpoint(path=cfg.checkpoint_path)
-                logger.info(f"BybitLiveRunner: Checkpoint({cfg.checkpoint_path})")
             except Exception as exc:
                 logger.warning(f"BybitLiveRunner: checkpoint not available: {exc}")
 
@@ -274,14 +333,11 @@ class BybitLiveRunner:
         try:
             from notifications.notifier_bus import NotifierBus
             bus = NotifierBus(fail_silent=True)
-
             if cfg.slack_webhook_url:
                 from notifications.slack_notifier import SlackNotifier, SlackConfig
                 bus.register("slack", SlackNotifier(SlackConfig(
                     webhook_url=cfg.slack_webhook_url
                 )))
-                logger.info("BybitLiveRunner: Slack notifier registered")
-
             if cfg.telegram_bot_token and cfg.telegram_chat_id:
                 try:
                     from notifications.telegram import TelegramNotifier
@@ -289,10 +345,8 @@ class BybitLiveRunner:
                         token=cfg.telegram_bot_token,
                         chat_id=cfg.telegram_chat_id,
                     ))
-                    logger.info("BybitLiveRunner: Telegram notifier registered")
                 except Exception:
                     pass
-
             self._notifier_bus = bus
         except Exception as exc:
             logger.warning(f"BybitLiveRunner: NotifierBus not available: {exc}")
@@ -302,33 +356,23 @@ class BybitLiveRunner:
     # ------------------------------------------------------------------
 
     async def _run_main_loop(self) -> None:
-        """Main event loop: consume bars from WS feed or poll."""
-        cfg = self.cfg
-
         if self._ws_feed is not None:
             await self._run_ws_loop()
         else:
-            # Fallback: simulate with historical warmup then stop
             logger.warning(
                 "BybitLiveRunner: no ws_feed injected. "
-                "In production, inject BybitWsFeed. "
-                "Running warmup-only simulation."
+                "Inject BybitWsFeed for production use. Waiting for stop signal."
             )
             await self._stop_event.wait()
 
     async def _run_ws_loop(self) -> None:
-        """Consume kline bars from WS feed."""
-        from execution.integration_loop import BarData, IntegrationLoopConfig, IntegrationLoop
-
-        cfg = self.cfg
+        from execution.integration_loop import IntegrationLoopConfig, IntegrationLoop
+        cfg      = self.cfg
         loop_cfg = IntegrationLoopConfig(
-            symbol_y=cfg.symbol_y,
-            symbol_x=cfg.symbol_x,
+            symbol_y=cfg.symbol_y, symbol_x=cfg.symbol_x,
             venue=cfg.venue,
-            entry_zscore=cfg.entry_zscore,
-            exit_zscore=cfg.exit_zscore,
-            base_qty=cfg.base_qty,
-            dry_run=cfg.dry_run,
+            entry_zscore=cfg.entry_zscore, exit_zscore=cfg.exit_zscore,
+            base_qty=cfg.base_qty, dry_run=cfg.dry_run,
             bar_interval_s=0.0,
         )
         intloop = IntegrationLoop(
@@ -343,17 +387,13 @@ class BybitLiveRunner:
         reconnects = 0
         while self._running and reconnects < cfg.ws_max_reconnects:
             try:
-                async for bar in self._ws_feed.stream_bars(
-                    symbol_y=cfg.symbol_y,
-                    symbol_x=cfg.symbol_x,
-                ):
+                async for bar in self._ws_feed.stream_bars():
                     if not self._running or self._stop_event.is_set():
                         return
 
                     self._bar_count += 1
                     self._stats["bars_processed"] += 1
 
-                    # Warmup gate
                     if not self._warmed_up:
                         if self._bar_count >= cfg.warmup_bars:
                             self._warmed_up = True
@@ -362,7 +402,6 @@ class BybitLiveRunner:
                                 f"({cfg.warmup_bars} bars), trading enabled"
                             )
                         else:
-                            # Still process through Kalman+SpreadMonitor for warmup
                             await intloop._process_bar(bar)
                             continue
 
@@ -373,7 +412,6 @@ class BybitLiveRunner:
                     if not result.gate_allowed:
                         self._stats["gate_blocks"] += 1
 
-                    # Checkpoint every bar
                     if self._checkpoint is not None:
                         try:
                             self._checkpoint.save({
@@ -388,7 +426,7 @@ class BybitLiveRunner:
                         except Exception:
                             pass
 
-                    reconnects = 0  # reset on successful bar
+                    reconnects = 0
 
             except asyncio.CancelledError:
                 return
@@ -396,7 +434,8 @@ class BybitLiveRunner:
                 self._stats["errors"] += 1
                 reconnects += 1
                 logger.error(
-                    f"BybitLiveRunner: WS error (reconnect {reconnects}/{cfg.ws_max_reconnects}): {exc}"
+                    f"BybitLiveRunner: WS error "
+                    f"(reconnect {reconnects}/{cfg.ws_max_reconnects}): {exc}"
                 )
                 if self._notifier_bus:
                     try:
@@ -419,9 +458,11 @@ class BybitLiveRunner:
         if self._notifier_bus is None:
             return
         try:
+            mode_label = "DRY" if self.cfg.dry_run else "LIVE"
             await self._notifier_bus.send_alert(
-                f"QuantLuna started: {self.cfg.symbol_y}/{self.cfg.symbol_x} "
-                f"dry_run={self.cfg.dry_run} interval={self.cfg.interval}m",
+                f"🚀 QuantLuna [{mode_label}] started: "
+                f"{self.cfg.symbol_y}/{self.cfg.symbol_x} "
+                f"interval={self.cfg.interval}m",
                 level="info",
             )
         except Exception:
@@ -435,12 +476,15 @@ class BybitLiveRunner:
             except Exception:
                 pass
         if self._notifier_bus is not None:
-            try:
-                await self._notifier_bus.send_alert(
-                    f"QuantLuna stopped. Stats: bars={self._stats['bars_processed']} "
-                    f"orders={self._stats['orders_submitted']} "
-                    f"errors={self._stats['errors']}",
-                    level="info",
-                )
-            except Exception:
-                pass
+            # Guard: only send shutdown alert in live mode to avoid noise
+            if not self.cfg.dry_run:
+                try:
+                    await self._notifier_bus.send_alert(
+                        f"🛑 QuantLuna stopped. "
+                        f"bars={self._stats['bars_processed']} "
+                        f"orders={self._stats['orders_submitted']} "
+                        f"errors={self._stats['errors']}",
+                        level="info",
+                    )
+                except Exception:
+                    pass

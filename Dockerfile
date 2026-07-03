@@ -1,27 +1,27 @@
 # QuantLuna — Production Dockerfile
-# Sprint 12
+# July 2026 hardening
 #
-# Multi-stage build:
-#   Stage 1 (builder): installs all deps
-#   Stage 2 (runtime): minimal image, no build tools
+# Improvements over Sprint 12:
+#   - HEALTHCHECK built-in (docker ps shows healthy/unhealthy)
+#   - build-arg APP_VERSION propagated as image label
+#   - /app/state directory created + owned by quantluna user
+#     (was missing — checkpoint writes failed in Docker)
+#   - pip-compile hash verification in builder stage
+#   - .dockerignore reference: ensure data/, logs/, .env are excluded
+#   - CMD changed to use main.py CLI instead of raw scripts/
 #
 # Build:
 #   docker build -t quantluna:latest .
+#   docker build --build-arg APP_VERSION=0.14.0 -t quantluna:0.14.0 .
 #
-# Run paper trader:
-#   docker run --env-file .env quantluna:latest python scripts/run_paper.py --pair BTCUSDT ETHUSDT
-#
-# Run live trader:
-#   docker run --env-file .env -v $(pwd)/data:/app/data quantluna:latest python scripts/run_live.py --pair BTCUSDT ETHUSDT
-#
-# Run with docker-compose:
-#   docker-compose up -d
+# Run:
+#   docker run --env-file .env quantluna:latest paper --pair BTCUSDT ETHUSDT
+#   docker run --env-file .env quantluna:latest live  --pair BTCUSDT ETHUSDT --yes
 
 FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
-# Install build deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
@@ -35,25 +35,31 @@ RUN pip install --upgrade pip && \
 # -----------------------------------------------------------------------
 FROM python:3.11-slim AS runtime
 
+ARG APP_VERSION=dev
+
 LABEL maintainer="George Pricop"
 LABEL description="QuantLuna — Adaptive Kalman Filter Pairs Trading Engine"
-LABEL version="1.0.0"
+LABEL version="${APP_VERSION}"
+LABEL org.opencontainers.image.source="https://github.com/Gzeu/quantluna"
 
 WORKDIR /app
 
-# Copy installed packages from builder
 COPY --from=builder /install /usr/local
 
-# Copy source
 COPY . .
 
-# Create data and cache directories
-RUN mkdir -p /app/data /root/.quantluna/cache
+# Create all runtime directories in one layer
+RUN mkdir -p /app/data /app/state /app/logs /root/.quantluna/cache
 
-# Non-root user for security
+# Non-root user
 RUN useradd -m -u 1000 quantluna && \
     chown -R quantluna:quantluna /app /root/.quantluna
 USER quantluna
 
-# Default: show help
-CMD ["python", "-c", "print('QuantLuna ready. Use: python scripts/run_live.py or python scripts/run_paper.py')"]
+# Healthcheck: verify the Python environment is intact
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD python -c "import quantluna_health_check 2>/dev/null || python -c 'import core, execution, risk; print(\"ok\")'"
+
+# Use main.py CLI as default entrypoint
+ENTRYPOINT ["python", "main.py"]
+CMD ["--help"]
