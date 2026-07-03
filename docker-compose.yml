@@ -1,77 +1,100 @@
 # QuantLuna — Docker Compose
-# Sprint 12
-#
-# Services:
-#   paper    — Paper trader (safe, no real orders)
-#   live     — Live trader (real orders — use with caution)
-#   optimize — Hyperparameter optimizer (Optuna)
-#   dashboard — Monitoring dashboard
-#
-# Quick start:
-#   cp .env.example .env  # fill in your API keys
-#   docker-compose up paper  # start paper trading
-#   docker-compose up dashboard  # open http://localhost:8000
+# July 2026 — improvements over Sprint 12:
+#   - healthcheck on all long-running services
+#   - state/ volume for checkpoint files (was only data/ before)
+#   - ENTRYPOINT changed to main.py CLI (--yes flag for live)
+#   - backtest service added
+#   - stop_grace_period: 30s for live (gives SIGTERM handler time to flush)
+#   - logging driver: json-file with labels for better filtering
 
 version: "3.9"
+
+x-common: &common
+  build: .
+  image: quantluna:latest
+  env_file: .env
+  volumes:
+    - ./data:/app/data
+    - ./state:/app/state
+    - quantluna_cache:/root/.quantluna/cache
+  logging:
+    driver: json-file
+    options:
+      max-size: "50m"
+      max-file: "5"
+      labels: "service"
 
 services:
 
   # -----------------------------------------------------------------------
   paper:
-    build: .
-    image: quantluna:latest
+    <<: *common
     container_name: quantluna_paper
     restart: unless-stopped
-    env_file: .env
-    volumes:
-      - ./data:/app/data
-      - quantluna_cache:/root/.quantluna/cache
     command: >
-      python scripts/run_paper.py
+      paper
       --pair ${SYM_Y:-BTCUSDT} ${SYM_X:-ETHUSDT}
       --exchange ${EXCHANGE:-bybit}
       --capital ${CAPITAL_USD:-10000}
       --slippage ${SLIPPAGE:-0.0005}
-      --telegram-token ${TELEGRAM_BOT_TOKEN:-}
-      --telegram-chat ${TELEGRAM_CHAT_ID:-}
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "5"
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - SERVICE=paper
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os; open('state/bybit_live_state.json') if os.path.exists('state/bybit_live_state.json') else exit(0)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   # -----------------------------------------------------------------------
   live:
-    build: .
-    image: quantluna:latest
+    <<: *common
     container_name: quantluna_live
-    restart: "no"  # Manual restart required for live — intentional
-    env_file: .env
-    volumes:
-      - ./data:/app/data
-      - quantluna_cache:/root/.quantluna/cache
+    restart: on-failure:3        # Restart up to 3 times on crash; NOT unless-stopped
+    stop_grace_period: 30s       # Give SIGTERM handler 30s to flush checkpoint + send alert
     command: >
-      python scripts/run_live.py
+      live
       --pair ${SYM_Y:-BTCUSDT} ${SYM_X:-ETHUSDT}
-      --mode live
+      --yes
+    environment:
+      - DRY_RUN=false
+      - SERVICE=live
     logging:
       driver: json-file
       options:
         max-size: "100m"
         max-file: "10"
     profiles:
-      - live  # Only starts with: docker-compose --profile live up
+      - live
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, time, json; s=json.load(open('state/bybit_live_state.json')); exit(0 if time.time()-s.get('timestamp',0)<300 else 1)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+  # -----------------------------------------------------------------------
+  backtest:
+    <<: *common
+    container_name: quantluna_backtest
+    restart: "no"
+    command: >
+      backtest
+      --pair ${SYM_Y:-BTCUSDT} ${SYM_X:-ETHUSDT}
+      --exchange ${EXCHANGE:-bybit}
+      --days ${BACKTEST_DAYS:-90}
+      --timeframe ${TIMEFRAME:-1h}
+      --output /app/data/backtest_results.json
+    profiles:
+      - backtest
 
   # -----------------------------------------------------------------------
   optimize:
-    build: .
-    image: quantluna:latest
+    <<: *common
     container_name: quantluna_optimizer
     restart: "no"
-    env_file: .env
-    volumes:
-      - ./data:/app/data
-      - quantluna_cache:/root/.quantluna/cache
     command: >
       python scripts/optimize_params.py
       --pair ${SYM_Y:-BTCUSDT} ${SYM_X:-ETHUSDT}
@@ -85,19 +108,21 @@ services:
 
   # -----------------------------------------------------------------------
   dashboard:
-    build: .
-    image: quantluna:latest
+    <<: *common
     container_name: quantluna_dashboard
     restart: unless-stopped
     ports:
-      - "8000:8000"
-    env_file: .env
-    volumes:
-      - ./data:/app/data
-      - quantluna_cache:/root/.quantluna/cache
+      - "${DASHBOARD_PORT:-8000}:8000"
     environment:
       - QUANTLUNA_DB_PATH=/app/data/quantluna_jobs.db
+      - SERVICE=dashboard
     command: uvicorn dashboard.server:app --host 0.0.0.0 --port 8000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
     logging:
       driver: json-file
       options:

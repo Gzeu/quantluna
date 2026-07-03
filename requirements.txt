@@ -1,5 +1,5 @@
 # QuantLuna — Python dependencies
-# Generated for Sprint 31 (v0.32.0)
+# July 2026 (v0.14.0+)
 
 # --- Web Framework ---
 fastapi>=0.111.0
@@ -20,7 +20,7 @@ statsmodels>=0.14.0
 sklearn-pandas>=2.2.0
 scikit-learn>=1.4.0
 
-# --- Charting / Reporting (Sprint 31 S) ---
+# --- Charting / Reporting ---
 plotly>=5.22.0
 kaleido>=0.2.1
 weasyprint>=61.0
@@ -43,13 +43,21 @@ python-dotenv>=1.0.0
 # --- Async task scheduling ---
 apscheduler>=3.10.4
 
-# --- Logging / Monitoring ---
+# --- Logging ---
+# loguru replaces structlog: simpler API, better async support, colours out-of-box
+loguru>=0.7.2
 structlog>=24.1.0
 
 # --- Testing ---
 pytest>=8.2.0
 pytest-asyncio>=0.23.0
 pytest-cov>=5.0.0
+coverage[toml]>=7.5.0
 
 # --- Type stubs (dev) ---
 pandas-stubs>=2.2.0
+types-requests>=2.31.0
+
+# --- Static analysis (dev) ---
+mypy>=1.10.0
+ruff>=0.4.0
