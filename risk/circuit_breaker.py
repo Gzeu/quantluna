@@ -1,263 +1,124 @@
 """
-QuantLuna — Circuit Breaker (Sprint 17)
+risk/circuit_breaker.py — circuit breaker pentru oprirea automata a trading-ului.
 
-Automatically halts trading after configurable loss/drawdown/error thresholds.
-When tripped, no new entries are allowed until the cooldown expires or
-manual reset is performed.
-
-Trip conditions (configurable, any single trigger is sufficient):
-  1. Consecutive losing trades ≥ max_consecutive_losses
-  2. Realised PnL drop ≥ max_drawdown_pct within a rolling window
-  3. Order error rate ≥ max_error_rate within error_window_trades
-  4. Manual trip (e.g. operator kill-switch)
-
-Usage:
-    cb = CircuitBreaker(CircuitBreakerConfig(max_consecutive_losses=5))
-    cb.record_trade(pnl=-50.0)
-    if not cb.is_open:   # is_open = trading allowed
-        signal_generator.block_entries()
+Monitorizeaza pierderi consecutive, drawdown rapid si erori de executie.
+Dupa atingerea pragurilor configura, blocheaza toate ordinele noi
+pentru o perioada de cooldown.
 """
 from __future__ import annotations
 
 import time
-from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Deque, List, Optional
-
-from loguru import logger
+from typing import List, Optional
 
 
-class TripReason(str, Enum):
-    CONSECUTIVE_LOSSES = "consecutive_losses"
-    DRAWDOWN           = "drawdown"
-    ERROR_RATE         = "error_rate"
-    MANUAL             = "manual"
+class BreakerState(Enum):
+    CLOSED = "closed"      # normal, trading permis
+    OPEN = "open"          # blocat
+    HALF_OPEN = "half_open"  # test dupa cooldown
 
 
 @dataclass
-class TripEvent:
-    reason:     TripReason
-    tripped_at: float = field(default_factory=time.time)
-    detail:     str = ""
-    auto_reset_at: Optional[float] = None
-
-
-@dataclass
-class CircuitBreakerConfig:
-    # --- Consecutive loss trip ---
-    max_consecutive_losses: int = 5
-
-    # --- Rolling drawdown trip ---
-    # Max cumulative PnL drop (as fraction, e.g. -0.10 = -10%) in window
-    max_drawdown_pct: float = -0.10
-    # Window size in number of trades for drawdown calculation
-    drawdown_window: int = 20
-    # Starting capital reference for pct calculation (0 = disabled)
-    capital_reference: float = 0.0
-
-    # --- Error rate trip ---
-    # Max fraction of errored orders in last N submissions
-    max_error_rate: float = 0.5
-    error_window_trades: int = 10
-
-    # --- Cooldown ---
-    # Seconds before auto-reset after a trip (0 = manual reset only)
-    cooldown_seconds: float = 3600.0  # 1 hour default
-
-    # --- Notifications ---
-    # Whether to log a critical alert on trip
-    alert_on_trip: bool = True
+class BreakerEvent:
+    reason: str
+    ts: float = field(default_factory=time.time)
 
 
 class CircuitBreaker:
     """
-    Monitors trading health and halts new entries when thresholds are breached.
+    Circuit breaker cu stari CLOSED / OPEN / HALF_OPEN.
 
-    Parameters
-    ----------
-    cfg : CircuitBreakerConfig
+    Usage::
+
+        cb = CircuitBreaker(max_consecutive_losses=3, cooldown_seconds=300)
+
+        cb.record_loss(50.0)
+        if not cb.allow():
+            logger.warning("Circuit breaker OPEN: %s", cb.last_reason)
     """
 
-    def __init__(self, cfg: Optional[CircuitBreakerConfig] = None) -> None:
-        self.cfg = cfg or CircuitBreakerConfig()
+    def __init__(
+        self,
+        max_consecutive_losses: int = 3,
+        max_drawdown_pct: float = 0.05,
+        max_errors: int = 5,
+        cooldown_seconds: float = 300.0,
+    ) -> None:
+        self._max_losses = max_consecutive_losses
+        self._max_dd = max_drawdown_pct
+        self._max_errors = max_errors
+        self._cooldown = cooldown_seconds
 
-        self._tripped:            bool = False
-        self._trip_event:         Optional[TripEvent] = None
-        self._trip_history:       List[TripEvent] = []
-
-        # Consecutive loss counter
-        self._consecutive_losses: int = 0
-
-        # Rolling PnL window
-        self._pnl_window: Deque[float] = deque(maxlen=self.cfg.drawdown_window)
-
-        # Error rate window: True = error, False = success
-        self._error_window: Deque[bool] = deque(maxlen=self.cfg.error_window_trades)
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    @property
-    def is_open(self) -> bool:
-        """
-        True = circuit closed = trading ALLOWED.
-        False = circuit open (tripped) = trading HALTED.
-        """
-        self._check_auto_reset()
-        return not self._tripped
+        self._state = BreakerState.CLOSED
+        self._consecutive_losses = 0
+        self._error_count = 0
+        self._open_at: Optional[float] = None
+        self._events: List[BreakerEvent] = []
+        self._peak_equity: float = 0.0
+        self._current_equity: float = 0.0
+        self.last_reason: str = ""
 
     @property
-    def is_tripped(self) -> bool:
-        """Inverse of is_open, for explicit check."""
-        return not self.is_open
+    def state(self) -> BreakerState:
+        self._maybe_transition()
+        return self._state
 
-    def record_trade(self, pnl: float) -> None:
-        """
-        Record a completed trade PnL and update trip counters.
+    def allow(self) -> bool:
+        return self.state != BreakerState.OPEN
 
-        Parameters
-        ----------
-        pnl : realised PnL in quote currency (positive = win, negative = loss)
-        """
-        self._pnl_window.append(pnl)
+    def record_win(self, pnl: float) -> None:
+        self._consecutive_losses = 0
+        self._current_equity += pnl
+        if self._current_equity > self._peak_equity:
+            self._peak_equity = self._current_equity
 
-        if pnl < 0:
-            self._consecutive_losses += 1
-        else:
-            self._consecutive_losses = 0
+    def record_loss(self, pnl: float) -> None:
+        """pnl deve essere negativo o positivo (viene trattato come perdita)."""
+        loss = abs(pnl)
+        self._current_equity -= loss
+        self._consecutive_losses += 1
 
-        self._evaluate()
+        if self._consecutive_losses >= self._max_losses:
+            self._trip(f"{self._consecutive_losses} consecutive losses")
+            return
 
-    def record_order_result(self, success: bool) -> None:
-        """
-        Record an order submission result for error-rate tracking.
+        if self._peak_equity > 0:
+            dd = (self._peak_equity - self._current_equity) / self._peak_equity
+            if dd >= self._max_dd:
+                self._trip(f"drawdown {dd*100:.1f}% >= {self._max_dd*100:.1f}%")
 
-        Parameters
-        ----------
-        success : True if order submitted/filled OK, False if errored
-        """
-        self._error_window.append(not success)  # True = error
-        self._evaluate()
-
-    def trip_manual(self, detail: str = "operator kill-switch") -> None:
-        """Manually trip the circuit breaker."""
-        self._trip(TripReason.MANUAL, detail)
+    def record_error(self) -> None:
+        self._error_count += 1
+        if self._error_count >= self._max_errors:
+            self._trip(f"{self._error_count} execution errors")
 
     def reset(self) -> None:
-        """Manually reset (close) the circuit breaker."""
-        if self._tripped:
-            logger.warning("CircuitBreaker: RESET — trading RESUMED")
-        self._tripped        = False
-        self._trip_event     = None
+        self._state = BreakerState.CLOSED
         self._consecutive_losses = 0
+        self._error_count = 0
+        self._open_at = None
+        self.last_reason = ""
 
-    def full_reset(self) -> None:
-        """Hard reset — clears all counters and history."""
-        self.reset()
-        self._pnl_window.clear()
-        self._error_window.clear()
-        self._trip_history.clear()
+    def set_equity(self, equity: float) -> None:
+        self._current_equity = equity
+        if equity > self._peak_equity:
+            self._peak_equity = equity
 
-    def status(self) -> dict:
-        """Return current state as dict for dashboard / logging."""
-        self._check_auto_reset()
-        return {
-            "is_open":             self.is_open,
-            "tripped":             self._tripped,
-            "trip_reason":         self._trip_event.reason.value if self._trip_event else None,
-            "trip_detail":         self._trip_event.detail if self._trip_event else None,
-            "consecutive_losses":  self._consecutive_losses,
-            "rolling_pnl":         round(sum(self._pnl_window), 4),
-            "error_rate":          self._current_error_rate(),
-            "cooldown_remaining_s": self._cooldown_remaining(),
-            "trip_count":          len(self._trip_history),
-        }
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
-
-    def _evaluate(self) -> None:
-        """Check all trip conditions. Trip on first match."""
-        if self._tripped:
+    def _trip(self, reason: str) -> None:
+        if self._state == BreakerState.OPEN:
             return
+        self._state = BreakerState.OPEN
+        self._open_at = time.time()
+        self.last_reason = reason
+        self._events.append(BreakerEvent(reason=reason))
 
-        cfg = self.cfg
+    def _maybe_transition(self) -> None:
+        if self._state == BreakerState.OPEN and self._open_at is not None:
+            elapsed = time.time() - self._open_at
+            if elapsed >= self._cooldown:
+                self._state = BreakerState.HALF_OPEN
 
-        # 1. Consecutive losses
-        if self._consecutive_losses >= cfg.max_consecutive_losses:
-            self._trip(
-                TripReason.CONSECUTIVE_LOSSES,
-                f"{self._consecutive_losses} consecutive losses",
-            )
-            return
-
-        # 2. Rolling drawdown
-        if (
-            len(self._pnl_window) >= 2
-            and cfg.capital_reference > 0
-        ):
-            cumulative = sum(self._pnl_window)
-            dd_pct = cumulative / cfg.capital_reference
-            if dd_pct <= cfg.max_drawdown_pct:
-                self._trip(
-                    TripReason.DRAWDOWN,
-                    f"rolling PnL={cumulative:.2f} ({dd_pct:.2%}) <= {cfg.max_drawdown_pct:.2%}",
-                )
-                return
-
-        # 3. Error rate
-        err_rate = self._current_error_rate()
-        if (
-            len(self._error_window) >= max(3, self.cfg.error_window_trades // 2)
-            and err_rate >= cfg.max_error_rate
-        ):
-            self._trip(
-                TripReason.ERROR_RATE,
-                f"error_rate={err_rate:.2%} >= {cfg.max_error_rate:.2%}",
-            )
-
-    def _trip(self, reason: TripReason, detail: str = "") -> None:
-        self._tripped = True
-        auto_reset_at = (
-            time.time() + self.cfg.cooldown_seconds
-            if self.cfg.cooldown_seconds > 0
-            else None
-        )
-        event = TripEvent(reason=reason, detail=detail, auto_reset_at=auto_reset_at)
-        self._trip_event = event
-        self._trip_history.append(event)
-
-        if self.cfg.alert_on_trip:
-            logger.critical(
-                f"CircuitBreaker TRIPPED: reason={reason.value} detail={detail} "
-                f"cooldown={self.cfg.cooldown_seconds:.0f}s"
-            )
-
-    def _check_auto_reset(self) -> None:
-        if (
-            self._tripped
-            and self._trip_event is not None
-            and self._trip_event.auto_reset_at is not None
-            and time.time() >= self._trip_event.auto_reset_at
-        ):
-            logger.warning("CircuitBreaker: auto-reset after cooldown — trading RESUMED")
-            self._tripped    = False
-            self._trip_event = None
-            self._consecutive_losses = 0
-
-    def _current_error_rate(self) -> float:
-        if not self._error_window:
-            return 0.0
-        return sum(1 for e in self._error_window if e) / len(self._error_window)
-
-    def _cooldown_remaining(self) -> float:
-        if (
-            self._tripped
-            and self._trip_event is not None
-            and self._trip_event.auto_reset_at is not None
-        ):
-            return max(0.0, self._trip_event.auto_reset_at - time.time())
-        return 0.0
+    @property
+    def events(self) -> List[BreakerEvent]:
+        return list(self._events)
