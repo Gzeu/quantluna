@@ -1,64 +1,107 @@
-/**
- * QuantLuna Dashboard — Main Page
- * Sprint 30
- */
-import { Suspense } from 'react';
-import { RiskMetrics }  from './components/RiskMetrics';
-import { EquityCurve }  from './components/EquityCurve';
-import { PairsGrid }    from './components/PairsGrid';
-import { AlertFeed }    from './components/AlertFeed';
-import { getEquityCurve } from './lib/api';
+'use client'
+import { useEffect } from 'react'
+import HeaderBar         from '../components/HeaderBar'
+import SidebarPanel      from '../components/SidebarPanel'
+import CandlestickChart  from '../components/CandlestickChart'
+import SpreadMonitorPanel from '../components/SpreadMonitorPanel'
+import MarketHeatmap     from '../components/MarketHeatmap'
+import BalanceTracker    from '../components/BalanceTracker'
+import PnLChart          from '../components/PnLChart'
+import ArbitragePanel    from '../components/ArbitragePanel'
+import ExecutionLog      from '../components/ExecutionLog'
+import ModalsHost        from '../components/modals/ModalsHost'
+import { useQuantLunaWS }          from '../hooks/useQuantLunaWS'
+import { useKeyboardShortcuts }    from '../hooks/useKeyboardShortcuts'
 
-export const dynamic    = 'force-dynamic';
-export const revalidate = 0;
+function QuantLunaApp() {
+  useQuantLunaWS()
+  useKeyboardShortcuts()
+  return null
+}
 
-export default async function DashboardPage() {
-  // Fetch initial equity history SSR
-  let equityHistory = [];
-  try {
-    equityHistory = await getEquityCurve();
-  } catch { /* API offline la build time */ }
-
+export default function DashboardPage() {
   return (
-    <main className="min-h-screen bg-surface text-white">
+    <div
+      style={{
+        display: 'grid',
+        gridTemplateRows: '40px 1fr 180px',
+        gridTemplateColumns: '238px 1fr 320px',
+        gridTemplateAreas: `
+          "header  header  header"
+          "sidebar central right"
+          "log     log     log"
+        `,
+        height: '100vh',
+        width:  '100vw',
+        gap: 4,
+        padding: 4,
+        background: '#08080F',
+        overflow: 'hidden',
+      }}
+    >
+      <QuantLunaApp />
+
       {/* Header */}
-      <header className="border-b border-border px-6 py-3 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <span className="text-xl font-bold text-brand">QuantLuna</span>
-          <span className="text-xs text-slate-500 font-mono">v0.30.0</span>
-        </div>
-        <div className="flex items-center gap-2">
-          <span className="w-2 h-2 rounded-full bg-success animate-pulse" />
-          <span className="text-xs text-slate-400">Live</span>
-        </div>
-      </header>
-
-      {/* Body */}
-      <div className="px-6 py-5 space-y-5 max-w-screen-2xl mx-auto">
-        {/* Row 1: Metric Cards */}
-        <Suspense fallback={<div className="h-24 bg-card rounded-xl animate-pulse" />}>
-          <RiskMetrics />
-        </Suspense>
-
-        {/* Row 2: Equity Curve + Alert Feed */}
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-          <div className="lg:col-span-2">
-            <Suspense fallback={<div className="h-72 bg-card rounded-xl animate-pulse" />}>
-              <EquityCurve history={equityHistory} />
-            </Suspense>
-          </div>
-          <div>
-            <Suspense fallback={<div className="h-72 bg-card rounded-xl animate-pulse" />}>
-              <AlertFeed />
-            </Suspense>
-          </div>
-        </div>
-
-        {/* Row 3: Pairs Grid */}
-        <Suspense fallback={<div className="h-48 bg-card rounded-xl animate-pulse" />}>
-          <PairsGrid />
-        </Suspense>
+      <div style={{ gridArea: 'header' }}>
+        <HeaderBar />
       </div>
-    </main>
-  );
+
+      {/* Sidebar */}
+      <div style={{ gridArea: 'sidebar', overflow: 'hidden' }}>
+        <SidebarPanel />
+      </div>
+
+      {/* Central zone: Chart + Spread + Heatmap */}
+      <div
+        style={{
+          gridArea: 'central',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 4,
+          overflow: 'hidden',
+          minHeight: 0,
+        }}
+      >
+        <div style={{ flex: '6 1 0', minHeight: 0 }}>
+          <CandlestickChart />
+        </div>
+        <div style={{ flex: '2 1 0', minHeight: 0 }}>
+          <SpreadMonitorPanel />
+        </div>
+        <div style={{ flex: '2 1 0', minHeight: 0 }}>
+          <MarketHeatmap />
+        </div>
+      </div>
+
+      {/* Right zone: Balance + PnL + Arb */}
+      <div
+        style={{
+          gridArea: 'right',
+          display: 'flex',
+          flexDirection: 'column',
+          gap: 4,
+          overflow: 'hidden',
+          minHeight: 0,
+        }}
+      >
+        <div style={{ flex: '3 1 0', minHeight: 0 }}>
+          <BalanceTracker />
+        </div>
+        <div style={{ flex: '3 1 0', minHeight: 0 }}>
+          <PnLChart />
+        </div>
+        <div style={{ flex: '4 1 0', minHeight: 0 }}>
+          <ArbitragePanel />
+        </div>
+      </div>
+
+      {/* Execution Log */}
+      <div style={{ gridArea: 'log' }}>
+        <ExecutionLog />
+      </div>
+
+      {/* Modals overlay */}
+      <ModalsHost />
+    </div>
+  )
 }

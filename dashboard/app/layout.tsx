@@ -1,15 +1,17 @@
-import type { Metadata } from 'next';
-import './globals.css';
+import type { Metadata } from 'next'
+import './globals.css'
 
 export const metadata: Metadata = {
-  title:       'QuantLuna Dashboard',
-  description: 'Crypto Pairs Trading Engine — Live Dashboard',
-};
+  title: '⟁ QUANTLUNA — Algorithmic Trading Dashboard',
+  description: 'Stat-arb trading system: Kalman filter, cointegration, multi-exchange execution',
+}
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="ro" className="dark">
-      <body>{children}</body>
+    <html lang="en" className="dark">
+      <body style={{ background: '#08080F', overflow: 'hidden', height: '100vh' }}>
+        {children}
+      </body>
     </html>
-  );
+  )
 }

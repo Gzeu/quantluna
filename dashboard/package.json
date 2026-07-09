@@ -1,6 +1,6 @@
 {
   "name": "quantluna-dashboard",
-  "version": "0.30.0",
+  "version": "0.40.0",
   "private": true,
   "scripts": {
     "dev":   "next dev -p 3000",
@@ -9,13 +9,16 @@
     "lint":  "next lint"
   },
   "dependencies": {
-    "next":          "14.2.5",
-    "react":         "^18.3.1",
-    "react-dom":     "^18.3.1",
-    "recharts":      "^2.12.7",
-    "clsx":          "^2.1.1",
-    "lucide-react":  "^0.400.0",
-    "date-fns":      "^3.6.0"
+    "next":                "14.2.5",
+    "react":               "^18.3.1",
+    "react-dom":           "^18.3.1",
+    "recharts":            "^2.12.7",
+    "clsx":                "^2.1.1",
+    "lucide-react":        "^0.400.0",
+    "date-fns":            "^3.6.0",
+    "zustand":             "^4.5.2",
+    "lightweight-charts":  "^4.2.0",
+    "use-sound":           "^4.0.3"
   },
   "devDependencies": {
     "typescript":              "^5.5.3",
