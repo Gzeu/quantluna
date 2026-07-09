@@ -1,32 +1,22 @@
 """
 QuantLuna — Integration Loop (Sprint 19 + Sprint 28)
 
-Loop-ul de integrare end-to-end care leagă toate componentele S17-S18
-within un singur ciclu asincron. Acesta NU este live_trader.py —
-este un harness de validare care poate fi rulat în paper mode sau
-test mode fără conexiuni reale la exchange.
-
-Fluxul unui ciclu:
-  1. Fetch bar nou (mock sau real)
-  2. Update Kalman + spread z-score
-  3. Update SpreadMonitor → SpreadHealthReport
-  4. Check RegimeFilter (CB + VolRegime + MTF + Spread)
-  5. Dacă gate.allowed → submit OrderRequest via OrderManager
-  6. Record PnL → CircuitBreaker
-  7. NotifierBus → trimite semnale
-
 Sprint 28 additions:
-  reset_cycle() — resets position state (_in_position, _entry_side, _bar_idx)
-    without touching the Kalman/SpreadMonitor warmup state.
-    Called by BybitLiveRunner.start_new_cycle() after an external trade closes
-    so the bot can immediately look for new entries on the next bar.
+  #5  FundingMonitor gate — blocks entry when |funding_net_ann| exceeds
+      cfg.funding_gate_max_net_ann. Reads _last_y/_last_x directly from
+      the FundingMonitor instance (non-blocking, uses last polled value).
+      gate_blocked_by includes 'funding_gate'; CycleResult.funding_blocked=True.
 
-Usage:
-    loop = IntegrationLoop(IntegrationLoopConfig(dry_run=True))
-    await loop.run(n_bars=100)
+  #6  Partial exit — two-stage exit instead of one full exit:
+        Stage 1: |z| <= partial_exit_zscore (default 1.0)
+                 Close partial_exit_pct (default 50%) of position.
+        Stage 2: |z| <= exit_zscore (default 0.5)
+                 Close remaining qty.
+      State tracked via _remaining_qty and _partial_done.
 
-    # Sprint 28: after external trade closes
-    loop.reset_cycle()
+  reset_cycle() — resets _in_position/_entry_side/_remaining_qty/_partial_done
+      without touching Kalman/SpreadMonitor warmup or CircuitBreaker counters.
+      Called by BybitLiveRunner.start_new_cycle() after external close.
 """
 from __future__ import annotations
 
@@ -40,17 +30,15 @@ from loguru import logger
 
 @dataclass
 class BarData:
-    """Minimal bar structure pentru integration loop."""
-    symbol_y:   str
-    symbol_x:   str
-    price_y:    float
-    price_x:    float
-    timestamp:  float = field(default_factory=time.time)
+    symbol_y:  str
+    symbol_x:  str
+    price_y:   float
+    price_x:   float
+    timestamp: float = field(default_factory=time.time)
 
 
 @dataclass
 class CycleResult:
-    """Rezultatul unui ciclu de integrare."""
     bar_idx:         int
     zscore:          float
     gate_allowed:    bool
@@ -59,40 +47,41 @@ class CycleResult:
     spread_healthy:  bool
     size_multiplier: float
     duration_ms:     float
+    partial_exit:    bool = False   # Sprint 28 #6
+    funding_blocked: bool = False   # Sprint 28 #5
 
 
 @dataclass
 class IntegrationLoopConfig:
-    # Pair
     symbol_y: str = "BTCUSDT"
     symbol_x: str = "ETHUSDT"
     venue:    str = "bybit"
 
-    # Thresholds (default paper-friendly)
-    entry_zscore:  float = 2.0
-    exit_zscore:   float = 0.5
-    base_qty:      float = 0.001
+    entry_zscore:        float = 2.0
+    exit_zscore:         float = 0.5
+    partial_exit_zscore: float = 1.0    # Sprint 28 #6
+    partial_exit_pct:    float = 0.50   # Sprint 28 #6
+    base_qty:            float = 0.001
 
-    # Dry run: no real orders
-    dry_run: bool = True
+    dry_run:        bool  = True
+    bar_interval_s: float = 0.0
+    max_bars:       int   = 1000
 
-    # Timing
-    bar_interval_s: float = 0.0  # 0 = as fast as possible (test mode)
-
-    # Max cycles before stop
-    max_bars: int = 1000
+    # Sprint 28 #5: None = disabled
+    funding_gate_max_net_ann: Optional[float] = None
 
 
 class IntegrationLoop:
     """
-    End-to-end integration loop: Kalman → SpreadMonitor → RegimeFilter
-    → OrderManager → CircuitBreaker → NotifierBus.
+    End-to-end integration loop:
+    Kalman → SpreadMonitor → RegimeFilter → [FundingGate]
+    → OrderManager (entry / partial-exit / full-exit)
+    → NotifierBus
 
-    All components are optional — pass None to skip.
-    In test mode, inject synthetic bars via run_synthetic().
-
-    Sprint 28: reset_cycle() resets position state so the loop can
-    immediately look for new entries after an external trade closes.
+    Sprint 28:
+      - funding_monitor: optional FundingMonitor; gate blocks entry
+      - two-stage partial exit (50% at z=1.0, rest at z=0.5)
+      - reset_cycle(): safe position reset for external-trade restart
     """
 
     def __init__(
@@ -103,78 +92,59 @@ class IntegrationLoop:
         regime_filter=None,
         order_manager=None,
         notifier_bus=None,
+        funding_monitor=None,   # Sprint 28 #5
     ) -> None:
-        self.cfg            = cfg or IntegrationLoopConfig()
-        self._kalman        = kalman
-        self._spread_monitor = spread_monitor
-        self._regime_filter = regime_filter
-        self._order_manager = order_manager
-        self._notifier_bus  = notifier_bus
+        self.cfg              = cfg or IntegrationLoopConfig()
+        self._kalman          = kalman
+        self._spread_monitor  = spread_monitor
+        self._regime_filter   = regime_filter
+        self._order_manager   = order_manager
+        self._notifier_bus    = notifier_bus
+        self._funding_monitor = funding_monitor  # Sprint 28 #5
 
-        self._bar_idx    = 0
-        self._in_position = False
-        self._entry_side: Optional[str] = None
-        self._results: List[CycleResult] = []
+        self._bar_idx        = 0
+        self._in_position    = False
+        self._entry_side:    Optional[str] = None
+        self._remaining_qty: float         = 0.0   # Sprint 28 #6
+        self._partial_done:  bool          = False  # Sprint 28 #6
+        self._results:       List[CycleResult] = []
 
     # ------------------------------------------------------------------
-    # Sprint 28: cycle reset
+    # Sprint 28: reset_cycle
     # ------------------------------------------------------------------
 
     def reset_cycle(self) -> None:
         """
-        Reset position tracking state without disturbing Kalman / SpreadMonitor
-        warmup data.
-
-        Called by BybitLiveRunner.start_new_cycle() after an external position
-        closes so the next bar can trigger a fresh entry signal immediately.
-
-        What is reset:
-          - _in_position → False
-          - _entry_side  → None
-          - _bar_idx     → kept (continuous bar counter, not reset)
-          - _results     → kept (history preserved)
-
-        What is NOT reset (intentionally):
-          - Kalman state (spread / hedge ratio / half-life warmup)
-          - SpreadMonitor warmup bars
-          - CircuitBreaker loss counters (risk management must persist)
+        Reset position state without touching Kalman/SpreadMonitor warmup
+        or CircuitBreaker counters.
+        Called after an external trade closes so the next bar can enter fresh.
         """
-        was_in_position = self._in_position
-        was_side        = self._entry_side
-        self._in_position = False
-        self._entry_side  = None
         logger.info(
-            f"IntegrationLoop.reset_cycle: position state cleared "
-            f"(was_in_position={was_in_position} was_side={was_side}). "
-            f"Ready for new entries on next bar."
+            f"IntegrationLoop.reset_cycle: clearing "
+            f"in_position={self._in_position} side={self._entry_side}"
         )
+        self._in_position    = False
+        self._entry_side     = None
+        self._remaining_qty  = 0.0
+        self._partial_done   = False
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    async def run_synthetic(
-        self,
-        bars: List[BarData],
-    ) -> List[CycleResult]:
-        """
-        Run the loop on a pre-built list of synthetic bars.
-        Returns all CycleResult records.
-        """
+    async def run_synthetic(self, bars: List[BarData]) -> List[CycleResult]:
         self._results.clear()
         self._bar_idx = 0
-
         for bar in bars:
             result = await self._process_bar(bar)
             self._results.append(result)
-            self._bar_idx += 1
             if self.cfg.bar_interval_s > 0:
                 await asyncio.sleep(self.cfg.bar_interval_s)
-
         logger.info(
-            f"IntegrationLoop: completed {len(self._results)} bars "
-            f"| orders={sum(r.order_submitted for r in self._results)} "
-            f"| gate_blocks={sum(not r.gate_allowed for r in self._results)}"
+            f"IntegrationLoop: {len(self._results)} bars | "
+            f"orders={sum(r.order_submitted for r in self._results)} | "
+            f"partials={sum(r.partial_exit for r in self._results)} | "
+            f"funding_blocks={sum(r.funding_blocked for r in self._results)}"
         )
         return self._results
 
@@ -189,24 +159,23 @@ class IntegrationLoop:
     async def _process_bar(self, bar: BarData) -> CycleResult:
         t0 = time.perf_counter()
 
-        # 1. Kalman update → hedge ratio + spread
-        zscore = 0.0
-        half_life = 24.0
+        # 1. Kalman update
+        zscore        = 0.0
+        half_life     = 24.0
         kalman_p_diag = 0.0
-        spread_val = bar.price_y - bar.price_x  # fallback: simple spread
-
+        spread_val    = bar.price_y - bar.price_x
         if self._kalman is not None:
             try:
                 self._kalman.update(bar.price_y, bar.price_x)
-                zscore        = float(getattr(self._kalman, "zscore", 0.0))
+                zscore        = float(getattr(self._kalman, "zscore",    0.0))
                 half_life     = float(getattr(self._kalman, "half_life", 24.0))
-                kalman_p_diag = float(getattr(self._kalman, "p_diag", 0.0))
-                spread_val    = float(getattr(self._kalman, "spread", spread_val))
+                kalman_p_diag = float(getattr(self._kalman, "p_diag",   0.0))
+                spread_val    = float(getattr(self._kalman, "spread",    spread_val))
             except Exception as exc:
-                logger.warning(f"IntegrationLoop: Kalman update error: {exc}")
+                logger.warning(f"Kalman error: {exc}")
 
-        # 2. SpreadMonitor update
-        spread_report = None
+        # 2. SpreadMonitor
+        spread_report  = None
         spread_healthy = True
         if self._spread_monitor is not None:
             spread_report  = self._spread_monitor.update(
@@ -215,7 +184,7 @@ class IntegrationLoop:
             )
             spread_healthy = spread_report.healthy
 
-        # 3. RegimeFilter check
+        # 3. RegimeFilter
         gate_allowed    = True
         gate_blocked_by: List[str] = []
         size_multiplier = 1.0
@@ -225,23 +194,45 @@ class IntegrationLoop:
                 spread_report=spread_report,
             )
             gate_allowed    = gate.allowed
-            gate_blocked_by = gate.blocked_by
+            gate_blocked_by = list(gate.blocked_by)
             size_multiplier = gate.size_multiplier
 
-        # 4. Entry/exit logic
+        # Sprint 28 #5: FundingMonitor gate
+        funding_blocked = False
+        max_net = self.cfg.funding_gate_max_net_ann
+        if gate_allowed and max_net is not None and self._funding_monitor is not None:
+            funding_net = abs(
+                getattr(self._funding_monitor, "_last_y", 0.0)
+                - getattr(self._funding_monitor, "_last_x", 0.0)
+            )
+            if funding_net > max_net:
+                gate_allowed = False
+                funding_blocked = True
+                gate_blocked_by.append("funding_gate")
+                logger.debug(
+                    f"[FundingGate] blocked: net_ann={funding_net:.4f} "
+                    f"(max={max_net:.4f})"
+                )
+
+        # 4. Entry / partial-exit / full-exit
         order_submitted = False
-        cfg = self.cfg
+        partial_exit    = False
+        cfg             = self.cfg
 
         if gate_allowed:
             if not self._in_position and abs(zscore) >= cfg.entry_zscore:
+                # --- Entry ---
                 side = "SELL" if zscore > 0 else "BUY"
                 qty  = cfg.base_qty * size_multiplier
-                order_submitted = await self._submit_order(
+                ok   = await self._submit_order(
                     symbol=cfg.symbol_y, side=side, qty=qty
                 )
-                if order_submitted:
-                    self._in_position = True
-                    self._entry_side  = side
+                if ok:
+                    self._in_position    = True
+                    self._entry_side     = side
+                    self._remaining_qty  = qty
+                    self._partial_done   = False
+                    order_submitted      = True
                     if self._notifier_bus is not None:
                         try:
                             await self._notifier_bus.send_entry_signal(
@@ -253,14 +244,42 @@ class IntegrationLoop:
                         except Exception:
                             pass
 
-            elif self._in_position and abs(zscore) <= cfg.exit_zscore:
+            elif self._in_position:
+                abs_z     = abs(zscore)
                 exit_side = "BUY" if self._entry_side == "SELL" else "SELL"
-                order_submitted = await self._submit_order(
-                    symbol=cfg.symbol_y, side=exit_side, qty=cfg.base_qty
-                )
-                if order_submitted:
-                    self._in_position = False
-                    self._entry_side  = None
+
+                # Sprint 28 #6: Stage 1 — partial exit
+                if (
+                    not self._partial_done
+                    and abs_z <= cfg.partial_exit_zscore
+                    and abs_z > cfg.exit_zscore
+                ):
+                    partial_qty = self._remaining_qty * cfg.partial_exit_pct
+                    ok = await self._submit_order(
+                        symbol=cfg.symbol_y, side=exit_side, qty=partial_qty
+                    )
+                    if ok:
+                        self._remaining_qty *= (1.0 - cfg.partial_exit_pct)
+                        self._partial_done   = True
+                        partial_exit         = True
+                        order_submitted      = True
+                        logger.info(
+                            f"[PartialExit] {cfg.partial_exit_pct:.0%} closed | "
+                            f"z={zscore:.3f} remaining={self._remaining_qty:.6f}"
+                        )
+
+                # Stage 2 — full exit
+                elif abs_z <= cfg.exit_zscore:
+                    close_qty = self._remaining_qty if self._remaining_qty > 0 else cfg.base_qty
+                    ok = await self._submit_order(
+                        symbol=cfg.symbol_y, side=exit_side, qty=close_qty
+                    )
+                    if ok:
+                        self._in_position    = False
+                        self._entry_side     = None
+                        self._remaining_qty  = 0.0
+                        self._partial_done   = False
+                        order_submitted      = True
 
         self._bar_idx += 1
         duration_ms = (time.perf_counter() - t0) * 1000
@@ -274,16 +293,13 @@ class IntegrationLoop:
             spread_healthy=spread_healthy,
             size_multiplier=size_multiplier,
             duration_ms=duration_ms,
+            partial_exit=partial_exit,
+            funding_blocked=funding_blocked,
         )
 
-    async def _submit_order(
-        self, symbol: str, side: str, qty: float
-    ) -> bool:
-        """Submit order via OrderManager or dry-run log."""
+    async def _submit_order(self, symbol: str, side: str, qty: float) -> bool:
         if self.cfg.dry_run:
-            logger.info(
-                f"[DRY RUN] bar={self._bar_idx} {side} {qty:.6f} {symbol}"
-            )
+            logger.info(f"[DRY RUN] bar={self._bar_idx} {side} {qty:.6f} {symbol}")
             return True
         if self._order_manager is None:
             return False
@@ -300,5 +316,5 @@ class IntegrationLoop:
             await self._order_manager.submit(req)
             return True
         except Exception as exc:
-            logger.error(f"IntegrationLoop: order submit failed: {exc}")
+            logger.error(f"Order submit failed: {exc}")
             return False

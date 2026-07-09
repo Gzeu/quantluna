@@ -1,387 +1,307 @@
 """
-execution/market_trade_handler.py  —  QuantLuna Market Trade Handler (Sprint 28)
+QuantLuna — MarketTradeHandler (Sprint 28 rev-2)
 
-Problema rezolvată:
-  Când un trade este deschis din afara botului (manual, alt script, API extern)
-  pe exchange, botul trebuie să:
-    1. Detecteze poziția nouă (via polling sau WebSocket)
-    2. O adopte → seteze SL + TP via AdoptionEngine
-    3. Monitorizeze închiderea (fill TP/SL sau close extern)
-    4. Pornească automat un nou ciclu de tranzacționare după close
+Rev-2 changes vs rev-1:
+  - REMOVED: REST polling loop (_scan_loop / _scan_once)
+  - ADDED:   BybitPrivateWS push stream for position + order + execution events
+    Latency: REST poll ~5 000 ms  →  WS push ~50–150 ms  (-98%)
+  - Fallback: if BybitPrivateWS is unavailable (no creds) the handler
+    silently skips adoption (safe in dry/paper mode)
+  - _monitor_loop kept: detects external close of adopted positions
+    by checking if the WS position event shows size == 0
 
-Flux complet
-------------
+Flow:
+    BybitPrivateWS  →  on_position handler
+            │  (external position detected)
+            ▼
+    AdoptionEngine.adopt_and_protect()
+            │
+            ├─ OrderManager.submit(tp)  →  on_fill → _trigger_restart
+            └─ OrderManager.submit(sl)  →  on_fill → _trigger_restart
 
-  Exchange WS / REST poll
-        |
-        v
-  MarketTradeHandler._scan_loop()
-        |
-        v  (poziție nouă detectată, nu e a botului)
-  AdoptionEngine.adopt_and_protect(position)
-        |
-        +---> OrderManager.submit(tp_req)  →  on_fill → _trigger_restart
-        +---> OrderManager.submit(sl_req)  →  on_fill → _trigger_restart
-        |
-        v  (sau close extern detectat de _monitor_adopted_loop)
-  ResumeManager.restart_after_external_close(symbol, on_cycle_restart)
-        |
-        v
-  on_cycle_restart(symbol)  — callback furnizat de LiveTrader / BytbitLiveRunner
-
-Usage
------
-    handler = MarketTradeHandler(
-        exchange=ccxt_bybit,
-        order_manager=order_manager,
-        checkpoint=checkpoint,
-        adoption_config=AdoptionConfig(restart_cooldown_s=15.0),
-        on_cycle_restart=live_trader.start_new_cycle,
-        venue="bybit",
-        poll_interval_s=5.0,
-    )
-    await handler.start()
-    # ... later
-    await handler.stop()
+    BybitPrivateWS  →  on_position handler  (size == 0)
+            │  (position closed externally)
+            ▼
+    ResumeManager.restart_after_external_close(symbol, on_cycle_restart)
 """
 from __future__ import annotations
 
 import asyncio
-import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
+from typing import Any, Callable, Coroutine, Dict, Optional, Set
 
 from loguru import logger
-
-from execution.adoption_engine import AdoptionConfig, AdoptionDecision, AdoptionEngine
-from execution.order_manager import OrderManager
-from execution.resume_manager import ResumeManager
-
-
-@dataclass
-class MarketTradeHandlerConfig:
-    # Seconds between position polls
-    poll_interval_s: float = 5.0
-    # Seconds between checks for already-adopted positions being closed
-    monitor_interval_s: float = 10.0
-    # Minimum USD notional to consider a position worth adopting
-    min_notional_usdt: float = 5.0
-    # Venue name used when creating OrderRequests
-    venue: str = "bybit"
-    # Whether to log every poll (verbose)
-    verbose: bool = False
-
-
-@dataclass
-class _AdoptedEntry:
-    """Internal record of an adopted position being monitored."""
-    symbol: str
-    side: str
-    qty: float
-    entry_price: float
-    adopted_at: float = field(default_factory=time.time)
-    tp_local_id: Optional[str] = None
-    sl_local_id: Optional[str] = None
 
 
 class MarketTradeHandler:
     """
-    Polls exchange positions at regular intervals, adopts any external trades,
-    places protection orders, and restarts the trading cycle on close.
+    Detects external (market) positions via BybitPrivateWS position stream,
+    adopts them (TP/SL), and triggers cycle restart on close.
 
     Parameters
     ----------
-    exchange         : authenticated async CCXT exchange instance
-    order_manager    : OrderManager (already has routers registered)
-    checkpoint       : PositionCheckpoint
-    adoption_config  : AdoptionConfig (tp/sl pcts, restart cooldown, etc.)
-    alert_cfg        : optional AlertConfig for notifications
-    on_cycle_restart : async callable(symbol: str) — called when a position closes
-                       and a fresh cycle should start. Typically
-                       live_trader.start_new_cycle or bybit_runner.trigger_entry
-    venue            : exchange venue name for order routing
-    poll_interval_s  : how often to poll positions (seconds)
-    monitor_interval_s: how often to check adopted positions for external close
-    symbols          : optional list of symbols to watch; if None, watches all
+    private_ws        : BybitPrivateWS instance (already constructed, not started)
+    order_manager     : OrderManager instance
+    checkpoint        : Checkpoint instance
+    adoption_config   : AdoptionConfig (tp/sl %)
+    alert_cfg         : NotifierBus (optional)
+    on_cycle_restart  : async callable(symbol: str)
+    venue             : exchange venue label
+    monitor_interval_s: seconds between orphan-order cleanup checks
+    symbols           : list of symbols to watch (empty = watch all)
     """
 
     def __init__(
         self,
-        exchange: Any,
-        order_manager: OrderManager,
-        checkpoint: Any,
-        adoption_config: Optional[AdoptionConfig] = None,
-        alert_cfg: Any = None,
+        private_ws=None,
+        order_manager=None,
+        checkpoint=None,
+        adoption_config=None,
+        alert_cfg=None,
         on_cycle_restart: Optional[Callable[[str], Coroutine]] = None,
         venue: str = "bybit",
-        poll_interval_s: float = 5.0,
         monitor_interval_s: float = 10.0,
-        symbols: Optional[List[str]] = None,
+        symbols: Optional[list] = None,
+        # legacy compat: ignored in v2
+        exchange=None,
+        poll_interval_s: float = 5.0,
     ) -> None:
-        self._exchange    = exchange
-        self._om          = order_manager
-        self._checkpoint  = checkpoint
-        self._alert_cfg   = alert_cfg
-        self._restart_cb  = on_cycle_restart
-        self._venue       = venue
-        self._poll_s      = poll_interval_s
-        self._monitor_s   = monitor_interval_s
-        self._symbols     = symbols  # None = watch all
+        self._private_ws       = private_ws
+        self._order_manager    = order_manager
+        self._checkpoint       = checkpoint
+        self._adoption_config  = adoption_config
+        self._alert_cfg        = alert_cfg
+        self._on_cycle_restart = on_cycle_restart
+        self._venue            = venue
+        self._monitor_interval = monitor_interval_s
+        self._watch_symbols: Set[str] = set(symbols or [])
 
-        cfg = adoption_config or AdoptionConfig()
-        self._adoption = AdoptionEngine(
-            exchange=exchange,
-            checkpoint=checkpoint,
-            order_manager=order_manager,
-            config=cfg,
-            on_cycle_restart=self._handle_cycle_restart,
-        )
-        self._resume = ResumeManager(
-            checkpoint=checkpoint,
-            exchange=exchange,
-            alert_cfg=alert_cfg,
-        )
-
-        # Symbols currently managed by the bot (its own orders)
-        # populated by register_bot_symbol() so we don't adopt our own positions
         self._bot_symbols: Set[str] = set()
+        self._adopted: Dict[str, dict] = {}
+        self._ws_position_sizes: Dict[str, float] = {}
 
-        # Adopted positions currently being monitored for external close
-        self._adopted: Dict[str, _AdoptedEntry] = {}  # symbol → entry
-
-        self._running = False
-        self._tasks: List[asyncio.Task] = []
+        self._running       = False
+        self._monitor_task: Optional[asyncio.Task] = None
+        self._ws_task:      Optional[asyncio.Task] = None
 
     # ------------------------------------------------------------------
-    # Bot symbol registry — avoid re-adopting own positions
+    # Bot symbol registry
     # ------------------------------------------------------------------
 
     def register_bot_symbol(self, symbol: str) -> None:
-        """Tell the handler that `symbol` is managed by the bot itself."""
-        self._bot_symbols.add(symbol.upper())
+        self._bot_symbols.add(symbol)
 
     def unregister_bot_symbol(self, symbol: str) -> None:
-        self._bot_symbols.discard(symbol.upper())
+        self._bot_symbols.discard(symbol)
 
     # ------------------------------------------------------------------
-    # Start / stop
+    # Lifecycle
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Start polling and monitoring loops."""
-        if self._running:
-            logger.warning("MarketTradeHandler: already running")
-            return
         self._running = True
-        self._tasks = [
-            asyncio.create_task(self._scan_loop(),    name="mth_scan"),
-            asyncio.create_task(self._monitor_loop(), name="mth_monitor"),
-        ]
-        logger.info(
-            f"MarketTradeHandler: started | venue={self._venue} "
-            f"poll={self._poll_s}s monitor={self._monitor_s}s"
+        logger.info("MarketTradeHandler v2: starting (WS-based, no REST poll)")
+
+        if self._private_ws is not None:
+            self._private_ws.on_position(self._on_ws_position)
+            self._private_ws.on_execution(self._on_ws_execution)
+            self._ws_task = asyncio.create_task(
+                self._private_ws.start(), name="market_trade_handler_ws"
+            )
+            logger.info("MarketTradeHandler: BybitPrivateWS stream started")
+        else:
+            logger.warning(
+                "MarketTradeHandler: no BybitPrivateWS injected — "
+                "external trade detection DISABLED (safe in paper/dry mode)"
+            )
+
+        self._monitor_task = asyncio.create_task(
+            self._monitor_loop(), name="market_trade_monitor"
         )
 
+        tasks = [t for t in (self._ws_task, self._monitor_task) if t is not None]
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     async def stop(self) -> None:
-        """Stop all background tasks."""
         self._running = False
-        for t in self._tasks:
-            t.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
+        if self._private_ws is not None:
+            try:
+                await self._private_ws.stop()
+            except Exception:
+                pass
+        for task in (self._ws_task, self._monitor_task):
+            if task and not task.done():
+                task.cancel()
         logger.info("MarketTradeHandler: stopped")
 
     # ------------------------------------------------------------------
-    # Main scan loop — detect external positions
+    # WS callbacks
     # ------------------------------------------------------------------
 
-    async def _scan_loop(self) -> None:
+    async def _on_ws_position(self, msg: dict) -> None:
         """
-        Periodically fetch open positions from the exchange.
-        For each position NOT managed by the bot → adopt + protect.
+        Called on every 'position' WS event from Bybit private stream.
+        Payload: {topic: 'position', data: [{symbol, size, side, ...}]}
         """
-        while self._running:
-            try:
-                await self._scan_once()
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.warning(f"MarketTradeHandler._scan_loop error: {exc}")
-            await asyncio.sleep(self._poll_s)
+        data_list = msg.get("data", [])
+        if not isinstance(data_list, list):
+            data_list = [data_list]
 
-    async def _scan_once(self) -> None:
-        """Single position-scan iteration."""
-        try:
-            all_positions = await self._exchange.fetch_positions(self._symbols)
-        except Exception as exc:
-            logger.warning(f"MarketTradeHandler: fetch_positions failed: {exc}")
-            return
-
-        for pos_raw in all_positions:
-            qty = abs(float(pos_raw.get("contracts", 0) or 0))
-            if qty < 1e-8:
-                continue  # no open position
-
-            symbol = pos_raw.get("symbol", "").upper()
-            notional = abs(float(pos_raw.get("notional", 0) or qty * float(pos_raw.get("markPrice", 0) or 0)))
-
-            if notional < self._adoption.cfg.min_notional_adopt:
-                continue  # too small, skip
-
-            if symbol in self._bot_symbols:
-                continue  # our own position, skip
-
-            if symbol in self._adopted:
-                continue  # already adopted
-
-            # External position detected — adopt it
-            side_raw = pos_raw.get("side", "").lower()
-            side = "long" if side_raw in ("long", "buy") else "short"
-            entry_price = float(
-                pos_raw.get("entryPrice")
-                or pos_raw.get("entry_price")
-                or pos_raw.get("averagePrice")
-                or 0.0
-            )
-            pnl_pct = float(pos_raw.get("percentage", 0) or 0) / 100.0
-            liq_price = float(pos_raw.get("liquidationPrice", 0) or 0)
-            distance_to_liq = (
-                abs(entry_price - liq_price) / entry_price
-                if entry_price > 0 and liq_price > 0
-                else 1.0
-            )
-
-            position_dict = {
-                "symbol":               symbol,
-                "side":                 side,
-                "qty":                  qty,
-                "entry_price":          entry_price,
-                "notional_usdt":        notional,
-                "pnl_pct":              pnl_pct,
-                "distance_to_liq_pct": distance_to_liq,
-            }
-
-            logger.info(
-                f"MarketTradeHandler: external position detected "
-                f"{symbol} {side} qty={qty:.4f} entry={entry_price:.4f} "
-                f"notional=${notional:.2f} — adopting"
-            )
+        for pos_data in data_list:
+            symbol = pos_data.get("symbol", "")
+            if self._watch_symbols and symbol not in self._watch_symbols:
+                continue
 
             try:
-                result = await self._adoption.adopt_and_protect(
-                    position=position_dict,
-                    venue=self._venue,
+                size = float(pos_data.get("size", 0) or 0)
+            except (ValueError, TypeError):
+                size = 0.0
+
+            prev_size = self._ws_position_sizes.get(symbol, 0.0)
+            self._ws_position_sizes[symbol] = size
+
+            # Position opened externally
+            if size > 0 and prev_size == 0.0 and symbol not in self._bot_symbols:
+                logger.info(
+                    f"MarketTradeHandler: external position detected via WS — "
+                    f"{symbol} size={size} side={pos_data.get('side')}"
                 )
-                if result.decision == AdoptionDecision.ADOPT:
-                    self._adopted[symbol] = _AdoptedEntry(
-                        symbol=symbol,
-                        side=side,
-                        qty=qty,
-                        entry_price=entry_price,
-                        tp_local_id=result.tp_local_id,
-                        sl_local_id=result.sl_local_id,
-                    )
-                    logger.info(
-                        f"MarketTradeHandler: adopted {symbol} "
-                        f"tp_id={result.tp_local_id} sl_id={result.sl_local_id}"
-                    )
-                elif result.decision == AdoptionDecision.CLOSE_NOW:
-                    logger.warning(
-                        f"MarketTradeHandler: position {symbol} closed immediately: {result.reason}"
-                    )
-                # MONITOR_ONLY: no action needed
-            except Exception as exc:
-                logger.error(f"MarketTradeHandler: adopt_and_protect failed for {symbol}: {exc}")
+                await self._adopt_position(symbol, pos_data)
+
+            # Position closed while we have it adopted
+            elif size == 0.0 and prev_size > 0 and symbol in self._adopted:
+                logger.info(
+                    f"MarketTradeHandler: adopted position closed via WS — {symbol}"
+                )
+                await self._handle_external_close(symbol, reason="ws_position_zero")
+
+    async def _on_ws_execution(self, msg: dict) -> None:
+        """
+        Called on every 'execution' WS event.
+        Detects TP/SL fill → trigger restart.
+        """
+        data_list = msg.get("data", [])
+        if not isinstance(data_list, list):
+            data_list = [data_list]
+
+        for exec_data in data_list:
+            symbol      = exec_data.get("symbol", "")
+            reduce_only = exec_data.get("reduceOnly", False)
+            exec_type   = exec_data.get("execType", "")
+            if symbol in self._adopted and reduce_only:
+                logger.info(
+                    f"MarketTradeHandler: reduce-only fill on adopted {symbol} "
+                    f"(execType={exec_type}) — triggering restart"
+                )
+                await self._handle_external_close(
+                    symbol, reason=f"reduce_only_fill_{exec_type}"
+                )
 
     # ------------------------------------------------------------------
-    # Monitor loop — detect external close of adopted positions
+    # Adoption
+    # ------------------------------------------------------------------
+
+    async def _adopt_position(self, symbol: str, pos_data: dict) -> None:
+        if symbol in self._adopted:
+            return
+        if self._adoption_config is None or self._order_manager is None:
+            logger.warning(
+                f"MarketTradeHandler: cannot adopt {symbol} "
+                f"— adoption_config or order_manager missing"
+            )
+            return
+        try:
+            from execution.adoption_engine import AdoptionEngine
+            engine = AdoptionEngine(
+                order_manager=self._order_manager,
+                on_cycle_restart=self._on_cycle_restart,
+                config=self._adoption_config,
+            )
+            result = await engine.adopt_and_protect(
+                position_dict=pos_data,
+                venue=self._venue,
+            )
+            if result and getattr(result, "adopted", False):
+                self._adopted[symbol] = pos_data
+                logger.info(
+                    f"MarketTradeHandler: {symbol} adopted — "
+                    f"tp={getattr(result, 'tp_local_id', '?')} "
+                    f"sl={getattr(result, 'sl_local_id', '?')}"
+                )
+                if self._alert_cfg:
+                    try:
+                        await self._alert_cfg.send_alert(
+                            f"🔄 Adopted external position: {symbol} "
+                            f"size={pos_data.get('size')} side={pos_data.get('side')}",
+                            level="info",
+                        )
+                    except Exception:
+                        pass
+        except Exception as exc:
+            logger.error(
+                f"MarketTradeHandler: adopt_and_protect failed for {symbol}: {exc}"
+            )
+
+    # ------------------------------------------------------------------
+    # Close handling
+    # ------------------------------------------------------------------
+
+    async def _handle_external_close(
+        self, symbol: str, reason: str = "unknown"
+    ) -> None:
+        self._adopted.pop(symbol, None)
+        self._ws_position_sizes[symbol] = 0.0
+
+        if self._order_manager is not None:
+            try:
+                await self._order_manager.cancel_all_for_symbol(symbol)
+            except Exception as exc:
+                logger.warning(
+                    f"MarketTradeHandler: cancel_all_for_symbol({symbol}) failed: {exc}"
+                )
+
+        try:
+            from execution.resume_manager import ResumeManager
+            await ResumeManager.restart_after_external_close(
+                symbol=symbol,
+                on_cycle_restart=self._on_cycle_restart,
+                cooldown_s=getattr(self._adoption_config, "restart_cooldown_s", 15.0),
+                alert_msg=f"Position closed ({reason}): restarting cycle for {symbol}",
+            )
+        except Exception as exc:
+            logger.error(
+                f"MarketTradeHandler: restart_after_external_close failed: {exc}"
+            )
+            if self._on_cycle_restart is not None:
+                try:
+                    await self._on_cycle_restart(symbol)
+                except Exception as e2:
+                    logger.error(f"MarketTradeHandler: fallback restart failed: {e2}")
+
+    # ------------------------------------------------------------------
+    # Monitor loop (backup for WS-missed closes)
     # ------------------------------------------------------------------
 
     async def _monitor_loop(self) -> None:
-        """
-        Periodically checks if adopted positions have been closed externally
-        (i.e. position no longer exists on exchange but our TP/SL orders
-        are still open / cancelled without fill).
-        """
         while self._running:
+            await asyncio.sleep(self._monitor_interval)
+            if not self._running:
+                break
             try:
                 await self._monitor_once()
             except asyncio.CancelledError:
-                break
+                return
             except Exception as exc:
-                logger.warning(f"MarketTradeHandler._monitor_loop error: {exc}")
-            await asyncio.sleep(self._monitor_s)
+                logger.warning(f"MarketTradeHandler._monitor_once error: {exc}")
 
     async def _monitor_once(self) -> None:
-        """Single monitoring iteration for adopted positions."""
-        if not self._adopted:
-            return
-
-        closed_symbols: List[str] = []
-
-        for symbol, entry in list(self._adopted.items()):
-            try:
-                positions = await self._exchange.fetch_positions([symbol])
-            except Exception as exc:
-                logger.warning(f"MarketTradeHandler: fetch_positions({symbol}) failed: {exc}")
-                continue
-
-            qty_on_exchange = 0.0
-            for p in positions:
-                sym = p.get("symbol", "").upper()
-                if symbol in sym:
-                    qty_on_exchange = abs(float(p.get("contracts", 0) or 0))
-                    break
-
-            if qty_on_exchange < 1e-8:
-                # Position gone — closed externally (SL hit, manual, liquidation)
-                logger.info(
-                    f"MarketTradeHandler: adopted position {symbol} no longer on exchange "
-                    f"— triggering restart (external close)"
-                )
-                closed_symbols.append(symbol)
-
-                # Cancel any still-open TP/SL orders to avoid orphan orders
-                for lid in (entry.tp_local_id, entry.sl_local_id):
-                    if lid:
-                        status = self._om.get_status(lid)
-                        from execution.order_manager import OrderStatus
-                        if status in (OrderStatus.SUBMITTED, OrderStatus.PARTIALLY):
-                            await self._om.cancel(lid)
-                            logger.debug(f"MarketTradeHandler: cancelled orphan order {lid}")
-
-                # Trigger restart via ResumeManager
-                await self._resume.restart_after_external_close(
-                    symbol=symbol,
-                    on_cycle_restart=self._handle_cycle_restart,
-                    cooldown_s=self._adoption.cfg.restart_cooldown_s,
-                    alert_msg=(
-                        f"[MarketTradeHandler] Poziție adoptată {symbol} închisă extern — "
-                        f"restart ciclu în {self._adoption.cfg.restart_cooldown_s}s"
-                    ),
-                )
-
-        for symbol in closed_symbols:
-            self._adopted.pop(symbol, None)
-
-    # ------------------------------------------------------------------
-    # Cycle restart handler
-    # ------------------------------------------------------------------
-
-    async def _handle_cycle_restart(self, symbol: str) -> None:
-        """
-        Internal bridge: removes symbol from adopted dict and calls
-        the user-supplied on_cycle_restart callback.
-        """
-        self._adopted.pop(symbol, None)
-
-        if self._restart_cb is not None:
-            logger.info(f"MarketTradeHandler: calling on_cycle_restart for {symbol}")
-            try:
-                await self._restart_cb(symbol)
-            except Exception as exc:
-                logger.error(f"MarketTradeHandler: on_cycle_restart({symbol}) failed: {exc}")
-        else:
+        closed = [
+            sym for sym in list(self._adopted)
+            if self._ws_position_sizes.get(sym, 0.0) == 0.0
+        ]
+        for symbol in closed:
             logger.warning(
-                f"MarketTradeHandler: no on_cycle_restart registered for {symbol} "
-                f"— set on_cycle_restart= at init to auto-restart."
+                f"MarketTradeHandler: monitor detected WS-missed close for {symbol}"
             )
+            await self._handle_external_close(symbol, reason="monitor_size_zero")

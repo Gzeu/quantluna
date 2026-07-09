@@ -1,52 +1,20 @@
 """
-QuantLuna — Bybit Live Runner (Sprint 21 + Sprint 28)
+QuantLuna — Bybit Live Runner (Sprint 21 + Sprint 28 rev-2)
 
-Sprint 28 additions:
-  - MarketTradeHandler integration: detects external (market) trades,
-    places TP/SL via AdoptionEngine, and auto-restarts the cycle
-    via start_new_cycle() after the position closes
-  - start_new_cycle(symbol): public method — resets IntegrationLoop state
-    and re-enables trading for the given symbol after an external trade closes
-  - _build_market_trade_handler(): wires all components together
-  - BybitLiveRunnerConfig: new fields market_trade_enabled,
-    market_trade_poll_s, market_trade_monitor_s, market_trade_cooldown_s,
-    market_trade_tp_pct, market_trade_sl_pct
+Sprint 28 rev-2 — all 6 subsystems wired:
+  #1  MarketTradeHandler uses BybitPrivateWS push stream (not REST poll)
+      _build_market_trade_handler() builds BybitPrivateWS from env creds
+  #2  PnLReconciler started as async task; _BusBridge routes reconciled
+      open_pnl to CircuitBreaker.record_pnl() when below cb_loss_threshold
+  #3  HealthCheck HTTP server on HEALTH_PORT (default 8080)
+      Endpoints: GET /health  GET /metrics  GET /ready
+  #4  Single CCXT exchange instance built via _build_exchange_via_factory()
+      shared across FundingMonitor, PnLReconciler, MarketTradeHandler
+  #5  FundingMonitor built and injected into IntegrationLoop for gate blocking
+  #6  PartialExitHandler logic lives in IntegrationLoop (see integration_loop.py)
 
-Previous improvements (July 2026):
-  - SIGTERM handler: graceful shutdown on SIGTERM (Docker / systemd stop)
-  - Periodic stats log every N bars (configurable stats_log_interval)
-  - Heartbeat watchdog: if WS feed is dead for > watchdog_dead_s, alert + restart
-  - dry_run guard on shutdown alert
-  - BybitWsFeed.ws_max_reconnects forwarded from cfg.ws_max_reconnects
-  - _build_components passes category from env/cfg to BybitWsFeed
-
-Original docstring preserved below:
-
-Orchestratul principal pentru run real pe Bybit.
-Conectează toate componentele S17-S20 într-un singur supervisor asincron:
-
-  BybitWsFeed  (kline WebSocket)
-      ↓
-  LiveDataBridge.from_ws_bar()
-      ↓
-  KalmanAdapter.update(price_y, price_x)
-      ↓
-  SpreadMonitor.update()
-      ↓
-  RegimeFilter.check()  ←  CircuitBreaker + VolRegimeAdapter + SpreadMonitor
-      ↓  gate.allowed
-  IntegrationLoop._process_bar()
-      ↓
-  OrderManager.submit()  →  BybitOrderRouter  (real sau paper)
-      ↓
-  NotifierBus  →  Slack / Telegram
-      ↓
-  Checkpoint.save()  (stare + PnL la fiecare bar)
-      ↓
-  [Sprint 28] MarketTradeHandler polls exchange for external positions
-      →  AdoptionEngine.adopt_and_protect()
-      →  TP/SL orders placed
-      →  on close → start_new_cycle(symbol)
+Previous improvements (July 2026 / Sprint 21):
+  - SIGTERM handler, periodic stats, WS watchdog, dry_run alert guard
 """
 from __future__ import annotations
 
@@ -89,72 +57,78 @@ class BybitLiveRunnerConfig:
     telegram_bot_token: str = ""
     telegram_chat_id:   str = ""
 
-    # How often to log periodic stats (in bars processed)
-    stats_log_interval: int = 100
+    stats_log_interval: int   = 100
+    watchdog_dead_s:    float = 120.0
 
-    # Dead-feed watchdog: seconds without WS message before alert + restart
-    watchdog_dead_s: float = 120.0
-
-    # ------------------------------------------------------------------
-    # Sprint 28: MarketTradeHandler settings
-    # ------------------------------------------------------------------
-    # Enable detection and adoption of external (market) trades
-    market_trade_enabled: bool = True
-    # Seconds between exchange position polls
-    market_trade_poll_s: float = 5.0
-    # Seconds between checks that adopted positions are still open
-    market_trade_monitor_s: float = 10.0
-    # Seconds to wait after position close before restarting cycle
-    market_trade_cooldown_s: float = 15.0
-    # TP target % from entry (e.g. 0.04 = 4%)
-    market_trade_tp_pct: float = 0.04
-    # SL max loss % from entry (e.g. 0.03 = 3%)
-    market_trade_sl_pct: float = 0.03
-    # Minimum USD notional to consider a position worth adopting
+    # Sprint 28 #1: MarketTradeHandler
+    market_trade_enabled:      bool  = True
+    market_trade_monitor_s:    float = 10.0
+    market_trade_cooldown_s:   float = 15.0
+    market_trade_tp_pct:       float = 0.04
+    market_trade_sl_pct:       float = 0.03
     market_trade_min_notional: float = 5.0
+
+    # Sprint 28 #2: PnL reconciler
+    pnl_reconciler_enabled:     bool  = True
+    pnl_reconciler_interval_s:  float = 30.0
+    pnl_drift_alert_usd:        float = 10.0
+    pnl_cb_loss_threshold_usd:  float = -5.0
+
+    # Sprint 28 #3: HealthCheck HTTP
+    health_http_enabled: bool = True
+    health_http_port:    int  = 8080
+
+    # Sprint 28 #5: FundingMonitor gate
+    funding_gate_enabled:      bool  = True
+    funding_gate_max_net_ann:  float = 0.5
+    funding_poll_interval_s:   float = 60.0
 
     @classmethod
     def from_env(cls) -> "BybitLiveRunnerConfig":
         return cls(
-            symbol_y              = os.getenv("SYMBOL_Y",              "BTCUSDT"),
-            symbol_x              = os.getenv("SYMBOL_X",              "ETHUSDT"),
-            venue                 = os.getenv("VENUE",                 "bybit"),
-            interval              = os.getenv("INTERVAL",              "5"),
-            entry_zscore          = float(os.getenv("ENTRY_ZSCORE",    "2.0")),
-            exit_zscore           = float(os.getenv("EXIT_ZSCORE",     "0.5")),
-            base_qty              = float(os.getenv("BASE_QTY",        "0.001")),
-            kalman_window         = int(os.getenv("KALMAN_WINDOW",     "100")),
-            warmup_bars           = int(os.getenv("WARMUP_BARS",       "100")),
-            max_consecutive_losses= int(os.getenv("MAX_CONSEC_LOSSES", "3")),
-            max_drawdown_pct      = float(os.getenv("MAX_DRAWDOWN_PCT","5.0")),
-            cooldown_seconds      = int(os.getenv("COOLDOWN_SECONDS",  "3600")),
-            dry_run               = os.getenv("DRY_RUN", "true").lower() != "false",
-            ws_reconnect_s        = float(os.getenv("WS_RECONNECT_S",  "5.0")),
-            ws_max_reconnects     = int(os.getenv("WS_MAX_RECONNECTS", "20")),
-            checkpoint_path       = os.getenv("CHECKPOINT_PATH",       "state/bybit_live_state.json"),
-            slack_webhook_url     = os.getenv("SLACK_WEBHOOK_URL",     ""),
-            telegram_bot_token    = os.getenv("TELEGRAM_BOT_TOKEN",    ""),
-            telegram_chat_id      = os.getenv("TELEGRAM_CHAT_ID",      ""),
-            stats_log_interval    = int(os.getenv("STATS_LOG_INTERVAL", "100")),
-            watchdog_dead_s       = float(os.getenv("WATCHDOG_DEAD_S",  "120.0")),
-            # Sprint 28
-            market_trade_enabled  = os.getenv("MARKET_TRADE_ENABLED", "true").lower() != "false",
-            market_trade_poll_s   = float(os.getenv("MARKET_TRADE_POLL_S",    "5.0")),
-            market_trade_monitor_s= float(os.getenv("MARKET_TRADE_MONITOR_S", "10.0")),
-            market_trade_cooldown_s=float(os.getenv("MARKET_TRADE_COOLDOWN_S","15.0")),
-            market_trade_tp_pct   = float(os.getenv("MARKET_TRADE_TP_PCT",    "0.04")),
-            market_trade_sl_pct   = float(os.getenv("MARKET_TRADE_SL_PCT",    "0.03")),
-            market_trade_min_notional=float(os.getenv("MARKET_TRADE_MIN_NOTIONAL", "5.0")),
+            symbol_y                  = os.getenv("SYMBOL_Y",                    "BTCUSDT"),
+            symbol_x                  = os.getenv("SYMBOL_X",                    "ETHUSDT"),
+            venue                     = os.getenv("VENUE",                       "bybit"),
+            interval                  = os.getenv("INTERVAL",                    "5"),
+            entry_zscore              = float(os.getenv("ENTRY_ZSCORE",          "2.0")),
+            exit_zscore               = float(os.getenv("EXIT_ZSCORE",           "0.5")),
+            base_qty                  = float(os.getenv("BASE_QTY",              "0.001")),
+            kalman_window             = int(os.getenv("KALMAN_WINDOW",           "100")),
+            warmup_bars               = int(os.getenv("WARMUP_BARS",             "100")),
+            max_consecutive_losses    = int(os.getenv("MAX_CONSEC_LOSSES",       "3")),
+            max_drawdown_pct          = float(os.getenv("MAX_DRAWDOWN_PCT",      "5.0")),
+            cooldown_seconds          = int(os.getenv("COOLDOWN_SECONDS",        "3600")),
+            dry_run                   = os.getenv("DRY_RUN", "true").lower() != "false",
+            ws_reconnect_s            = float(os.getenv("WS_RECONNECT_S",        "5.0")),
+            ws_max_reconnects         = int(os.getenv("WS_MAX_RECONNECTS",       "20")),
+            checkpoint_path           = os.getenv("CHECKPOINT_PATH",             "state/bybit_live_state.json"),
+            slack_webhook_url         = os.getenv("SLACK_WEBHOOK_URL",           ""),
+            telegram_bot_token        = os.getenv("TELEGRAM_BOT_TOKEN",          ""),
+            telegram_chat_id          = os.getenv("TELEGRAM_CHAT_ID",            ""),
+            stats_log_interval        = int(os.getenv("STATS_LOG_INTERVAL",      "100")),
+            watchdog_dead_s           = float(os.getenv("WATCHDOG_DEAD_S",       "120.0")),
+            market_trade_enabled      = os.getenv("MARKET_TRADE_ENABLED",        "true").lower() != "false",
+            market_trade_monitor_s    = float(os.getenv("MARKET_TRADE_MONITOR_S","10.0")),
+            market_trade_cooldown_s   = float(os.getenv("MARKET_TRADE_COOLDOWN_S","15.0")),
+            market_trade_tp_pct       = float(os.getenv("MARKET_TRADE_TP_PCT",   "0.04")),
+            market_trade_sl_pct       = float(os.getenv("MARKET_TRADE_SL_PCT",   "0.03")),
+            market_trade_min_notional = float(os.getenv("MARKET_TRADE_MIN_NOTIONAL","5.0")),
+            pnl_reconciler_enabled    = os.getenv("PNL_RECONCILER_ENABLED",      "true").lower() != "false",
+            pnl_reconciler_interval_s = float(os.getenv("PNL_RECONCILER_INTERVAL_S","30.0")),
+            pnl_drift_alert_usd       = float(os.getenv("PNL_DRIFT_ALERT_USD",   "10.0")),
+            pnl_cb_loss_threshold_usd = float(os.getenv("PNL_CB_LOSS_THRESHOLD_USD","-5.0")),
+            health_http_enabled       = os.getenv("HEALTH_HTTP_ENABLED",         "true").lower() != "false",
+            health_http_port          = int(os.getenv("HEALTH_PORT",             "8080")),
+            funding_gate_enabled      = os.getenv("FUNDING_GATE_ENABLED",        "true").lower() != "false",
+            funding_gate_max_net_ann  = float(os.getenv("FUNDING_GATE_MAX_NET_ANN","0.5")),
+            funding_poll_interval_s   = float(os.getenv("FUNDING_POLL_INTERVAL_S","60.0")),
         )
 
 
 class BybitLiveRunner:
     """
     Main supervisor for Bybit live/paper trading.
-
-    Sprint 28: now also supervises a MarketTradeHandler that detects
-    external positions, protects them with TP/SL, and restarts the
-    trading cycle via start_new_cycle() when the position closes.
+    Sprint 28 rev-2: all 6 subsystems fully wired.
     """
 
     def __init__(
@@ -167,8 +141,8 @@ class BybitLiveRunner:
         notifier_bus=None,
         checkpoint=None,
         ws_feed=None,
-        # Sprint 28: optional ccxt exchange instance for MarketTradeHandler
-        exchange=None,
+        exchange=None,    # ccxt async instance (optional, built from env if None)
+        private_ws=None,  # BybitPrivateWS instance (optional)
     ) -> None:
         self.cfg             = cfg or BybitLiveRunnerConfig()
         self._running        = False
@@ -183,30 +157,33 @@ class BybitLiveRunner:
         self._notifier_bus   = notifier_bus
         self._checkpoint     = checkpoint
         self._ws_feed        = ws_feed
-
-        # Sprint 28: ccxt exchange for position polling
         self._exchange       = exchange
-        # Sprint 28: MarketTradeHandler instance (built in _build_components)
-        self._market_trade_handler = None
-        # Sprint 28: IntegrationLoop reference for cycle reset
-        self._intloop        = None
-        # Sprint 28: guard to avoid double restart
-        self._restart_lock   = asyncio.Lock()
+        self._private_ws     = private_ws
 
-        self._loop_task: Optional[asyncio.Task] = None
-        self._ws_task:   Optional[asyncio.Task] = None
-        self._watchdog_task: Optional[asyncio.Task] = None
-        self._mth_task:  Optional[asyncio.Task] = None  # Sprint 28
+        # built during _build_components
+        self._market_trade_handler = None
+        self._intloop              = None
+        self._restart_lock         = asyncio.Lock()
+        self._funding_monitor      = None
+        self._pnl_reconciler       = None
+        self._circuit_breaker      = None
+        self._health_server        = None
+
+        # background tasks
+        self._watchdog_task = None
+        self._mth_task      = None
+        self._funding_task  = None
+        self._pnl_task      = None
 
         self._stats = {
-            "bars_processed":   0,
-            "orders_submitted": 0,
-            "gate_blocks":      0,
-            "errors":           0,
-            "started_at":       0.0,
-            # Sprint 28
+            "bars_processed":        0,
+            "orders_submitted":      0,
+            "gate_blocks":           0,
+            "errors":                0,
+            "started_at":            0.0,
             "market_trades_adopted": 0,
             "cycle_restarts":        0,
+            "pnl_drift_alerts":      0,
         }
 
     # ------------------------------------------------------------------
@@ -217,14 +194,11 @@ class BybitLiveRunner:
         logger.info(
             f"BybitLiveRunner: starting "
             f"{self.cfg.symbol_y}/{self.cfg.symbol_x} "
-            f"interval={self.cfg.interval}m "
-            f"dry_run={self.cfg.dry_run}"
+            f"interval={self.cfg.interval}m dry_run={self.cfg.dry_run}"
         )
         self._stats["started_at"] = time.time()
         self._running  = True
         self._stop_event.clear()
-
-        # Register SIGTERM for graceful shutdown (Docker / systemd)
         self._register_signal_handlers()
 
         await self._build_components()
@@ -236,27 +210,38 @@ class BybitLiveRunner:
             except Exception:
                 pass
 
-        # Start heartbeat watchdog
+        # #3 Health HTTP server
+        if self.cfg.health_http_enabled:
+            await self._start_health_server()
+
+        # #5 FundingMonitor
+        if self._funding_monitor is not None:
+            self._funding_task = asyncio.create_task(
+                self._funding_monitor.run(), name="funding_monitor"
+            )
+            logger.info("BybitLiveRunner: FundingMonitor started")
+
+        # #2 PnL reconciler
+        if self._pnl_reconciler is not None:
+            self._pnl_task = asyncio.create_task(
+                self._run_pnl_reconciler(), name="pnl_reconciler"
+            )
+            logger.info("BybitLiveRunner: PnLReconciler started")
+
+        # Watchdog
         self._watchdog_task = asyncio.create_task(self._watchdog_loop())
 
-        # Sprint 28: start MarketTradeHandler if enabled and exchange available
+        # #1 MarketTradeHandler
         if self._market_trade_handler is not None:
             self._mth_task = asyncio.create_task(
-                self._market_trade_handler.start(),
-                name="market_trade_handler",
+                self._market_trade_handler.start(), name="market_trade_handler"
             )
-            logger.info("BybitLiveRunner: MarketTradeHandler started")
+            logger.info("BybitLiveRunner: MarketTradeHandler (WS) started")
 
         try:
             await self._run_main_loop()
         finally:
-            if self._watchdog_task and not self._watchdog_task.done():
-                self._watchdog_task.cancel()
-            # Sprint 28: stop MarketTradeHandler
-            if self._market_trade_handler is not None:
-                await self._market_trade_handler.stop()
-            if self._mth_task and not self._mth_task.done():
-                self._mth_task.cancel()
+            await self._cleanup_tasks()
             await self._shutdown()
 
     async def stop(self) -> None:
@@ -276,68 +261,126 @@ class BybitLiveRunner:
         }
 
     # ------------------------------------------------------------------
-    # Sprint 28: start_new_cycle — called by MarketTradeHandler on close
+    # Sprint 28 #1: start_new_cycle
     # ------------------------------------------------------------------
 
     async def start_new_cycle(self, symbol: str) -> None:
-        """
-        Called by MarketTradeHandler (via AdoptionEngine / ResumeManager)
-        when an adopted external position closes (TP hit, SL hit, or manual close).
-
-        Resets the IntegrationLoop state and re-enables entry for `symbol`.
-        If the symbol matches one of our pair legs, both legs are reset.
-
-        This is the single point of truth for cycle restart — pass this
-        method as `on_cycle_restart=` when building MarketTradeHandler.
-
-        Parameters
-        ----------
-        symbol : str  e.g. "BTCUSDT" — the symbol whose position just closed
-        """
         async with self._restart_lock:
             self._stats["cycle_restarts"] += 1
             logger.info(
-                f"BybitLiveRunner.start_new_cycle: restarting cycle for {symbol} "
+                f"BybitLiveRunner.start_new_cycle: {symbol} "
                 f"(restart #{self._stats['cycle_restarts']})"
             )
-
-            # 1. Reset IntegrationLoop position state
             if self._intloop is not None:
                 self._intloop.reset_cycle()
-                logger.info("BybitLiveRunner: IntegrationLoop cycle reset")
-
-            # 2. Unregister symbol from bot-owned set so it can be re-adopted
-            #    if another external trade opens before the bot takes one
             if self._market_trade_handler is not None:
                 self._market_trade_handler.unregister_bot_symbol(symbol)
-
-            # 3. Notify via NotifierBus
             if self._notifier_bus is not None:
                 try:
                     await self._notifier_bus.send_alert(
-                        f"🔄 QuantLuna: cycle restarted for {symbol} "
-                        f"(restart #{self._stats['cycle_restarts']})",
+                        f"\U0001f504 Cycle restarted for {symbol} "
+                        f"(#{self._stats['cycle_restarts']})",
                         level="info",
                     )
-                except Exception as exc:
-                    logger.warning(f"BybitLiveRunner: notify restart failed: {exc}")
+                except Exception:
+                    pass
 
+    # ------------------------------------------------------------------
+    # Sprint 28 #2: PnL reconciler loop + CircuitBreaker bridge
+    # ------------------------------------------------------------------
+
+    async def _run_pnl_reconciler(self) -> None:
+        if self._pnl_reconciler is None:
+            return
+        cfg = self.cfg
+
+        class _BusBridge:
+            """Minimal StateBus shim — routes reconciler output to runner CB."""
+            def __init__(self, runner):
+                self._r    = runner
+                self._snap = type("S", (), {"open_pnl_usd": 0.0})()
+
+            def snapshot(self):
+                return self._snap
+
+            def update(self, data: dict):
+                if data.get("pnl_drift_alert"):
+                    self._r._stats["pnl_drift_alerts"] += 1
+                    logger.warning(
+                        f"PnLReconciler: drift alert "
+                        f"drift=${data.get('pnl_drift_usd', 0):.2f}"
+                    )
+                pnl = data.get("reconciled_open_pnl", 0.0)
+                if (
+                    pnl < cfg.pnl_cb_loss_threshold_usd
+                    and self._r._circuit_breaker is not None
+                ):
+                    try:
+                        self._r._circuit_breaker.record_pnl(pnl)
+                        logger.warning(
+                            f"PnLReconciler→CB: open_pnl={pnl:.2f} USD "
+                            f"< threshold {cfg.pnl_cb_loss_threshold_usd}"
+                        )
+                    except Exception as exc:
+                        logger.debug(f"CB.record_pnl error: {exc}")
+
+        self._pnl_reconciler.bus = _BusBridge(self)
+        await self._pnl_reconciler.run()
+
+    # ------------------------------------------------------------------
+    # Sprint 28 #3: Health HTTP server
+    # ------------------------------------------------------------------
+
+    async def _start_health_server(self) -> None:
+        try:
+            from aiohttp import web
+            runner_ref = self
+
+            async def health(request):
+                return web.json_response({
+                    "status":    "ok" if runner_ref._running else "stopping",
+                    "warmed_up": runner_ref._warmed_up,
+                    "uptime_s":  runner_ref.status()["uptime_s"],
+                })
+
+            async def metrics(request):
+                return web.json_response(runner_ref.status())
+
+            async def ready(request):
+                ok = runner_ref._running and runner_ref._warmed_up
+                return web.json_response(
+                    {"ready": ok},
+                    status=200 if ok else 503,
+                )
+
+            app = web.Application()
+            app.router.add_get("/health",  health)
+            app.router.add_get("/metrics", metrics)
+            app.router.add_get("/ready",   ready)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", self.cfg.health_http_port)
+            await site.start()
+            self._health_server = runner
             logger.info(
-                f"BybitLiveRunner.start_new_cycle: done. "
-                f"IntegrationLoop ready to take new entries."
+                f"BybitLiveRunner: Health HTTP on :{self.cfg.health_http_port} "
+                f"(/health /metrics /ready)"
             )
+        except ImportError:
+            logger.warning(
+                "BybitLiveRunner: aiohttp not installed — "
+                "health HTTP disabled (pip install aiohttp)"
+            )
+        except Exception as exc:
+            logger.warning(f"BybitLiveRunner: health server failed: {exc}")
 
     # ------------------------------------------------------------------
     # Signal handlers
     # ------------------------------------------------------------------
 
     def _register_signal_handlers(self) -> None:
-        """
-        Register SIGTERM + SIGINT for graceful shutdown.
-        Useful for Docker (SIGTERM on `docker stop`) and systemd.
-        """
         if sys.platform == "win32":
-            return  # signal.add_signal_handler not available on Windows
+            return
         loop = asyncio.get_event_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             loop.add_signal_handler(
@@ -345,8 +388,8 @@ class BybitLiveRunner:
                 lambda s=sig: asyncio.create_task(self._handle_signal(s)),
             )
 
-    async def _handle_signal(self, sig: signal.Signals) -> None:
-        logger.info(f"BybitLiveRunner: received {sig.name}, initiating graceful shutdown")
+    async def _handle_signal(self, sig) -> None:
+        logger.info(f"BybitLiveRunner: {sig.name} → graceful shutdown")
         await self.stop()
 
     # ------------------------------------------------------------------
@@ -354,45 +397,32 @@ class BybitLiveRunner:
     # ------------------------------------------------------------------
 
     async def _watchdog_loop(self) -> None:
-        """
-        Periodic heartbeat:
-          - Logs stats every cfg.stats_log_interval bars
-          - Alerts + triggers reconnect if WS feed is dead > cfg.watchdog_dead_s
-        """
         last_bars = 0
         while self._running:
             await asyncio.sleep(30)
             if not self._running:
                 break
-
-            # Periodic stats log (Sprint 28: include market trade stats)
             current_bars = self._stats["bars_processed"]
             if current_bars - last_bars >= self.cfg.stats_log_interval:
                 logger.info(
                     f"[Heartbeat] bars={current_bars} "
                     f"orders={self._stats['orders_submitted']} "
-                    f"gate_blocks={self._stats['gate_blocks']} "
+                    f"blocks={self._stats['gate_blocks']} "
+                    f"adopted={self._stats['market_trades_adopted']} "
+                    f"restarts={self._stats['cycle_restarts']} "
+                    f"pnl_alerts={self._stats['pnl_drift_alerts']} "
                     f"errors={self._stats['errors']} "
-                    f"market_adopted={self._stats.get('market_trades_adopted', 0)} "
-                    f"cycle_restarts={self._stats.get('cycle_restarts', 0)} "
                     f"uptime={self.status()['uptime_s']:.0f}s"
                 )
                 last_bars = current_bars
-
-            # Dead-feed watchdog
             if self._ws_feed is not None and hasattr(self._ws_feed, "last_msg_age_s"):
                 age = self._ws_feed.last_msg_age_s
                 if age > self.cfg.watchdog_dead_s:
-                    logger.error(
-                        f"[Watchdog] WS feed dead for {age:.0f}s "
-                        f"(threshold={self.cfg.watchdog_dead_s}s) — alerting"
-                    )
+                    logger.error(f"[Watchdog] WS dead {age:.0f}s — stopping")
                     if self._notifier_bus:
                         try:
                             await self._notifier_bus.send_alert(
-                                f"⚠️ WS feed dead for {age:.0f}s on "
-                                f"{self.cfg.symbol_y}/{self.cfg.symbol_x}. "
-                                f"Forcing reconnect.",
+                                f"\u26a0\ufe0f WS dead {age:.0f}s — reconnecting",
                                 level="error",
                             )
                         except Exception:
@@ -428,6 +458,7 @@ class BybitLiveRunner:
                 max_drawdown_pct=cfg.max_drawdown_pct,
                 cooldown_seconds=cfg.cooldown_seconds,
             ))
+            self._circuit_breaker = cb  # #2: keep ref for PnL bridge
             vr = VolRegimeAdapter(ewma_span=20)
             self._regime_filter = RegimeFilter(
                 circuit_breaker=cb,
@@ -437,9 +468,7 @@ class BybitLiveRunner:
 
         if self._order_manager is None:
             from execution.order_manager import OrderManager, OrderManagerConfig
-            self._order_manager = OrderManager(OrderManagerConfig(
-                dry_run=cfg.dry_run,
-            ))
+            self._order_manager = OrderManager(OrderManagerConfig(dry_run=cfg.dry_run))
 
         if self._notifier_bus is None:
             await self._build_notifier_bus()
@@ -450,50 +479,145 @@ class BybitLiveRunner:
                 os.makedirs(os.path.dirname(cfg.checkpoint_path), exist_ok=True)
                 self._checkpoint = Checkpoint(path=cfg.checkpoint_path)
             except Exception as exc:
-                logger.warning(f"BybitLiveRunner: checkpoint not available: {exc}")
+                logger.warning(f"Checkpoint unavailable: {exc}")
 
-        # Sprint 28: build MarketTradeHandler if enabled
+        # #4 Single shared CCXT exchange
+        if self._exchange is None:
+            self._exchange = self._build_exchange_via_factory()
+
+        # #5 FundingMonitor
+        if cfg.funding_gate_enabled and self._exchange is not None:
+            await self._build_funding_monitor()
+
+        # #2 PnLReconciler
+        if cfg.pnl_reconciler_enabled and self._exchange is not None:
+            await self._build_pnl_reconciler()
+
+        # #1 MarketTradeHandler
         if cfg.market_trade_enabled:
             await self._build_market_trade_handler()
 
-    async def _build_market_trade_handler(self) -> None:
-        """
-        Sprint 28: Build and wire MarketTradeHandler with AdoptionConfig,
-        OrderManager, Checkpoint and on_cycle_restart callback.
+    # ------------------------------------------------------------------
+    # Sprint 28 #4: ExchangeFactory pattern
+    # ------------------------------------------------------------------
 
-        If no exchange is injected (self._exchange is None), tries to build
-        a CCXT Bybit async instance using env credentials.
-        Skips silently if credentials are missing (safe in paper/dry mode).
-        """
+    def _build_exchange_via_factory(self):
+        api_key    = os.getenv("BYBIT_API_KEY",    "")
+        api_secret = os.getenv("BYBIT_API_SECRET", "")
+        if not api_key or not api_secret:
+            logger.info(
+                "BybitLiveRunner: BYBIT_API_KEY/SECRET not set — "
+                "CCXT exchange not built (safe in dry mode)"
+            )
+            return None
+        try:
+            import ccxt.async_support as ccxt
+            testnet  = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
+            exchange = ccxt.bybit({
+                "apiKey":          api_key,
+                "secret":          api_secret,
+                "enableRateLimit": True,
+                "options":         {"defaultType": "linear"},
+            })
+            if testnet:
+                exchange.set_sandbox_mode(True)
+            logger.info(
+                f"BybitLiveRunner: CCXT Bybit built "
+                f"({'testnet' if testnet else 'mainnet'})"
+            )
+            return exchange
+        except Exception as exc:
+            logger.warning(f"BybitLiveRunner: CCXT build failed: {exc}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Sprint 28 #5: FundingMonitor
+    # ------------------------------------------------------------------
+
+    async def _build_funding_monitor(self) -> None:
         cfg = self.cfg
+        try:
+            from execution.funding_monitor import FundingMonitor, FundingConfig
 
-        # Resolve exchange — prefer injected, else build from env
-        exchange = self._exchange
-        if exchange is None:
-            api_key    = os.getenv("BYBIT_API_KEY", "")
-            api_secret = os.getenv("BYBIT_API_SECRET", "")
-            if not api_key or not api_secret:
-                logger.info(
-                    "BybitLiveRunner: BYBIT_API_KEY/SECRET not set — "
-                    "MarketTradeHandler disabled (no exchange for position polling)"
-                )
-                return
+            def _sym(s: str) -> str:
+                s = s.upper()
+                return f"{s[:-4]}/USDT:USDT" if "/" not in s and s.endswith("USDT") else s
+
+            fm_cfg = FundingConfig(
+                sym_y=_sym(cfg.symbol_y),
+                sym_x=_sym(cfg.symbol_x),
+                poll_interval_s=cfg.funding_poll_interval_s,
+            )
+            self._funding_monitor = FundingMonitor(
+                cfg=fm_cfg,
+                exchange=self._exchange,
+                bus=None,
+            )
+            logger.info(
+                f"BybitLiveRunner: FundingMonitor built "
+                f"({fm_cfg.sym_y}/{fm_cfg.sym_x} "
+                f"max_net={cfg.funding_gate_max_net_ann:.1%})"
+            )
+        except Exception as exc:
+            logger.warning(f"BybitLiveRunner: FundingMonitor build failed: {exc}")
+
+    # ------------------------------------------------------------------
+    # Sprint 28 #2: PnLReconciler
+    # ------------------------------------------------------------------
+
+    async def _build_pnl_reconciler(self) -> None:
+        cfg = self.cfg
+        try:
+            from execution.pnl_reconciler import PnLReconciler, ReconcilerConfig
+
+            def _sym(s: str) -> str:
+                s = s.upper()
+                return f"{s[:-4]}/USDT:USDT" if "/" not in s and s.endswith("USDT") else s
+
+            rec_cfg = ReconcilerConfig(
+                sym_y=_sym(cfg.symbol_y),
+                sym_x=_sym(cfg.symbol_x),
+                poll_interval_s=cfg.pnl_reconciler_interval_s,
+                drift_alert_usd=cfg.pnl_drift_alert_usd,
+            )
+            self._pnl_reconciler = PnLReconciler(
+                cfg=rec_cfg,
+                exchange=self._exchange,
+                bus=None,  # wired in _run_pnl_reconciler via _BusBridge
+            )
+            logger.info(
+                f"BybitLiveRunner: PnLReconciler built "
+                f"(drift_alert=${cfg.pnl_drift_alert_usd} "
+                f"cb_threshold=${cfg.pnl_cb_loss_threshold_usd})"
+            )
+        except Exception as exc:
+            logger.warning(f"BybitLiveRunner: PnLReconciler build failed: {exc}")
+
+    # ------------------------------------------------------------------
+    # Sprint 28 #1: MarketTradeHandler (WS-based)
+    # ------------------------------------------------------------------
+
+    async def _build_market_trade_handler(self) -> None:
+        cfg        = self.cfg
+        api_key    = os.getenv("BYBIT_API_KEY",    "")
+        api_secret = os.getenv("BYBIT_API_SECRET", "")
+
+        private_ws = self._private_ws
+        if private_ws is None and api_key and api_secret:
             try:
-                import ccxt.async_support as ccxt
-                exchange = ccxt.bybit({
-                    "apiKey":    api_key,
-                    "secret":    api_secret,
-                    "enableRateLimit": True,
-                    "options":   {"defaultType": "linear"},
-                })
-                testnet = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
-                if testnet:
-                    exchange.set_sandbox_mode(True)
-                self._exchange = exchange
-                logger.info("BybitLiveRunner: CCXT Bybit async exchange built for MarketTradeHandler")
+                from execution.bybit_private_ws import BybitPrivateWS
+                testnet    = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
+                private_ws = BybitPrivateWS(
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    testnet=testnet,
+                )
+                logger.info(
+                    f"BybitLiveRunner: BybitPrivateWS built "
+                    f"({'testnet' if testnet else 'mainnet'})"
+                )
             except Exception as exc:
-                logger.warning(f"BybitLiveRunner: could not build CCXT exchange: {exc} — MarketTradeHandler disabled")
-                return
+                logger.warning(f"BybitLiveRunner: BybitPrivateWS build failed: {exc}")
 
         try:
             from execution.market_trade_handler import MarketTradeHandler
@@ -505,33 +629,25 @@ class BybitLiveRunner:
                 min_notional_adopt=cfg.market_trade_min_notional,
                 restart_cooldown_s=cfg.market_trade_cooldown_s,
             )
-
             self._market_trade_handler = MarketTradeHandler(
-                exchange=exchange,
+                private_ws=private_ws,
                 order_manager=self._order_manager,
                 checkpoint=self._checkpoint,
                 adoption_config=adoption_cfg,
                 alert_cfg=self._notifier_bus,
-                on_cycle_restart=self.start_new_cycle,   # ← wired here
+                on_cycle_restart=self.start_new_cycle,
                 venue=cfg.venue,
-                poll_interval_s=cfg.market_trade_poll_s,
                 monitor_interval_s=cfg.market_trade_monitor_s,
-                symbols=[cfg.symbol_y, cfg.symbol_x],    # watch only our pair
+                symbols=[cfg.symbol_y, cfg.symbol_x],
             )
-
-            # Register bot-owned symbols so we don't adopt our own positions
             self._market_trade_handler.register_bot_symbol(cfg.symbol_y)
             self._market_trade_handler.register_bot_symbol(cfg.symbol_x)
-
             logger.info(
-                f"BybitLiveRunner: MarketTradeHandler built — "
-                f"watching {cfg.symbol_y}/{cfg.symbol_x} "
-                f"poll={cfg.market_trade_poll_s}s "
-                f"tp={cfg.market_trade_tp_pct*100:.1f}% "
-                f"sl={cfg.market_trade_sl_pct*100:.1f}%"
+                f"BybitLiveRunner: MarketTradeHandler built (WS) — "
+                f"tp={cfg.market_trade_tp_pct:.1%} sl={cfg.market_trade_sl_pct:.1%}"
             )
         except Exception as exc:
-            logger.error(f"BybitLiveRunner: failed to build MarketTradeHandler: {exc}")
+            logger.error(f"BybitLiveRunner: MarketTradeHandler build failed: {exc}")
 
     async def _build_notifier_bus(self) -> None:
         cfg = self.cfg
@@ -554,7 +670,7 @@ class BybitLiveRunner:
                     pass
             self._notifier_bus = bus
         except Exception as exc:
-            logger.warning(f"BybitLiveRunner: NotifierBus not available: {exc}")
+            logger.warning(f"NotifierBus unavailable: {exc}")
 
     # ------------------------------------------------------------------
     # Main loop
@@ -564,21 +680,25 @@ class BybitLiveRunner:
         if self._ws_feed is not None:
             await self._run_ws_loop()
         else:
-            logger.warning(
-                "BybitLiveRunner: no ws_feed injected. "
-                "Inject BybitWsFeed for production use. Waiting for stop signal."
-            )
+            logger.warning("BybitLiveRunner: no ws_feed — waiting for stop.")
             await self._stop_event.wait()
 
     async def _run_ws_loop(self) -> None:
         from execution.integration_loop import IntegrationLoopConfig, IntegrationLoop
         cfg      = self.cfg
         loop_cfg = IntegrationLoopConfig(
-            symbol_y=cfg.symbol_y, symbol_x=cfg.symbol_x,
+            symbol_y=cfg.symbol_y,
+            symbol_x=cfg.symbol_x,
             venue=cfg.venue,
-            entry_zscore=cfg.entry_zscore, exit_zscore=cfg.exit_zscore,
-            base_qty=cfg.base_qty, dry_run=cfg.dry_run,
+            entry_zscore=cfg.entry_zscore,
+            exit_zscore=cfg.exit_zscore,
+            base_qty=cfg.base_qty,
+            dry_run=cfg.dry_run,
             bar_interval_s=0.0,
+            # #5 funding gate threshold (None = disabled)
+            funding_gate_max_net_ann=(
+                cfg.funding_gate_max_net_ann if cfg.funding_gate_enabled else None
+            ),
         )
         self._intloop = IntegrationLoop(
             cfg=loop_cfg,
@@ -587,6 +707,7 @@ class BybitLiveRunner:
             regime_filter=self._regime_filter,
             order_manager=self._order_manager,
             notifier_bus=self._notifier_bus,
+            funding_monitor=self._funding_monitor,  # #5
         )
 
         reconnects = 0
@@ -595,17 +716,13 @@ class BybitLiveRunner:
                 async for bar in self._ws_feed.stream_bars():
                     if not self._running or self._stop_event.is_set():
                         return
-
                     self._bar_count += 1
                     self._stats["bars_processed"] += 1
 
                     if not self._warmed_up:
                         if self._bar_count >= cfg.warmup_bars:
                             self._warmed_up = True
-                            logger.info(
-                                f"BybitLiveRunner: warmup complete "
-                                f"({cfg.warmup_bars} bars), trading enabled"
-                            )
+                            logger.info(f"Warmup complete ({cfg.warmup_bars} bars)")
                         else:
                             await self._intloop._process_bar(bar)
                             continue
@@ -614,11 +731,9 @@ class BybitLiveRunner:
 
                     if result.order_submitted:
                         self._stats["orders_submitted"] += 1
-                        # Sprint 28: register symbol as bot-owned after entry
-                        if self._market_trade_handler is not None:
+                        if self._market_trade_handler:
                             self._market_trade_handler.register_bot_symbol(cfg.symbol_y)
                             self._market_trade_handler.register_bot_symbol(cfg.symbol_x)
-
                     if not result.gate_allowed:
                         self._stats["gate_blocks"] += 1
 
@@ -628,14 +743,12 @@ class BybitLiveRunner:
                                 "bar_count":        self._bar_count,
                                 "last_zscore":      result.zscore,
                                 "gate_allowed":     result.gate_allowed,
-                                "spread_healthy":   result.spread_healthy,
-                                "size_multiplier":  result.size_multiplier,
+                                "funding_blocked":  result.funding_blocked,
                                 "orders_submitted": self._stats["orders_submitted"],
                                 "timestamp":        time.time(),
                             })
                         except Exception:
                             pass
-
                     reconnects = 0
 
             except asyncio.CancelledError:
@@ -644,8 +757,7 @@ class BybitLiveRunner:
                 self._stats["errors"] += 1
                 reconnects += 1
                 logger.error(
-                    f"BybitLiveRunner: WS error "
-                    f"(reconnect {reconnects}/{cfg.ws_max_reconnects}): {exc}"
+                    f"WS error (reconnect {reconnects}/{cfg.ws_max_reconnects}): {exc}"
                 )
                 if self._notifier_bus:
                     try:
@@ -657,21 +769,38 @@ class BybitLiveRunner:
                 await asyncio.sleep(cfg.ws_reconnect_s)
 
         if reconnects >= cfg.ws_max_reconnects:
-            logger.error("BybitLiveRunner: max reconnects reached, stopping")
+            logger.error("Max reconnects reached, stopping")
             await self.stop()
 
     # ------------------------------------------------------------------
-    # Lifecycle helpers
+    # Cleanup + shutdown
     # ------------------------------------------------------------------
+
+    async def _cleanup_tasks(self) -> None:
+        for task in (
+            self._watchdog_task,
+            self._funding_task,
+            self._pnl_task,
+            self._mth_task,
+        ):
+            if task and not task.done():
+                task.cancel()
+        if self._market_trade_handler is not None:
+            await self._market_trade_handler.stop()
+        if self._health_server is not None:
+            try:
+                await self._health_server.cleanup()
+            except Exception:
+                pass
 
     async def _notify_startup(self) -> None:
         if self._notifier_bus is None:
             return
         try:
-            mode_label = "DRY" if self.cfg.dry_run else "LIVE"
-            mth_label  = " +MarketTradeWatch" if self._market_trade_handler else ""
+            mode  = "DRY" if self.cfg.dry_run else "LIVE"
+            extra = " +WS +PnLRec +Health +Funding" if not self.cfg.dry_run else ""
             await self._notifier_bus.send_alert(
-                f"🚀 QuantLuna [{mode_label}{mth_label}] started: "
+                f"\U0001f680 QuantLuna [{mode}{extra}] "
                 f"{self.cfg.symbol_y}/{self.cfg.symbol_x} "
                 f"interval={self.cfg.interval}m",
                 level="info",
@@ -680,12 +809,10 @@ class BybitLiveRunner:
             pass
 
     async def _shutdown(self) -> None:
-        logger.info(f"BybitLiveRunner: shutdown | stats={self.status()}")
-        # Sprint 28: close CCXT exchange if we built it
+        logger.info(f"BybitLiveRunner: shutdown | {self.status()}")
         if self._exchange is not None:
             try:
                 await self._exchange.close()
-                logger.debug("BybitLiveRunner: CCXT exchange closed")
             except Exception:
                 pass
         if self._order_manager is not None:
@@ -693,17 +820,16 @@ class BybitLiveRunner:
                 await self._order_manager.stop()
             except Exception:
                 pass
-        if self._notifier_bus is not None:
-            if not self.cfg.dry_run:
-                try:
-                    await self._notifier_bus.send_alert(
-                        f"🛑 QuantLuna stopped. "
-                        f"bars={self._stats['bars_processed']} "
-                        f"orders={self._stats['orders_submitted']} "
-                        f"market_adopted={self._stats.get('market_trades_adopted', 0)} "
-                        f"cycle_restarts={self._stats.get('cycle_restarts', 0)} "
-                        f"errors={self._stats['errors']}",
-                        level="info",
-                    )
-                except Exception:
-                    pass
+        if self._notifier_bus is not None and not self.cfg.dry_run:
+            try:
+                await self._notifier_bus.send_alert(
+                    f"\U0001f6d1 QuantLuna stopped. "
+                    f"bars={self._stats['bars_processed']} "
+                    f"orders={self._stats['orders_submitted']} "
+                    f"pnl_alerts={self._stats['pnl_drift_alerts']} "
+                    f"restarts={self._stats['cycle_restarts']} "
+                    f"errors={self._stats['errors']}",
+                    level="info",
+                )
+            except Exception:
+                pass
