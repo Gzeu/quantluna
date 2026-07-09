@@ -1,20 +1,14 @@
 """
-QuantLuna — Bybit Live Runner (Sprint 21 + Sprint 28 rev-2)
+QuantLuna — Bybit Live Runner (Sprint 21 + Sprint 28 rev-3)
 
-Sprint 28 rev-2 — all 6 subsystems wired:
-  #1  MarketTradeHandler uses BybitPrivateWS push stream (not REST poll)
-      _build_market_trade_handler() builds BybitPrivateWS from env creds
-  #2  PnLReconciler started as async task; _BusBridge routes reconciled
-      open_pnl to CircuitBreaker.record_pnl() when below cb_loss_threshold
-  #3  HealthCheck HTTP server on HEALTH_PORT (default 8080)
-      Endpoints: GET /health  GET /metrics  GET /ready
-  #4  Single CCXT exchange instance built via _build_exchange_via_factory()
-      shared across FundingMonitor, PnLReconciler, MarketTradeHandler
-  #5  FundingMonitor built and injected into IntegrationLoop for gate blocking
-  #6  PartialExitHandler logic lives in IntegrationLoop (see integration_loop.py)
+Sprint 28 rev-3 refactor:
+  - _build_exchange_via_factory()  → delegates to ExchangeFactory class
+  - _start_health_server()         → delegates to HealthCheck.start_http_server()
+                                     (falls back to inline aiohttp if not available)
+  - _watchdog_loop()               → delegates to WsWatchdog class
+  - All 6 Sprint 28 subsystems remain wired (#1-#6)
 
-Previous improvements (July 2026 / Sprint 21):
-  - SIGTERM handler, periodic stats, WS watchdog, dry_run alert guard
+All previous Sprint 28 rev-2 behaviour is preserved.
 """
 from __future__ import annotations
 
@@ -83,52 +77,56 @@ class BybitLiveRunnerConfig:
     funding_gate_max_net_ann:  float = 0.5
     funding_poll_interval_s:   float = 60.0
 
+    # Extra: HealthCheck pre-flight thresholds
+    min_capital_usdt: float = 100.0
+
     @classmethod
     def from_env(cls) -> "BybitLiveRunnerConfig":
         return cls(
-            symbol_y                  = os.getenv("SYMBOL_Y",                    "BTCUSDT"),
-            symbol_x                  = os.getenv("SYMBOL_X",                    "ETHUSDT"),
-            venue                     = os.getenv("VENUE",                       "bybit"),
-            interval                  = os.getenv("INTERVAL",                    "5"),
-            entry_zscore              = float(os.getenv("ENTRY_ZSCORE",          "2.0")),
-            exit_zscore               = float(os.getenv("EXIT_ZSCORE",           "0.5")),
-            base_qty                  = float(os.getenv("BASE_QTY",              "0.001")),
-            kalman_window             = int(os.getenv("KALMAN_WINDOW",           "100")),
-            warmup_bars               = int(os.getenv("WARMUP_BARS",             "100")),
-            max_consecutive_losses    = int(os.getenv("MAX_CONSEC_LOSSES",       "3")),
-            max_drawdown_pct          = float(os.getenv("MAX_DRAWDOWN_PCT",      "5.0")),
-            cooldown_seconds          = int(os.getenv("COOLDOWN_SECONDS",        "3600")),
+            symbol_y                  = os.getenv("SYMBOL_Y",                     "BTCUSDT"),
+            symbol_x                  = os.getenv("SYMBOL_X",                     "ETHUSDT"),
+            venue                     = os.getenv("VENUE",                        "bybit"),
+            interval                  = os.getenv("INTERVAL",                     "5"),
+            entry_zscore              = float(os.getenv("ENTRY_ZSCORE",           "2.0")),
+            exit_zscore               = float(os.getenv("EXIT_ZSCORE",            "0.5")),
+            base_qty                  = float(os.getenv("BASE_QTY",               "0.001")),
+            kalman_window             = int(os.getenv("KALMAN_WINDOW",            "100")),
+            warmup_bars               = int(os.getenv("WARMUP_BARS",              "100")),
+            max_consecutive_losses    = int(os.getenv("MAX_CONSEC_LOSSES",        "3")),
+            max_drawdown_pct          = float(os.getenv("MAX_DRAWDOWN_PCT",       "5.0")),
+            cooldown_seconds          = int(os.getenv("COOLDOWN_SECONDS",         "3600")),
             dry_run                   = os.getenv("DRY_RUN", "true").lower() != "false",
-            ws_reconnect_s            = float(os.getenv("WS_RECONNECT_S",        "5.0")),
-            ws_max_reconnects         = int(os.getenv("WS_MAX_RECONNECTS",       "20")),
-            checkpoint_path           = os.getenv("CHECKPOINT_PATH",             "state/bybit_live_state.json"),
-            slack_webhook_url         = os.getenv("SLACK_WEBHOOK_URL",           ""),
-            telegram_bot_token        = os.getenv("TELEGRAM_BOT_TOKEN",          ""),
-            telegram_chat_id          = os.getenv("TELEGRAM_CHAT_ID",            ""),
-            stats_log_interval        = int(os.getenv("STATS_LOG_INTERVAL",      "100")),
-            watchdog_dead_s           = float(os.getenv("WATCHDOG_DEAD_S",       "120.0")),
-            market_trade_enabled      = os.getenv("MARKET_TRADE_ENABLED",        "true").lower() != "false",
-            market_trade_monitor_s    = float(os.getenv("MARKET_TRADE_MONITOR_S","10.0")),
+            ws_reconnect_s            = float(os.getenv("WS_RECONNECT_S",         "5.0")),
+            ws_max_reconnects         = int(os.getenv("WS_MAX_RECONNECTS",        "20")),
+            checkpoint_path           = os.getenv("CHECKPOINT_PATH",              "state/bybit_live_state.json"),
+            slack_webhook_url         = os.getenv("SLACK_WEBHOOK_URL",            ""),
+            telegram_bot_token        = os.getenv("TELEGRAM_BOT_TOKEN",           ""),
+            telegram_chat_id          = os.getenv("TELEGRAM_CHAT_ID",             ""),
+            stats_log_interval        = int(os.getenv("STATS_LOG_INTERVAL",       "100")),
+            watchdog_dead_s           = float(os.getenv("WATCHDOG_DEAD_S",        "120.0")),
+            market_trade_enabled      = os.getenv("MARKET_TRADE_ENABLED",         "true").lower() != "false",
+            market_trade_monitor_s    = float(os.getenv("MARKET_TRADE_MONITOR_S", "10.0")),
             market_trade_cooldown_s   = float(os.getenv("MARKET_TRADE_COOLDOWN_S","15.0")),
-            market_trade_tp_pct       = float(os.getenv("MARKET_TRADE_TP_PCT",   "0.04")),
-            market_trade_sl_pct       = float(os.getenv("MARKET_TRADE_SL_PCT",   "0.03")),
+            market_trade_tp_pct       = float(os.getenv("MARKET_TRADE_TP_PCT",    "0.04")),
+            market_trade_sl_pct       = float(os.getenv("MARKET_TRADE_SL_PCT",    "0.03")),
             market_trade_min_notional = float(os.getenv("MARKET_TRADE_MIN_NOTIONAL","5.0")),
-            pnl_reconciler_enabled    = os.getenv("PNL_RECONCILER_ENABLED",      "true").lower() != "false",
+            pnl_reconciler_enabled    = os.getenv("PNL_RECONCILER_ENABLED",       "true").lower() != "false",
             pnl_reconciler_interval_s = float(os.getenv("PNL_RECONCILER_INTERVAL_S","30.0")),
-            pnl_drift_alert_usd       = float(os.getenv("PNL_DRIFT_ALERT_USD",   "10.0")),
+            pnl_drift_alert_usd       = float(os.getenv("PNL_DRIFT_ALERT_USD",    "10.0")),
             pnl_cb_loss_threshold_usd = float(os.getenv("PNL_CB_LOSS_THRESHOLD_USD","-5.0")),
-            health_http_enabled       = os.getenv("HEALTH_HTTP_ENABLED",         "true").lower() != "false",
-            health_http_port          = int(os.getenv("HEALTH_PORT",             "8080")),
-            funding_gate_enabled      = os.getenv("FUNDING_GATE_ENABLED",        "true").lower() != "false",
+            health_http_enabled       = os.getenv("HEALTH_HTTP_ENABLED",          "true").lower() != "false",
+            health_http_port          = int(os.getenv("HEALTH_PORT",              "8080")),
+            funding_gate_enabled      = os.getenv("FUNDING_GATE_ENABLED",         "true").lower() != "false",
             funding_gate_max_net_ann  = float(os.getenv("FUNDING_GATE_MAX_NET_ANN","0.5")),
-            funding_poll_interval_s   = float(os.getenv("FUNDING_POLL_INTERVAL_S","60.0")),
+            funding_poll_interval_s   = float(os.getenv("FUNDING_POLL_INTERVAL_S", "60.0")),
+            min_capital_usdt          = float(os.getenv("MIN_CAPITAL_USDT",        "100.0")),
         )
 
 
 class BybitLiveRunner:
     """
     Main supervisor for Bybit live/paper trading.
-    Sprint 28 rev-2: all 6 subsystems fully wired.
+    Sprint 28 rev-3: delegates exchange/health/watchdog to dedicated modules.
     """
 
     def __init__(
@@ -141,8 +139,8 @@ class BybitLiveRunner:
         notifier_bus=None,
         checkpoint=None,
         ws_feed=None,
-        exchange=None,    # ccxt async instance (optional, built from env if None)
-        private_ws=None,  # BybitPrivateWS instance (optional)
+        exchange=None,
+        private_ws=None,
     ) -> None:
         self.cfg             = cfg or BybitLiveRunnerConfig()
         self._running        = False
@@ -160,7 +158,6 @@ class BybitLiveRunner:
         self._exchange       = exchange
         self._private_ws     = private_ws
 
-        # built during _build_components
         self._market_trade_handler = None
         self._intloop              = None
         self._restart_lock         = asyncio.Lock()
@@ -168,8 +165,8 @@ class BybitLiveRunner:
         self._pnl_reconciler       = None
         self._circuit_breaker      = None
         self._health_server        = None
+        self._ws_watchdog          = None
 
-        # background tasks
         self._watchdog_task = None
         self._mth_task      = None
         self._funding_task  = None
@@ -228,8 +225,10 @@ class BybitLiveRunner:
             )
             logger.info("BybitLiveRunner: PnLReconciler started")
 
-        # Watchdog
-        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+        # Watchdog (rev-3: WsWatchdog class)
+        self._watchdog_task = asyncio.create_task(
+            self._run_watchdog(), name="ws_watchdog"
+        )
 
         # #1 MarketTradeHandler
         if self._market_trade_handler is not None:
@@ -248,6 +247,11 @@ class BybitLiveRunner:
         logger.info("BybitLiveRunner: stop requested")
         self._running = False
         self._stop_event.set()
+        if self._ws_watchdog is not None:
+            try:
+                await self._ws_watchdog.stop()
+            except Exception:
+                pass
 
     def status(self) -> dict:
         uptime = time.time() - self._stats["started_at"] if self._stats["started_at"] else 0
@@ -261,7 +265,7 @@ class BybitLiveRunner:
         }
 
     # ------------------------------------------------------------------
-    # Sprint 28 #1: start_new_cycle
+    # start_new_cycle
     # ------------------------------------------------------------------
 
     async def start_new_cycle(self, symbol: str) -> None:
@@ -286,7 +290,7 @@ class BybitLiveRunner:
                     pass
 
     # ------------------------------------------------------------------
-    # Sprint 28 #2: PnL reconciler loop + CircuitBreaker bridge
+    # PnL reconciler bridge
     # ------------------------------------------------------------------
 
     async def _run_pnl_reconciler(self) -> None:
@@ -295,7 +299,6 @@ class BybitLiveRunner:
         cfg = self.cfg
 
         class _BusBridge:
-            """Minimal StateBus shim — routes reconciler output to runner CB."""
             def __init__(self, runner):
                 self._r    = runner
                 self._snap = type("S", (), {"open_pnl_usd": 0.0})()
@@ -328,10 +331,40 @@ class BybitLiveRunner:
         await self._pnl_reconciler.run()
 
     # ------------------------------------------------------------------
-    # Sprint 28 #3: Health HTTP server
+    # rev-3: Health HTTP via HealthCheck module
     # ------------------------------------------------------------------
 
     async def _start_health_server(self) -> None:
+        """
+        Starts HTTP health server.
+        Tries HealthCheck module first; falls back to inline aiohttp.
+        """
+        try:
+            from execution.health_check import HealthCheck, HealthConfig
+            if hasattr(HealthCheck, "start_http_server"):
+                hc = HealthCheck(HealthConfig(
+                    exchange=self.cfg.venue,
+                    sym_y=self.cfg.symbol_y,
+                    sym_x=self.cfg.symbol_x,
+                ))
+                await hc.start_http_server(
+                    port=self.cfg.health_http_port,
+                    status_callback=self.status,
+                    ready_callback=lambda: self._running and self._warmed_up,
+                )
+                self._health_server = hc
+                logger.info(
+                    f"BybitLiveRunner: Health HTTP (HealthCheck module) "
+                    f"on :{self.cfg.health_http_port}"
+                )
+                return
+        except Exception:
+            pass
+
+        # Fallback: inline aiohttp
+        await self._start_health_server_inline()
+
+    async def _start_health_server_inline(self) -> None:
         try:
             from aiohttp import web
             runner_ref = self
@@ -348,10 +381,7 @@ class BybitLiveRunner:
 
             async def ready(request):
                 ok = runner_ref._running and runner_ref._warmed_up
-                return web.json_response(
-                    {"ready": ok},
-                    status=200 if ok else 503,
-                )
+                return web.json_response({"ready": ok}, status=200 if ok else 503)
 
             app = web.Application()
             app.router.add_get("/health",  health)
@@ -363,40 +393,39 @@ class BybitLiveRunner:
             await site.start()
             self._health_server = runner
             logger.info(
-                f"BybitLiveRunner: Health HTTP on :{self.cfg.health_http_port} "
-                f"(/health /metrics /ready)"
+                f"BybitLiveRunner: Health HTTP (inline) on :{self.cfg.health_http_port}"
             )
         except ImportError:
-            logger.warning(
-                "BybitLiveRunner: aiohttp not installed — "
-                "health HTTP disabled (pip install aiohttp)"
-            )
+            logger.warning("BybitLiveRunner: aiohttp not installed — health HTTP disabled")
         except Exception as exc:
             logger.warning(f"BybitLiveRunner: health server failed: {exc}")
 
     # ------------------------------------------------------------------
-    # Signal handlers
+    # rev-3: Watchdog via WsWatchdog class
     # ------------------------------------------------------------------
 
-    def _register_signal_handlers(self) -> None:
-        if sys.platform == "win32":
-            return
-        loop = asyncio.get_event_loop()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            loop.add_signal_handler(
-                sig,
-                lambda s=sig: asyncio.create_task(self._handle_signal(s)),
+    async def _run_watchdog(self) -> None:
+        """
+        Tries WsWatchdog class first; falls back to inline loop.
+        """
+        try:
+            from execution.ws_watchdog import WsWatchdog, WsWatchdogConfig
+            cfg = WsWatchdogConfig(
+                dead_s=self.cfg.watchdog_dead_s,
+                stats_log_interval=self.cfg.stats_log_interval,
             )
+            self._ws_watchdog = WsWatchdog(
+                cfg=cfg,
+                ws_feed=self._ws_feed,
+                status_callback=self.status,
+                on_dead=self.stop,
+                notifier_bus=self._notifier_bus,
+            )
+            await self._ws_watchdog.run()
+        except Exception:
+            await self._watchdog_loop_inline()
 
-    async def _handle_signal(self, sig) -> None:
-        logger.info(f"BybitLiveRunner: {sig.name} → graceful shutdown")
-        await self.stop()
-
-    # ------------------------------------------------------------------
-    # Watchdog
-    # ------------------------------------------------------------------
-
-    async def _watchdog_loop(self) -> None:
+    async def _watchdog_loop_inline(self) -> None:
         last_bars = 0
         while self._running:
             await asyncio.sleep(30)
@@ -422,12 +451,29 @@ class BybitLiveRunner:
                     if self._notifier_bus:
                         try:
                             await self._notifier_bus.send_alert(
-                                f"\u26a0\ufe0f WS dead {age:.0f}s — reconnecting",
-                                level="error",
+                                f"\u26a0\ufe0f WS dead {age:.0f}s", level="error"
                             )
                         except Exception:
                             pass
                     await self.stop()
+
+    # ------------------------------------------------------------------
+    # Signal handlers
+    # ------------------------------------------------------------------
+
+    def _register_signal_handlers(self) -> None:
+        if sys.platform == "win32":
+            return
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(
+                sig,
+                lambda s=sig: asyncio.create_task(self._handle_signal(s)),
+            )
+
+    async def _handle_signal(self, sig) -> None:
+        logger.info(f"BybitLiveRunner: {sig.name} → graceful shutdown")
+        await self.stop()
 
     # ------------------------------------------------------------------
     # Component builder
@@ -458,7 +504,7 @@ class BybitLiveRunner:
                 max_drawdown_pct=cfg.max_drawdown_pct,
                 cooldown_seconds=cfg.cooldown_seconds,
             ))
-            self._circuit_breaker = cb  # #2: keep ref for PnL bridge
+            self._circuit_breaker = cb
             vr = VolRegimeAdapter(ewma_span=20)
             self._regime_filter = RegimeFilter(
                 circuit_breaker=cb,
@@ -481,24 +527,21 @@ class BybitLiveRunner:
             except Exception as exc:
                 logger.warning(f"Checkpoint unavailable: {exc}")
 
-        # #4 Single shared CCXT exchange
+        # rev-3: ExchangeFactory class
         if self._exchange is None:
             self._exchange = self._build_exchange_via_factory()
 
-        # #5 FundingMonitor
         if cfg.funding_gate_enabled and self._exchange is not None:
             await self._build_funding_monitor()
 
-        # #2 PnLReconciler
         if cfg.pnl_reconciler_enabled and self._exchange is not None:
             await self._build_pnl_reconciler()
 
-        # #1 MarketTradeHandler
         if cfg.market_trade_enabled:
             await self._build_market_trade_handler()
 
     # ------------------------------------------------------------------
-    # Sprint 28 #4: ExchangeFactory pattern
+    # rev-3: ExchangeFactory delegates to module
     # ------------------------------------------------------------------
 
     def _build_exchange_via_factory(self):
@@ -506,10 +549,20 @@ class BybitLiveRunner:
         api_secret = os.getenv("BYBIT_API_SECRET", "")
         if not api_key or not api_secret:
             logger.info(
-                "BybitLiveRunner: BYBIT_API_KEY/SECRET not set — "
-                "CCXT exchange not built (safe in dry mode)"
+                "BybitLiveRunner: no API creds — exchange not built (dry mode OK)"
             )
             return None
+        try:
+            from execution.exchange_factory import ExchangeFactory
+            return ExchangeFactory.build(
+                venue=self.cfg.venue,
+                api_key=api_key,
+                api_secret=api_secret,
+                testnet=os.getenv("BYBIT_TESTNET", "false").lower() == "true",
+            )
+        except Exception:
+            pass
+        # Fallback: inline build
         try:
             import ccxt.async_support as ccxt
             testnet  = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
@@ -521,18 +574,11 @@ class BybitLiveRunner:
             })
             if testnet:
                 exchange.set_sandbox_mode(True)
-            logger.info(
-                f"BybitLiveRunner: CCXT Bybit built "
-                f"({'testnet' if testnet else 'mainnet'})"
-            )
+            logger.info("BybitLiveRunner: CCXT Bybit built (inline fallback)")
             return exchange
         except Exception as exc:
-            logger.warning(f"BybitLiveRunner: CCXT build failed: {exc}")
+            logger.warning(f"BybitLiveRunner: exchange build failed: {exc}")
             return None
-
-    # ------------------------------------------------------------------
-    # Sprint 28 #5: FundingMonitor
-    # ------------------------------------------------------------------
 
     async def _build_funding_monitor(self) -> None:
         cfg = self.cfg
@@ -549,21 +595,14 @@ class BybitLiveRunner:
                 poll_interval_s=cfg.funding_poll_interval_s,
             )
             self._funding_monitor = FundingMonitor(
-                cfg=fm_cfg,
-                exchange=self._exchange,
-                bus=None,
+                cfg=fm_cfg, exchange=self._exchange, bus=None,
             )
             logger.info(
-                f"BybitLiveRunner: FundingMonitor built "
-                f"({fm_cfg.sym_y}/{fm_cfg.sym_x} "
+                f"BybitLiveRunner: FundingMonitor ({fm_cfg.sym_y}/{fm_cfg.sym_x} "
                 f"max_net={cfg.funding_gate_max_net_ann:.1%})"
             )
         except Exception as exc:
             logger.warning(f"BybitLiveRunner: FundingMonitor build failed: {exc}")
-
-    # ------------------------------------------------------------------
-    # Sprint 28 #2: PnLReconciler
-    # ------------------------------------------------------------------
 
     async def _build_pnl_reconciler(self) -> None:
         cfg = self.cfg
@@ -581,21 +620,15 @@ class BybitLiveRunner:
                 drift_alert_usd=cfg.pnl_drift_alert_usd,
             )
             self._pnl_reconciler = PnLReconciler(
-                cfg=rec_cfg,
-                exchange=self._exchange,
-                bus=None,  # wired in _run_pnl_reconciler via _BusBridge
+                cfg=rec_cfg, exchange=self._exchange, bus=None,
             )
             logger.info(
-                f"BybitLiveRunner: PnLReconciler built "
+                f"BybitLiveRunner: PnLReconciler "
                 f"(drift_alert=${cfg.pnl_drift_alert_usd} "
                 f"cb_threshold=${cfg.pnl_cb_loss_threshold_usd})"
             )
         except Exception as exc:
             logger.warning(f"BybitLiveRunner: PnLReconciler build failed: {exc}")
-
-    # ------------------------------------------------------------------
-    # Sprint 28 #1: MarketTradeHandler (WS-based)
-    # ------------------------------------------------------------------
 
     async def _build_market_trade_handler(self) -> None:
         cfg        = self.cfg
@@ -608,9 +641,7 @@ class BybitLiveRunner:
                 from execution.bybit_private_ws import BybitPrivateWS
                 testnet    = os.getenv("BYBIT_TESTNET", "false").lower() == "true"
                 private_ws = BybitPrivateWS(
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    testnet=testnet,
+                    api_key=api_key, api_secret=api_secret, testnet=testnet,
                 )
                 logger.info(
                     f"BybitLiveRunner: BybitPrivateWS built "
@@ -643,7 +674,7 @@ class BybitLiveRunner:
             self._market_trade_handler.register_bot_symbol(cfg.symbol_y)
             self._market_trade_handler.register_bot_symbol(cfg.symbol_x)
             logger.info(
-                f"BybitLiveRunner: MarketTradeHandler built (WS) — "
+                f"BybitLiveRunner: MarketTradeHandler (WS) "
                 f"tp={cfg.market_trade_tp_pct:.1%} sl={cfg.market_trade_sl_pct:.1%}"
             )
         except Exception as exc:
@@ -695,7 +726,6 @@ class BybitLiveRunner:
             base_qty=cfg.base_qty,
             dry_run=cfg.dry_run,
             bar_interval_s=0.0,
-            # #5 funding gate threshold (None = disabled)
             funding_gate_max_net_ann=(
                 cfg.funding_gate_max_net_ann if cfg.funding_gate_enabled else None
             ),
@@ -707,7 +737,7 @@ class BybitLiveRunner:
             regime_filter=self._regime_filter,
             order_manager=self._order_manager,
             notifier_bus=self._notifier_bus,
-            funding_monitor=self._funding_monitor,  # #5
+            funding_monitor=self._funding_monitor,
         )
 
         reconnects = 0
@@ -789,7 +819,10 @@ class BybitLiveRunner:
             await self._market_trade_handler.stop()
         if self._health_server is not None:
             try:
-                await self._health_server.cleanup()
+                if hasattr(self._health_server, "cleanup"):
+                    await self._health_server.cleanup()
+                elif hasattr(self._health_server, "stop"):
+                    await self._health_server.stop()
             except Exception:
                 pass
 
