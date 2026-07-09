@@ -1,41 +1,37 @@
 """
-QuantLuna — Live Trading CLI  (v2 — cu WorkflowOrchestrator)
+scripts/run_live.py  —  Live / shadow-live trading entry point.
 
-Startup sequence:
-  0. preflight_check (deja exista in LiveTrader)
-  1. Position Scan     ← PositionScanner
-  2. Reconciliere      ← ResumeManager
-  3. Adoptie orfane    ← AdoptionEngine
-  4. ProfitOptimizer   ← registrare pozitii adoptate
-  5. LiveTrader.run()  + optimizer_loop (background)
+Can be run standalone::
 
-Usage:
-  python scripts/run_live.py --pair ETHUSDT BTCUSDT --mode paper
-  python scripts/run_live.py --pair ETHUSDT BTCUSDT --mode live
-  python scripts/run_live.py --pair ETHUSDT BTCUSDT --mode live --skip-orphan-scan
+    python scripts/run_live.py --pair BTCUSDT ETHUSDT --mode live
+
+Or called from main.py dispatch (confirmation already handled there)::
+
+    from scripts.run_live import main
+    await main(pair=["BTCUSDT", "ETHUSDT"], exchange="bybit", mode="live")
+
+Note: live-mode confirmation prompt has been removed from this module.
+Confirmation is now handled by _confirm_live() in main.py before the
+coroutine is ever called, so tracebacks propagate cleanly.
 """
 from __future__ import annotations
 
-import asyncio
+import logging
 import os
-import sys
 from pathlib import Path
 
-import click
-from loguru import logger
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
 from config.settings import QuantLunaConfig
-from execution.live_trader import LiveTrader, AlertConfig
-from execution.workflow_orchestrator import WorkflowOrchestrator, AdoptionConfig
+from execution.alert_config import AlertConfig
+from execution.live_trader import LiveTrader
+
+logger = logging.getLogger(__name__)
 
 
 def _build_alert_cfg(cfg: QuantLunaConfig) -> AlertConfig | None:
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    chat  = os.getenv("TELEGRAM_CHAT_ID", "")
+    token = cfg.notifications.telegram_token
+    chat  = cfg.notifications.telegram_chat_id
     if token and chat:
-        return AlertConfig(bot_token=token, chat_id=chat)
+        return AlertConfig(telegram_token=token, telegram_chat_id=chat)
     return None
 
 
@@ -43,106 +39,82 @@ async def _run(
     sym_y: str,
     sym_x: str,
     cfg: QuantLunaConfig,
-    checkpoint_path: str = "position_checkpoint.db",
-    skip_orphan_scan: bool = False,
+    checkpoint: str,
+    skip_orphan_scan: bool,
 ) -> None:
     alert_cfg = _build_alert_cfg(cfg)
-
-    # Instantiem LiveTrader — initializeaza exchange intern
-    trader = LiveTrader(sym_y=sym_y, sym_x=sym_x, cfg=cfg)
-
-    # Extragem exchange-ul initializat pentru a evita doua conexiuni separate
-    exchange = getattr(trader, '_exchange', None)
-
-    # ----------------------------------------------------------------
-    # FAZA 1-4: WorkflowOrchestrator (scan → reconcile → adopt → register)
-    # ----------------------------------------------------------------
-    if exchange is not None and not skip_orphan_scan:
-        adopt_cfg = AdoptionConfig(
-            adopt_min_pnl_pct=float(os.getenv("ADOPT_MIN_PNL_PCT", -0.02)),
-            close_loss_pct=float(os.getenv("CLOSE_LOSS_PCT", -0.05)),
-            min_liq_distance_pct=float(os.getenv("MIN_LIQ_DISTANCE_PCT", 0.08)),
-            tp_target_pct=float(os.getenv("TP_TARGET_PCT", 0.04)),
-            sl_max_loss_pct=float(os.getenv("SL_MAX_LOSS_PCT", 0.03)),
-            trailing_activation_pct=float(os.getenv("TRAILING_ACTIVATION_PCT", 0.02)),
-            trailing_distance_pct=float(os.getenv("TRAILING_DISTANCE_PCT", 0.015)),
-        )
-
-        orch = WorkflowOrchestrator(
-            exchange=exchange,
-            checkpoint_path=checkpoint_path,
-            alert_cfg=alert_cfg,
-            adoption_config=adopt_cfg,
-        )
-
-        ctx = await orch.run_startup_workflow()
-
-        if ctx.should_halt:
-            logger.critical(f"[Startup] HALT cerut de orchestrator: {ctx.halt_reason}")
-            sys.exit(1)
-
-        if ctx.has_adopted_positions:
-            logger.info(
-                f"[Startup] {ctx.adopted_count} pozitii adoptate, "
-                f"{ctx.closed_count} inchise automat — pornire optimizer loop"
-            )
-
-            async def _get_prices() -> dict:
-                """Price feed pentru optimizer loop."""
-                prices = {}
-                if ctx.optimizer:
-                    for sym in list(ctx.optimizer._positions.keys()):
-                        try:
-                            ticker = await exchange.fetch_ticker(sym)
-                            prices[sym] = float(ticker.get('last', 0))
-                        except Exception as exc:
-                            logger.warning(f"[PriceFeed] {sym}: {exc}")
-                return prices
-
-            poll_interval = float(os.getenv("OPTIMIZER_POLL_INTERVAL_S", 1.0))
-            asyncio.create_task(
-                orch.run_optimizer_loop(ctx, _get_prices, poll_interval_s=poll_interval)
-            )
-    else:
-        if skip_orphan_scan:
-            logger.info("[Startup] Orphan scan dezactivat (--skip-orphan-scan)")
-        else:
-            logger.warning("[Startup] Exchange neinitializat — skip orphan scan")
-
-    # ----------------------------------------------------------------
-    # FAZA 5: LiveTrader normal
-    # ----------------------------------------------------------------
+    trader = LiveTrader(
+        sym_y=sym_y,
+        sym_x=sym_x,
+        config=cfg,
+        checkpoint_path=checkpoint,
+        skip_orphan_scan=skip_orphan_scan,
+        alert_config=alert_cfg,
+    )
     await trader.run()
 
 
-@click.command()
-@click.option("--pair", nargs=2, required=True, help="Doua simboluri: Y X")
-@click.option("--mode", default="paper",
-              type=click.Choice(["paper", "live", "testnet"]), help="Trading mode")
-@click.option("--exchange", default="binance")
-@click.option("--params", default=None, help="JSON file cu parametri optimizati")
-@click.option("--checkpoint", default="position_checkpoint.db",
-              help="Cale checkpoint SQLite")
-@click.option("--skip-orphan-scan", is_flag=True, default=False,
-              help="Sari peste scanarea pozitiilor orfane la startup")
-def main(pair, mode, exchange, params, checkpoint, skip_orphan_scan):
+async def main(
+    pair: list[str] | None = None,
+    exchange: str | None = None,
+    mode: str = "paper",
+    checkpoint: str = "checkpoints/live_state.pkl",
+    params_file: str | None = None,
+    skip_orphan_scan: bool = False,
+    **_,
+) -> None:
+    """
+    Live/shadow-live entry point callable from main.py dispatch.
+    Live-mode confirmation is the caller's responsibility (main.py
+    calls _confirm_live() before invoking this coroutine).
+    """
+    if pair is None:
+        import argparse, sys
+        ap = argparse.ArgumentParser(prog="run_live")
+        ap.add_argument("--pair", nargs=2, metavar=("SYM_Y", "SYM_X"), required=True)
+        ap.add_argument("--exchange", default=os.environ.get("QUANTLUNA_EXCHANGE", "bybit"))
+        ap.add_argument("--mode", default="paper", choices=["live", "paper"])
+        ap.add_argument("--checkpoint", default="checkpoints/live_state.pkl")
+        ap.add_argument("--params", default=None)
+        ap.add_argument("--skip-orphan-scan", dest="skip_orphan_scan", action="store_true")
+        args = ap.parse_args()
+        pair             = args.pair
+        exchange         = args.exchange
+        mode             = args.mode
+        checkpoint       = args.checkpoint
+        params_file      = args.params
+        skip_orphan_scan = args.skip_orphan_scan
+
+        if mode == "live":
+            import sys
+            print("\u26a0\ufe0f  LIVE MODE — REAL ORDERS WILL BE PLACED.")
+            ans = input("Type 'YES' to confirm: ").strip()
+            if ans != "YES":
+                print("Aborted.")
+                sys.exit(0)
+
     sym_y_raw, sym_x_raw = pair
     sym_y = sym_y_raw.replace("USDT", "/USDT:USDT") if "/" not in sym_y_raw else sym_y_raw
     sym_x = sym_x_raw.replace("USDT", "/USDT:USDT") if "/" not in sym_x_raw else sym_x_raw
 
     cfg = QuantLunaConfig()
     cfg.trading_mode = mode
-    cfg.execution.exchange = exchange
+    cfg.execution.exchange = exchange or cfg.execution.exchange
 
     if mode == "live":
-        logger.warning("LIVE MODE — Ordine REALE vor fi plasate!")
-        confirm = input("Scrie 'YES' pentru confirmare: ")
-        if confirm.strip() != "YES":
-            logger.info("Anulat de utilizator")
-            return
+        logger.warning("LIVE MODE — Real orders will be placed on %s", cfg.execution.exchange)
 
-    asyncio.run(_run(sym_y, sym_x, cfg, checkpoint, skip_orphan_scan))
+    if params_file:
+        import json
+        with open(params_file) as f:
+            extra = json.load(f).get("params", {})
+        # Apply recognised overrides
+        if "delta" in extra:
+            cfg.kalman.delta = extra["delta"]
+
+    await _run(sym_y, sym_x, cfg, checkpoint, skip_orphan_scan)
 
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main())
