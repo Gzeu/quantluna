@@ -1,204 +1,332 @@
 """
-execution/workflow_orchestrator.py  —  QuantLuna Startup Workflow Orchestrator
+execution/workflow_orchestrator.py  —  QuantLuna Startup Workflow Orchestrator v2
 
-Planul complet de workflow la startup:
+Sprint 28 rev-3:
+  Orchestratorul complet care leagă TOATE modulele existente:
 
-  FAZA 0: Pre-flight guard (preflight_check.py deja există)
-  FAZA 1: Scan pozitii exchange  ← PositionScanner
-  FAZA 2: Reconciliere checkpoint  ← ResumeManager
-  FAZA 3: Adoptie pozitii orfane   ← AdoptionEngine
-  FAZA 4: Initializare optimizer    ← ProfitOptimizer.register()
-  FAZA 5: Pornire LiveTrader normal ← LiveTrader.run()
+  FAZA 0: Pre-flight HealthCheck      ← health_check.HealthCheck
+  FAZA 1: Scan pozitii exchange        ← position_scanner.PositionScanner
+  FAZA 2: Reconciliere checkpoint      ← resume_manager.ResumeManager
+  FAZA 3: Adoptie pozitii orfane       ← adoption_engine.AdoptionEngine
+  FAZA 4: Initializare ProfitOptimizer ← profit_optimizer.ProfitOptimizer
+  FAZA 5: Pornire BybitLiveRunner      ← bybit_live_runner.BybitLiveRunner
 
-Orchestratorul rulează fazele 1-4 înainte de a ceda controlul
-catre LiveTrader, asiȟurând că ORICE pozitie de pe cont
-e cunoscută şi gestionată.
+  Subsisteme integrate:
+  - ExchangeFactory  : instanta CCXT shared pentru toate fazele
+  - WsWatchdog       : injectat in runner
+  - EmergencyStop    : apelat la halt (FAZA 0 sau FAZA 2)
+  - NotifierBus      : inlocuieste live_trader._send_alert
 
-Usage:
-    orch = WorkflowOrchestrator(config, exchange, alert_cfg)
+Usage (din main.py):
+    orch = WorkflowOrchestrator.from_runner_cfg(runner_cfg, notifier_bus)
     ctx  = await orch.run_startup_workflow()
-
     if ctx.should_halt:
-        # halt şi notificare operator
-    elif ctx.has_adopted_positions:
-        # porneste optimizer loop în background
-    # porneste LiveTrader normal
+        sys.exit(1)
+    await orch.start_runner(ctx)  # blocks until stop
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
-from typing import List, Optional
-
-from execution.checkpoint import PositionCheckpoint
-from execution.position_scanner import PositionScanner, ScanReport
-from execution.resume_manager import ResumeManager, ReconcileResult
-from execution.adoption_engine import AdoptionEngine, AdoptionResult, AdoptionDecision, AdoptionConfig
-from execution.profit_optimizer import ProfitOptimizer
+from typing import List, Optional, Callable, Awaitable
 
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# StartupContext
+# ---------------------------------------------------------------------------
+
 @dataclass
 class StartupContext:
-    scan_report: Optional[ScanReport]          = None
-    reconcile_result: Optional[ReconcileResult] = None
-    adoption_results: List[AdoptionResult]     = field(default_factory=list)
-    optimizer: Optional[ProfitOptimizer]       = None
+    scan_report       = None   # ScanReport | None
+    reconcile_result  = None   # ReconcileResult | None
+    adoption_results: list = field(default_factory=list)
+    optimizer         = None   # ProfitOptimizer | None
+    health_report     = None   # HealthReport | None
 
-    should_halt: bool  = False
-    halt_reason: str   = ""
+    should_halt: bool = False
+    halt_reason: str  = ""
 
     @property
     def has_adopted_positions(self) -> bool:
-        return any(
-            r.decision in (AdoptionDecision.ADOPT, AdoptionDecision.MONITOR_ONLY)
-            for r in self.adoption_results
-        )
+        try:
+            from execution.adoption_engine import AdoptionDecision
+            return any(
+                r.decision in (AdoptionDecision.ADOPT, AdoptionDecision.MONITOR_ONLY)
+                for r in self.adoption_results
+            )
+        except Exception:
+            return bool(self.adoption_results)
 
     @property
     def adopted_count(self) -> int:
-        return sum(
-            1 for r in self.adoption_results
-            if r.decision in (AdoptionDecision.ADOPT, AdoptionDecision.MONITOR_ONLY)
-        )
+        try:
+            from execution.adoption_engine import AdoptionDecision
+            return sum(
+                1 for r in self.adoption_results
+                if r.decision in (AdoptionDecision.ADOPT, AdoptionDecision.MONITOR_ONLY)
+            )
+        except Exception:
+            return len(self.adoption_results)
 
     @property
     def closed_count(self) -> int:
-        return sum(
-            1 for r in self.adoption_results
-            if r.decision == AdoptionDecision.CLOSE_NOW
-        )
+        try:
+            from execution.adoption_engine import AdoptionDecision
+            return sum(
+                1 for r in self.adoption_results
+                if r.decision.name == "CLOSE_NOW"
+            )
+        except Exception:
+            return 0
 
+
+# ---------------------------------------------------------------------------
+# WorkflowOrchestrator
+# ---------------------------------------------------------------------------
 
 class WorkflowOrchestrator:
     """
-    Orchetratore de startup complet.
+    Orchestrator complet Sprint 28.
 
-    Args:
-        exchange:        ccxt async exchange instance
-        checkpoint_path: calea catre position_checkpoint.db
-        alert_cfg:       AlertConfig
-        adoption_config: AdoptionConfig (praguri decizie)
-        min_notional:    minim notional pentru scan pozitii
+    Preferred constructor: WorkflowOrchestrator.from_runner_cfg(cfg, bus)
+    Manual constructor for tests: WorkflowOrchestrator(exchange=..., ...)
     """
 
     def __init__(
         self,
-        exchange,
-        checkpoint_path: str = "position_checkpoint.db",
-        alert_cfg=None,
-        adoption_config: Optional[AdoptionConfig] = None,
+        exchange=None,
+        checkpoint_path: str = "state/position_checkpoint.db",
+        notifier_bus=None,
+        adoption_config=None,
         min_notional: float = 1.0,
+        runner=None,           # BybitLiveRunner instance (optional, built in start_runner)
+        runner_cfg=None,       # BybitLiveRunnerConfig (used to build runner + health check)
+        private_ws=None,       # BybitPrivateWS (optional, passed to runner)
+        ws_feed=None,          # BybitWsFeed (optional, passed to runner)
+        skip_health_check: bool = False,
     ) -> None:
-        self._exchange   = exchange
-        self._alert      = alert_cfg
-        self._cp         = PositionCheckpoint(checkpoint_path)
-        self._scanner    = PositionScanner(exchange, self._cp, min_notional)
-        self._resume     = ResumeManager(self._cp, exchange, alert_cfg)
-        self._adoption   = AdoptionEngine(exchange, self._cp, alert_cfg, adoption_config)
-        self._optimizer  = ProfitOptimizer(exchange, alert_cfg)
+        self._exchange        = exchange
+        self._checkpoint_path = checkpoint_path
+        self._bus             = notifier_bus
+        self._adoption_cfg    = adoption_config
+        self._min_notional    = min_notional
+        self._runner          = runner
+        self._runner_cfg      = runner_cfg
+        self._private_ws      = private_ws
+        self._ws_feed         = ws_feed
+        self._skip_health     = skip_health_check
+
+    # ------------------------------------------------------------------
+    # Factory
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_runner_cfg(
+        cls,
+        cfg,  # BybitLiveRunnerConfig
+        notifier_bus=None,
+        ws_feed=None,
+        private_ws=None,
+        skip_health_check: bool = False,
+    ) -> "WorkflowOrchestrator":
+        """
+        Build orchestrator from a BybitLiveRunnerConfig.
+        Exchange is built lazily via ExchangeFactory inside run_startup_workflow.
+        """
+        return cls(
+            exchange=None,       # built in _build_shared_exchange
+            checkpoint_path=cfg.checkpoint_path,
+            notifier_bus=notifier_bus,
+            runner_cfg=cfg,
+            ws_feed=ws_feed,
+            private_ws=private_ws,
+            skip_health_check=skip_health_check,
+        )
+
+    # ------------------------------------------------------------------
+    # Main entry
+    # ------------------------------------------------------------------
 
     async def run_startup_workflow(self) -> StartupContext:
         """
-        Execută toate fazele de startup si returnează StartupContext.
+        Executa toate fazele de startup si returneaza StartupContext.
+        Daca should_halt=True, apeleaza EmergencyStop si returneaza imediat.
         """
         ctx = StartupContext()
+        sep = "=" * 60
 
-        # --- FAZA 1: Scan pozitii exchange ---
-        logger.info("=" * 60)
+        logger.info(sep)
+        logger.info("[Orchestrator] QuantLuna startup workflow START")
+
+        # FAZA 0: Pre-flight HealthCheck
+        if not self._skip_health:
+            logger.info("[Orchestrator] FAZA 0: HealthCheck pre-flight")
+            ctx.health_report = await self._run_health_check()
+            if ctx.health_report is not None and not ctx.health_report.all_passed:
+                failures = [c.name for c in ctx.health_report.critical_failures]
+                ctx.should_halt = True
+                ctx.halt_reason = f"HealthCheck critical failures: {failures}"
+                logger.error(f"[Orchestrator] HALT: {ctx.halt_reason}")
+                await self._alert(f"\u274c Startup HALT (HealthCheck):\n{ctx.halt_reason}")
+                await self._emergency_stop(ctx.halt_reason)
+                return ctx
+            logger.info("[Orchestrator] FAZA 0: HealthCheck OK")
+        else:
+            logger.info("[Orchestrator] FAZA 0: HealthCheck SKIPPED (skip_health_check=True)")
+
+        # Build shared exchange (ExchangeFactory pattern)
+        if self._exchange is None:
+            self._exchange = await self._build_shared_exchange()
+
+        # FAZA 1: Scan pozitii exchange
         logger.info("[Orchestrator] FAZA 1: Scan pozitii exchange")
         try:
-            ctx.scan_report = await self._scanner.scan()
+            from execution.position_scanner import PositionScanner
+            from execution.checkpoint import PositionCheckpoint
+            cp      = PositionCheckpoint(self._checkpoint_path)
+            scanner = PositionScanner(self._exchange, cp, self._min_notional)
+            ctx.scan_report = await scanner.scan()
             logger.info(f"[Orchestrator] {ctx.scan_report.summary()}")
         except Exception as exc:
             logger.error(f"[Orchestrator] Scan failed: {exc} — skip")
-            ctx.scan_report = None
 
-        # --- FAZA 2: Reconciliere checkpoint ---
+        # FAZA 2: Reconciliere checkpoint
         logger.info("[Orchestrator] FAZA 2: Reconciliere checkpoint")
         try:
-            ctx.reconcile_result = await self._resume.reconcile_on_startup()
-            if ctx.reconcile_result.should_halt:
-                ctx.should_halt  = True
-                ctx.halt_reason  = ctx.reconcile_result.message
-                logger.error(f"[Orchestrator] HALT cerut de ResumeManager: {ctx.halt_reason}")
-                await self._send_alert(
-                    f"❌ Startup HALT (reconciliere):\n{ctx.halt_reason}"
-                )
+            from execution.resume_manager import ResumeManager
+            from execution.checkpoint import PositionCheckpoint
+            cp     = PositionCheckpoint(self._checkpoint_path)
+            resume = ResumeManager(cp, self._exchange, self._bus)
+            ctx.reconcile_result = await resume.reconcile_on_startup()
+            if getattr(ctx.reconcile_result, "should_halt", False):
+                ctx.should_halt = True
+                ctx.halt_reason = getattr(ctx.reconcile_result, "message", "reconcile halt")
+                logger.error(f"[Orchestrator] HALT (ResumeManager): {ctx.halt_reason}")
+                await self._alert(f"\u274c Startup HALT (reconciliere):\n{ctx.halt_reason}")
+                await self._emergency_stop(ctx.halt_reason)
                 return ctx
         except Exception as exc:
             logger.error(f"[Orchestrator] Reconciliere failed: {exc} — continuam")
 
-        # --- FAZA 3: Adoptie pozitii orfane ---
-        if ctx.scan_report and ctx.scan_report.has_orphans:
+        # FAZA 3: Adoptie pozitii orfane
+        has_orphans = (
+            ctx.scan_report is not None
+            and getattr(ctx.scan_report, "has_orphans", False)
+        )
+        if has_orphans:
             orphan_count = len(ctx.scan_report.orphans)
-            logger.info(
-                f"[Orchestrator] FAZA 3: Adoptie {orphan_count} pozitii orfane"
-            )
-            await self._send_alert(
-                f"⚠️ {orphan_count} pozitii orfane detectate — procesare automată..."
-            )
+            logger.info(f"[Orchestrator] FAZA 3: Adoptie {orphan_count} pozitii orfane")
+            await self._alert(f"\u26a0\ufe0f {orphan_count} pozitii orfane detectate — procesare...")
             try:
-                ctx.adoption_results = await self._adoption.adopt_all(
+                from execution.adoption_engine import AdoptionEngine
+                from execution.checkpoint import PositionCheckpoint
+                cp       = PositionCheckpoint(self._checkpoint_path)
+                adoption = AdoptionEngine(
+                    self._exchange, cp, self._bus, self._adoption_cfg
+                )
+                ctx.adoption_results = await adoption.adopt_all(
                     ctx.scan_report.orphans
                 )
                 logger.info(
-                    f"[Orchestrator] Adoptie completă: "
-                    f"{ctx.adopted_count} adoptate, "
-                    f"{ctx.closed_count} închise"
+                    f"[Orchestrator] Adoptie: {ctx.adopted_count} adoptate, "
+                    f"{ctx.closed_count} inchise"
                 )
             except Exception as exc:
                 logger.error(f"[Orchestrator] Adoptie failed: {exc}")
         else:
-            logger.info("[Orchestrator] FAZA 3: Nicio pozitie orfană — skip")
+            logger.info("[Orchestrator] FAZA 3: Nicio pozitie orfana — skip")
 
-        # --- FAZA 4: Initializare ProfitOptimizer ---
+        # FAZA 4: Initializare ProfitOptimizer
         if ctx.has_adopted_positions:
             logger.info(
-                f"[Orchestrator] FAZA 4: Initializare ProfitOptimizer "
+                f"[Orchestrator] FAZA 4: ProfitOptimizer "
                 f"({ctx.adopted_count} pozitii)"
             )
-            for result in ctx.adoption_results:
-                if result.decision in (
-                    AdoptionDecision.ADOPT,
-                    AdoptionDecision.MONITOR_ONLY,
-                ):
-                    self._optimizer.register(
-                        result,
-                        current_price=result.position.mark_price,
-                    )
-            ctx.optimizer = self._optimizer
-            logger.info(
-                f"[Orchestrator] ProfitOptimizer activ: "
-                f"{self._optimizer.active_count} pozitii urmărite"
-            )
+            try:
+                from execution.profit_optimizer import ProfitOptimizer
+                from execution.adoption_engine import AdoptionDecision
+                optimizer = ProfitOptimizer(self._exchange, self._bus)
+                for result in ctx.adoption_results:
+                    if result.decision in (
+                        AdoptionDecision.ADOPT, AdoptionDecision.MONITOR_ONLY
+                    ):
+                        optimizer.register(
+                            result,
+                            current_price=getattr(result.position, "mark_price", 0.0),
+                        )
+                ctx.optimizer = optimizer
+                logger.info(
+                    f"[Orchestrator] ProfitOptimizer: "
+                    f"{optimizer.active_count} pozitii active"
+                )
+            except Exception as exc:
+                logger.error(f"[Orchestrator] ProfitOptimizer init failed: {exc}")
         else:
-            logger.info("[Orchestrator] FAZA 4: Nicio pozitie adoptată — optimizer idle")
+            logger.info("[Orchestrator] FAZA 4: Nicio pozitie adoptata — optimizer idle")
 
-        logger.info("[Orchestrator] Startup workflow complet — LiveTrader poate porni")
-        logger.info("=" * 60)
+        logger.info("[Orchestrator] Startup workflow COMPLET — runner poate porni")
+        logger.info(sep)
         return ctx
+
+    # ------------------------------------------------------------------
+    # FAZA 5: Pornire runner + optimizer loop
+    # ------------------------------------------------------------------
+
+    async def start_runner(
+        self,
+        ctx: StartupContext,
+        price_feed_callback: Optional[Callable[[], Awaitable[dict]]] = None,
+    ) -> None:
+        """
+        FAZA 5: Porneste BybitLiveRunner si (optional) optimizer loop in paralel.
+
+        price_feed_callback: async () -> Dict[symbol, price]
+          Daca e None si exista pozitii adoptate, se foloseste un poller simplu
+          pe self._exchange.
+        """
+        if ctx.should_halt:
+            logger.error("[Orchestrator] start_runner: context HALT — nu pornesc runner")
+            return
+
+        logger.info("[Orchestrator] FAZA 5: Pornire BybitLiveRunner")
+
+        runner = self._runner
+        if runner is None:
+            runner = self._build_runner()
+
+        tasks = [asyncio.create_task(runner.start(), name="bybit_live_runner")]
+
+        # Optimizer loop in background daca avem pozitii adoptate
+        if ctx.has_adopted_positions and ctx.optimizer:
+            cb = price_feed_callback or self._make_price_callback(
+                [getattr(r, "symbol", "") for r in ctx.adoption_results]
+            )
+            tasks.append(
+                asyncio.create_task(
+                    self.run_optimizer_loop(ctx, cb), name="optimizer_loop"
+                )
+            )
+
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            logger.info("[Orchestrator] Tasks cancelled — stopping runner")
+            await runner.stop()
+        except Exception as exc:
+            logger.error(f"[Orchestrator] Runner error: {exc}")
+            await self._alert(f"\u26a0\ufe0f Runner error: {exc}")
+            raise
 
     async def run_optimizer_loop(
         self,
         ctx: StartupContext,
-        price_feed_callback,
+        price_feed_callback: Callable[[], Awaitable[dict]],
         poll_interval_s: float = 1.0,
     ) -> None:
-        """
-        Loop de monitoring pentru poziții adoptate.
-        Rulează în background task, paralel cu LiveTrader.
-
-        `price_feed_callback` e un callable async care returnează
-        Dict[symbol, price] la fiecare apel.
-
-        Exemplu integrare in main.py:
-            asyncio.create_task(
-                orchestrator.run_optimizer_loop(ctx, get_prices)
-            )
-        """
         if not ctx.optimizer or ctx.optimizer.active_count == 0:
             logger.info("[Orchestrator] Optimizer loop: nicio pozitie de monitorizat")
             return
@@ -207,14 +335,13 @@ class WorkflowOrchestrator:
             f"[Orchestrator] Optimizer loop pornit: "
             f"{ctx.optimizer.active_count} pozitii active"
         )
-
         while ctx.optimizer.active_count > 0:
             try:
-                prices = await price_feed_callback()
+                prices  = await price_feed_callback()
                 actions = await ctx.optimizer.on_price_tick(prices)
                 for action in actions:
                     logger.info(
-                        f"[OLoop] Action: {action.symbol} {action.action_type.value} "
+                        f"[OLoop] {action.symbol} {action.action_type.value} "
                         f"qty={action.close_qty:.4f} reason={action.reason} "
                         f"PnL={action.current_pnl:+.2f}"
                     )
@@ -225,17 +352,95 @@ class WorkflowOrchestrator:
                 logger.warning(f"[Orchestrator] Optimizer loop error: {exc}")
             await asyncio.sleep(poll_interval_s)
 
-        logger.info("[Orchestrator] Optimizer loop: toate pozițiile închise")
+        logger.info("[Orchestrator] Optimizer loop: toate pozitiile inchise")
 
-    async def _send_alert(self, message: str) -> None:
-        if not self._alert:
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    async def _run_health_check(self):
+        cfg = self._runner_cfg
+        if cfg is None:
+            logger.warning("[Orchestrator] No runner_cfg — skipping HealthCheck")
+            return None
+        try:
+            from execution.health_check import HealthCheck, HealthConfig
+            hc = HealthCheck(HealthConfig(
+                exchange=getattr(cfg, "venue", "bybit"),
+                sym_y=cfg.symbol_y,
+                sym_x=cfg.symbol_x,
+                api_key=os.getenv("BYBIT_API_KEY",    ""),
+                api_secret=os.getenv("BYBIT_API_SECRET", ""),
+                testnet=os.getenv("BYBIT_TESTNET", "false").lower() == "true",
+                min_capital_usdt=getattr(cfg, "min_capital_usdt", 100.0),
+            ))
+            report = await hc.run()
+            report.print_report()
+            return report
+        except Exception as exc:
+            logger.warning(f"[Orchestrator] HealthCheck error: {exc}")
+            return None
+
+    async def _build_shared_exchange(self):
+        """Build shared CCXT instance via ExchangeFactory."""
+        try:
+            from execution.exchange_factory import ExchangeFactory
+            return ExchangeFactory.build(
+                venue=getattr(self._runner_cfg, "venue", "bybit") if self._runner_cfg else "bybit",
+                api_key=os.getenv("BYBIT_API_KEY",    ""),
+                api_secret=os.getenv("BYBIT_API_SECRET", ""),
+                testnet=os.getenv("BYBIT_TESTNET", "false").lower() == "true",
+            )
+        except Exception as exc:
+            logger.warning(f"[Orchestrator] ExchangeFactory failed: {exc}")
+            return None
+
+    def _build_runner(self):
+        """Build BybitLiveRunner from runner_cfg."""
+        from execution.bybit_live_runner import BybitLiveRunner
+        return BybitLiveRunner(
+            cfg=self._runner_cfg,
+            exchange=self._exchange,
+            private_ws=self._private_ws,
+            ws_feed=self._ws_feed,
+            notifier_bus=self._bus,
+        )
+
+    def _make_price_callback(
+        self, symbols: list
+    ) -> Callable[[], Awaitable[dict]]:
+        """Fallback price poller via CCXT ticker for optimizer loop."""
+        exchange = self._exchange
+
+        async def _poll() -> dict:
+            prices = {}
+            if exchange is None:
+                return prices
+            for sym in symbols:
+                try:
+                    ticker = await exchange.fetch_ticker(sym)
+                    prices[sym] = float(ticker.get("last", 0) or 0)
+                except Exception:
+                    pass
+            return prices
+
+        return _poll
+
+    async def _alert(self, message: str) -> None:
+        if not self._bus:
             return
         try:
-            from execution.live_trader import _send_alert
-            await _send_alert(self._alert, message)
+            await self._bus.send_alert(message, level="error")
         except Exception as exc:
             logger.warning(f"[Orchestrator] alert failed: {exc}")
 
-    @property
-    def checkpoint(self) -> PositionCheckpoint:
-        return self._cp
+    async def _emergency_stop(self, reason: str) -> None:
+        try:
+            from execution.emergency_stop import EmergencyStop
+            es = EmergencyStop(
+                exchange=self._exchange,
+                alert_cfg=self._bus,
+            )
+            await es.trigger(reason=reason)
+        except Exception as exc:
+            logger.error(f"[Orchestrator] EmergencyStop failed: {exc}")

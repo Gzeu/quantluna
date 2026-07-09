@@ -1,5 +1,5 @@
 """
-QuantLuna — Order Manager (Sprint 17)
+QuantLuna — Order Manager (Sprint 17 + Sprint 28)
 
 Centralised order lifecycle management across all venues (Bybit, Binance, OKX).
 Abstracts over individual routers — callers use OrderManager instead of
@@ -11,12 +11,17 @@ Responsibilities:
   - Automatic cancel-on-timeout for stale open orders
   - Emit events via StateBus on fill / cancel / error
   - Thread-safe for use from async tasks
+  - [Sprint 28] on_fill / on_close callback hooks for cycle restart
 
 Usage:
     mgr = OrderManager(config)
     await mgr.connect_all()
     order_id = await mgr.submit(OrderRequest(symbol="BTCUSDT", side="buy", qty=0.01, venue="bybit"))
     status   = mgr.get_status(order_id)
+
+    # Register restart callback
+    mgr.register_on_fill(my_callback)   # called when FILLED
+    mgr.register_on_close(my_callback)  # called when CANCELLED / TIMED_OUT / FAILED
 """
 from __future__ import annotations
 
@@ -25,7 +30,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from loguru import logger
 
@@ -62,7 +67,7 @@ class OrderRequest:
     reduce_only: bool = False
     post_only:   bool = False
     client_id:   Optional[str] = None
-    tag:         str = ""        # e.g. 'pair_y', 'pair_x', 'close_y'
+    tag:         str = ""        # e.g. 'pair_y', 'pair_x', 'close_y', 'adopted'
 
 
 @dataclass
@@ -115,6 +120,10 @@ class OrderManagerConfig:
     dry_run: bool = False
 
 
+# Type alias for async callbacks
+_AsyncCallback = Callable[[OrderRecord], Coroutine]
+
+
 class OrderManager:
     """
     Centralised order router and lifecycle tracker.
@@ -124,6 +133,12 @@ class OrderManager:
     config   : OrderManagerConfig
     routers  : dict of venue_name → router object (must have place_market_order /
                place_limit_order / cancel_order coroutines)
+
+    Sprint 28 additions
+    -------------------
+    register_on_fill(cb)  — cb(record) called every time an order reaches FILLED status
+    register_on_close(cb) — cb(record) called when order reaches CANCELLED/FAILED/TIMED_OUT
+    These are useful for triggering a new trade cycle after a position closes.
     """
 
     def __init__(
@@ -136,6 +151,45 @@ class OrderManager:
         self._orders: Dict[str, OrderRecord] = {}  # local_id → record
         self._lock   = asyncio.Lock()
         self._monitor_task: Optional[asyncio.Task] = None
+
+        # Sprint 28: lifecycle callbacks
+        self._on_fill_callbacks:  List[_AsyncCallback] = []
+        self._on_close_callbacks: List[_AsyncCallback] = []
+
+    # ------------------------------------------------------------------
+    # Sprint 28: Callback registration
+    # ------------------------------------------------------------------
+
+    def register_on_fill(self, callback: _AsyncCallback) -> None:
+        """
+        Register an async callback invoked when any order reaches FILLED status.
+        Useful for: placing TP/SL after entry fill, starting a new cycle.
+
+        Example
+        -------
+        async def on_fill(record: OrderRecord):
+            if record.request.tag in ("adopted", "entry_y"):
+                await protection_manager.place_tp_sl(record)
+        mgr.register_on_fill(on_fill)
+        """
+        self._on_fill_callbacks.append(callback)
+        logger.debug(f"OrderManager: registered on_fill callback [{callback.__name__}]")
+
+    def register_on_close(self, callback: _AsyncCallback) -> None:
+        """
+        Register an async callback invoked when any order reaches a terminal
+        non-fill state: CANCELLED, FAILED, TIMED_OUT.
+        Useful for: restarting the trade cycle after a position closes externally.
+
+        Example
+        -------
+        async def on_close(record: OrderRecord):
+            if record.request.tag == "tp" or record.request.tag == "sl":
+                await cycle_manager.restart_cycle(record.request.symbol)
+        mgr.register_on_close(on_close)
+        """
+        self._on_close_callbacks.append(callback)
+        logger.debug(f"OrderManager: registered on_close callback [{callback.__name__}]")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -190,6 +244,7 @@ class OrderManager:
             record.fill_price  = req.price or 0.0
             record.fill_qty    = req.qty
             record.filled_at   = time.time()
+            await self._notify_fill(record)
             return local_id
 
         router = self.routers.get(req.venue)
@@ -197,6 +252,7 @@ class OrderManager:
             record.status = OrderStatus.FAILED
             record.error  = f"No router registered for venue='{req.venue}'"
             logger.error(record.error)
+            await self._notify_close(record)
             return local_id
 
         try:
@@ -225,6 +281,7 @@ class OrderManager:
                 )
                 record.fill_qty  = float(resp.get("filled") or req.qty)
                 record.filled_at = time.time()
+                await self._notify_fill(record)
             logger.info(
                 f"OrderManager: submitted {req.side} {req.qty} {req.symbol} "
                 f"venue={req.venue} local_id={local_id} exch_id={record.exchange_id}"
@@ -233,6 +290,7 @@ class OrderManager:
             record.status = OrderStatus.FAILED
             record.error  = str(exc)
             logger.error(f"OrderManager: order failed local_id={local_id} err={exc}")
+            await self._notify_close(record)
 
         return local_id
 
@@ -260,12 +318,14 @@ class OrderManager:
         router = self.routers.get(record.request.venue)
         if router is None or record.exchange_id is None:
             record.status = OrderStatus.CANCELLED
+            await self._notify_close(record)
             return True
 
         try:
             await router.cancel_order(record.exchange_id, record.request.symbol)
             record.status = OrderStatus.CANCELLED
             logger.info(f"OrderManager: cancelled local_id={local_id}")
+            await self._notify_close(record)
             return True
         except Exception as exc:
             logger.error(f"OrderManager: cancel failed local_id={local_id} err={exc}")
@@ -299,6 +359,38 @@ class OrderManager:
         return {"total": len(self._orders), "by_status": counts}
 
     # ------------------------------------------------------------------
+    # Sprint 28: Internal callback dispatchers
+    # ------------------------------------------------------------------
+
+    async def _notify_fill(self, record: OrderRecord) -> None:
+        """
+        Fire all on_fill callbacks for a FILLED order.
+        Callbacks run sequentially; errors are logged but do not abort the chain.
+        """
+        for cb in self._on_fill_callbacks:
+            try:
+                await cb(record)
+            except Exception as exc:
+                logger.error(
+                    f"OrderManager: on_fill callback [{getattr(cb, '__name__', cb)}] "
+                    f"raised for local_id={record.local_id}: {exc}"
+                )
+
+    async def _notify_close(self, record: OrderRecord) -> None:
+        """
+        Fire all on_close callbacks for a non-fill terminal order
+        (CANCELLED / FAILED / TIMED_OUT).
+        """
+        for cb in self._on_close_callbacks:
+            try:
+                await cb(record)
+            except Exception as exc:
+                logger.error(
+                    f"OrderManager: on_close callback [{getattr(cb, '__name__', cb)}] "
+                    f"raised for local_id={record.local_id}: {exc}"
+                )
+
+    # ------------------------------------------------------------------
     # Background timeout monitor
     # ------------------------------------------------------------------
 
@@ -328,6 +420,7 @@ class OrderManager:
                 cancelled = await self.cancel(record.local_id)
                 if not cancelled:
                     record.status = OrderStatus.TIMED_OUT
+                    await self._notify_close(record)
 
     def _prune_history(self) -> None:
         """Keep only the most recent max_history terminal records."""
