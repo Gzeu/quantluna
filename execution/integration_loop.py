@@ -1,5 +1,5 @@
 """
-QuantLuna — Integration Loop (Sprint 19)
+QuantLuna — Integration Loop (Sprint 19 + Sprint 28)
 
 Loop-ul de integrare end-to-end care leagă toate componentele S17-S18
 within un singur ciclu asincron. Acesta NU este live_trader.py —
@@ -15,9 +15,18 @@ Fluxul unui ciclu:
   6. Record PnL → CircuitBreaker
   7. NotifierBus → trimite semnale
 
+Sprint 28 additions:
+  reset_cycle() — resets position state (_in_position, _entry_side, _bar_idx)
+    without touching the Kalman/SpreadMonitor warmup state.
+    Called by BybitLiveRunner.start_new_cycle() after an external trade closes
+    so the bot can immediately look for new entries on the next bar.
+
 Usage:
     loop = IntegrationLoop(IntegrationLoopConfig(dry_run=True))
     await loop.run(n_bars=100)
+
+    # Sprint 28: after external trade closes
+    loop.reset_cycle()
 """
 from __future__ import annotations
 
@@ -81,6 +90,9 @@ class IntegrationLoop:
 
     All components are optional — pass None to skip.
     In test mode, inject synthetic bars via run_synthetic().
+
+    Sprint 28: reset_cycle() resets position state so the loop can
+    immediately look for new entries after an external trade closes.
     """
 
     def __init__(
@@ -103,6 +115,39 @@ class IntegrationLoop:
         self._in_position = False
         self._entry_side: Optional[str] = None
         self._results: List[CycleResult] = []
+
+    # ------------------------------------------------------------------
+    # Sprint 28: cycle reset
+    # ------------------------------------------------------------------
+
+    def reset_cycle(self) -> None:
+        """
+        Reset position tracking state without disturbing Kalman / SpreadMonitor
+        warmup data.
+
+        Called by BybitLiveRunner.start_new_cycle() after an external position
+        closes so the next bar can trigger a fresh entry signal immediately.
+
+        What is reset:
+          - _in_position → False
+          - _entry_side  → None
+          - _bar_idx     → kept (continuous bar counter, not reset)
+          - _results     → kept (history preserved)
+
+        What is NOT reset (intentionally):
+          - Kalman state (spread / hedge ratio / half-life warmup)
+          - SpreadMonitor warmup bars
+          - CircuitBreaker loss counters (risk management must persist)
+        """
+        was_in_position = self._in_position
+        was_side        = self._entry_side
+        self._in_position = False
+        self._entry_side  = None
+        logger.info(
+            f"IntegrationLoop.reset_cycle: position state cleared "
+            f"(was_in_position={was_in_position} was_side={was_side}). "
+            f"Ready for new entries on next bar."
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -217,6 +262,7 @@ class IntegrationLoop:
                     self._in_position = False
                     self._entry_side  = None
 
+        self._bar_idx += 1
         duration_ms = (time.perf_counter() - t0) * 1000
 
         return CycleResult(
@@ -249,6 +295,7 @@ class IntegrationLoop:
                 side=side,
                 qty=qty,
                 order_type="MARKET",
+                tag="bot_entry",
             )
             await self._order_manager.submit(req)
             return True
