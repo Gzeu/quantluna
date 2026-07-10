@@ -31,12 +31,12 @@ Flow:
     3. Build NotifierBus (Telegram + Slack)
     4. Build BybitWsFeed
     5. WorkflowOrchestrator.run_startup_workflow()
-       Faza 0: HealthCheck → halt on critical failure
+       Faza 0: HealthCheck -> halt on critical failure
        Faza 1: PositionScanner
        Faza 2: ResumeManager
        Faza 3: AdoptionEngine
        Faza 4: ProfitOptimizer
-    6. WorkflowOrchestrator.start_runner() → blocks
+    6. WorkflowOrchestrator.start_runner() -> blocks
        Faza 5: BybitLiveRunner + optimizer loop in background
 """
 from __future__ import annotations
@@ -46,6 +46,9 @@ import asyncio
 import logging
 import os
 import sys
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from loguru import logger
 
@@ -145,12 +148,11 @@ async def _build_ws_feed(cfg):
     try:
         from execution.bybit_ws_feed import BybitWsFeed, BybitWsFeedConfig
         feed_cfg = BybitWsFeedConfig(
-            symbol_y=cfg.symbol_y,
-            symbol_x=cfg.symbol_x,
+            symbol=cfg.symbol_y,
             interval=cfg.interval,
             testnet=os.getenv("BYBIT_TESTNET", "false").lower() == "true",
         )
-        feed = BybitWsFeed(feed_cfg)
+        feed = BybitWsFeed.from_config(feed_cfg)
         logger.info(
             f"main: BybitWsFeed built "
             f"({cfg.symbol_y}/{cfg.symbol_x} {cfg.interval}m)"
@@ -166,13 +168,9 @@ async def main() -> int:
     _configure_logging(args.log_level)
     os.makedirs("logs", exist_ok=True)
 
-    # ------------------------------------------------------------------
-    # 1. Load config from env
-    # ------------------------------------------------------------------
     from execution.bybit_live_runner import BybitLiveRunnerConfig
     cfg = BybitLiveRunnerConfig.from_env()
 
-    # CLI overrides
     if args.dry_run:
         cfg.dry_run = True
     if args.pair:
@@ -192,15 +190,9 @@ async def main() -> int:
         f"dry_run={cfg.dry_run}"
     )
 
-    # ------------------------------------------------------------------
-    # 2. Build shared components
-    # ------------------------------------------------------------------
     notifier_bus = await _build_notifier_bus(cfg)
-    ws_feed      = await _build_ws_feed(cfg)
+    ws_feed = await _build_ws_feed(cfg)
 
-    # ------------------------------------------------------------------
-    # 3. Build orchestrator
-    # ------------------------------------------------------------------
     from execution.workflow_orchestrator import WorkflowOrchestrator
     orch = WorkflowOrchestrator.from_runner_cfg(
         cfg=cfg,
@@ -209,9 +201,6 @@ async def main() -> int:
         skip_health_check=args.skip_health or cfg.dry_run,
     )
 
-    # ------------------------------------------------------------------
-    # 4. Run startup workflow (Faza 0-4)
-    # ------------------------------------------------------------------
     ctx = await orch.run_startup_workflow()
 
     if ctx.should_halt:
@@ -226,9 +215,6 @@ async def main() -> int:
                 pass
         return 1
 
-    # ------------------------------------------------------------------
-    # 5. Start runner (Faza 5) — blocks until stop
-    # ------------------------------------------------------------------
     await orch.start_runner(ctx)
     return 0
 
