@@ -29,16 +29,15 @@ from loguru import logger
 
 @dataclass
 class FundingConfig:
-    sym_y: str                    # e.g. "ETH/USDT:USDT"
-    sym_x: str                    # e.g. "BTC/USDT:USDT"
-    poll_interval_s: float = 60.0 # seconds between polls
-    funding_periods_per_year: float = 3.0 * 365.0  # 3 x/day * 365
+    sym_y: str
+    sym_x: str
+    poll_interval_s: float = 60.0
+    funding_periods_per_year: float = 3.0 * 365.0
     exchange_id: str = "bybit"
     testnet: bool = False
 
 
 class FundingMonitor:
-    """
     Lansează un asyncio.Task care polling funding rates și publică în bus.
 
     Usage:
@@ -46,7 +45,6 @@ class FundingMonitor:
         task = asyncio.create_task(monitor.run())
         # la shutdown:
         task.cancel()
-    """
 
     def __init__(self, cfg: FundingConfig, exchange: ccxt.Exchange, bus) -> None:
         self.cfg = cfg
@@ -56,7 +54,7 @@ class FundingMonitor:
         self._last_x: float = 0.0
 
     async def run(self) -> None:
-        """Main polling loop. Runs until CancelledError."""
+        Main polling loop. Runs until CancelledError.
         logger.info(
             f"FundingMonitor started — {self.cfg.sym_y} / {self.cfg.sym_x} "
             f"poll={self.cfg.poll_interval_s}s"
@@ -67,12 +65,12 @@ class FundingMonitor:
             except asyncio.CancelledError:
                 logger.info("FundingMonitor stopped (cancelled)")
                 raise
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(f"FundingMonitor poll error: {exc} — using last known values")
             await asyncio.sleep(self.cfg.poll_interval_s)
 
     async def _poll_and_publish(self) -> None:
-        """Fetch both legs and push to StateBus."""
+        Fetch both legs and push to StateBus.
         fy = await self._fetch_annualized(self.cfg.sym_y)
         fx = await self._fetch_annualized(self.cfg.sym_x)
 
@@ -83,7 +81,6 @@ class FundingMonitor:
 
         net = self._last_y - self._last_x
 
-        # FIX-BUS: guard — bus poate fi None în primele secunde de inițializare
         if self.bus is None:
             logger.debug("FundingMonitor: bus not ready yet, skipping publish")
             return
@@ -100,15 +97,15 @@ class FundingMonitor:
         )
 
     async def _fetch_annualized(self, symbol: str) -> Optional[float]:
-        """
         Fetch current funding rate and annualize.
         Returns None on error (caller uses last known value).
-        """
         try:
             data = await self.exchange.fetch_funding_rate(symbol)
+            if data is None:
+                return None
             rate = float(data.get("fundingRate", 0.0) or 0.0)
             return rate * self.cfg.funding_periods_per_year
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(f"fetch_funding_rate({symbol}) failed: {exc}")
             return None
 
@@ -118,8 +115,7 @@ async def create_funding_monitor(
     api_key: str,
     api_secret: str,
     bus,
-) -> tuple["FundingMonitor", ccxt.Exchange]:
-    """
+) -> tuple:
     Factory helper — creează exchange CCXT async și FundingMonitor.
     Returnează (monitor, exchange) pentru ca exchange-ul să poată fi
     închis explicit la shutdown.
@@ -130,7 +126,7 @@ async def create_funding_monitor(
         # la shutdown:
         task.cancel()
         await exchange.close()
-    """
+
     exchange_cls = getattr(ccxt, cfg.exchange_id)
     exchange = exchange_cls({
         "apiKey": api_key,
