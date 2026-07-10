@@ -27,11 +27,11 @@ from typing import Deque, Optional
 from loguru import logger
 
 try:
-    from core.kalman_filter import KalmanFilter as _KF
+    from core.kalman_filter import KalmanHedgeRatio as _KF
     _KF_AVAILABLE = True
 except Exception as _e:
     _KF_AVAILABLE = False
-    logger.warning(f"KalmanAdapter: KalmanFilter not importable ({_e}), using fallback")
+    logger.warning(f"KalmanAdapter: KalmanHedgeRatio not importable ({_e}), using fallback")
 
 
 class KalmanAdapter:
@@ -120,17 +120,18 @@ class KalmanAdapter:
     def _update_kf(self, price_y: float, price_x: float) -> None:
         kf = self._kf
         try:
-            # Try common KalmanFilter update signatures
-            if hasattr(kf, "update"):
-                kf.update(price_y, price_x)  # type: ignore[union-attr]
-            elif hasattr(kf, "step"):
-                kf.step(price_y, price_x)  # type: ignore[union-attr]
+            # KalmanHedgeRatio.update returns a KalmanState
+            state = kf.update(price_y, price_x)  # type: ignore[union-attr]
 
-            # Extract properties (try multiple naming conventions)
-            self._spread    = float(self._get_attr(kf, ["spread", "residual", "e"], 0.0))
-            self._zscore    = float(self._get_attr(kf, ["zscore", "z_score", "z"], 0.0))
-            self._half_life = float(self._get_attr(kf, ["half_life", "halflife"], self._half_life_h))
-            self._p_diag    = float(self._get_attr(kf, ["p_diag", "P", "uncertainty"], 0.0))
+            # Extract properties from KalmanState
+            self._spread    = float(state.innovation)
+            self._zscore    = 0.0  # KalmanHedgeRatio does not compute z-score directly
+            self._half_life = float(self._get_attr(state, ["half_life_hours"], self._half_life_h))
+            self._p_diag    = float(state.P_beta)
+
+            # Compute z-score from spread history if not provided
+            if self._zscore == 0.0:
+                self._compute_zscore_from_spread(self._spread)
 
             # If KF doesn't compute z-score directly, compute from spread history
             if self._zscore == 0.0 and self._spread != 0.0:
