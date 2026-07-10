@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-import logging
 import numpy as np
 import pandas as pd
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Deque
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
-# Maximum number of KalmanState snapshots kept in memory.
-# At 1-min bars this is ~7 days; at 1h bars ~180 days.
+# Module-level constant kept for backward compatibility.
+# Prefer passing history_maxlen= to the constructor directly.
 _HISTORY_MAXLEN = 10_000
 
 
@@ -59,10 +58,16 @@ class KalmanHedgeRatio:
         Process noise parameter. Q = delta/(1-delta) * I.
         Controls adaptation speed (1e-5=very slow, 1e-4=default, 5e-4=fast).
     observation_noise : float
-        Measurement noise R. Higher = smoother but less reactive.
+        Measurement noise R. Must be > 0 — R=0 makes S=F*P*F (no noise floor)
+        which causes K to blow up when spread variance collapses.
+        Higher = smoother but less reactive.
     warm_up : int
         Bars before is_warm becomes True. Results before warm-up
         should not be used for trading signals.
+    history_maxlen : int
+        Maximum KalmanState snapshots kept in memory.
+        At 1-min bars, 10_000 ≈ 7 days; at 1h bars ≈ 180 days.
+        Increase for longer backtest history, decrease for memory-constrained envs.
     """
 
     def __init__(
@@ -73,10 +78,15 @@ class KalmanHedgeRatio:
         initial_beta: float = 1.0,
         initial_alpha: float = 0.0,
         initial_cov: float = 1.0,
+        history_maxlen: int = _HISTORY_MAXLEN,
     ) -> None:
         self._delta = delta
-        self._R = observation_noise
+        # FIX: validate R > 0 — R=0 produces S = F*P_pred*F (no noise floor),
+        # Kalman Gain K = P_pred*F / S blows up when spread variance collapses.
+        self._validate_observation_noise(observation_noise)
+        self._R = float(observation_noise)
         self.warm_up = warm_up
+        self._history_maxlen = history_maxlen
 
         # Q is derived from delta — always kept in sync via the property setter
         self._Q = self._compute_Q(delta)
@@ -90,13 +100,35 @@ class KalmanHedgeRatio:
         self.P = np.array([[initial_cov, 0.0], [0.0, initial_cov]])
 
         # FIX: bounded deque — prevents unbounded memory growth in live mode
-        self._history: Deque[KalmanState] = deque(maxlen=_HISTORY_MAXLEN)
+        self._history: Deque[KalmanState] = deque(maxlen=history_maxlen)
         self._is_warm: bool = False
         self._n_updates: int = 0
 
         logger.debug(
-            f"KalmanHedgeRatio init: delta={delta}, R={observation_noise}, warm_up={warm_up}"
+            "KalmanHedgeRatio init: delta={}, R={}, warm_up={}, history_maxlen={}",
+            delta, observation_noise, warm_up, history_maxlen,
         )
+
+    # ------------------------------------------------------------------ #
+    # Validation helpers
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _validate_observation_noise(value: float) -> None:
+        """Raise ValueError if observation_noise <= 0.
+
+        R must be strictly positive:
+          - R=0  → innovation variance S = F*P*F + 0, Kalman gain K = P*F/S.
+            When the spread variance (P) collapses near zero, S→0 and K→inf,
+            producing numerically undefined state updates.
+          - R<0  → physically meaningless (negative variance).
+        """
+        if float(value) <= 0.0:
+            raise ValueError(
+                f"observation_noise (R) must be > 0, got {value}. "
+                "R=0 causes K=inf when spread variance collapses. "
+                "Use a small positive value such as 1e-4 or 1e-2."
+            )
 
     # ------------------------------------------------------------------ #
     # Properties — single source of truth for R and Q
@@ -118,18 +150,19 @@ class KalmanHedgeRatio:
         """Setting delta recomputes Q atomically — no stale Q risk."""
         self._Q = self._compute_Q(value)
         self._delta = value
-        logger.debug(f"KalmanHedgeRatio delta updated → {value} (Q recomputed)")
+        logger.debug("KalmanHedgeRatio delta updated → {} (Q recomputed)", value)
 
     @property
     def observation_noise(self) -> float:
-        """Public alias for measurement noise R."""
+        """Public alias for measurement noise R. Must be > 0."""
         return self._R
 
     @observation_noise.setter
     def observation_noise(self, value: float) -> None:
-        """Single setter — keeps R in sync everywhere."""
+        """Single setter — validates R > 0 and keeps R in sync everywhere."""
+        self._validate_observation_noise(value)
         self._R = float(value)
-        logger.debug(f"KalmanHedgeRatio observation_noise updated → {value}")
+        logger.debug("KalmanHedgeRatio observation_noise updated → {}", value)
 
     # Keep backward-compatible direct attribute access
     @property
@@ -143,6 +176,10 @@ class KalmanHedgeRatio:
     @property
     def Q(self) -> np.ndarray:
         return self._Q
+
+    @property
+    def history_maxlen(self) -> int:
+        return self._history_maxlen
 
     def update_delta(self, new_delta: float) -> None:
         """Convenience method for dynamic delta changes (regime adaptation)."""
@@ -167,8 +204,8 @@ class KalmanHedgeRatio:
         # FIX: guard against x=0 — makes beta unobservable and P explodes
         if abs(x) < 1e-10:
             logger.warning(
-                f"KalmanHedgeRatio.update(): x={x} is effectively zero — skipping update, "
-                "returning last state. Check price feed for zeros/NaNs."
+                "KalmanHedgeRatio.update(): x={} is effectively zero — skipping update, "
+                "returning last state. Check price feed for zeros/NaNs.", x
             )
             return KalmanState(
                 beta=self.beta,
@@ -192,7 +229,7 @@ class KalmanHedgeRatio:
         y_hat = float(F @ np.array([self.beta, self.alpha]))
         innovation = y - y_hat
 
-        # Innovation variance (scalar)
+        # Innovation variance (scalar) — R > 0 guaranteed by setter/init
         S = float(F @ P_pred @ F) + self._R
 
         # Kalman Gain
@@ -247,18 +284,16 @@ class KalmanHedgeRatio:
             raise ValueError(f"y ({len(y)}) and x ({len(x)}) must have same length")
 
         # FIX Sprint 13: reset state before fit — prevents stale state on 2nd call
-        # Before this fix, calling fit() twice gave different results for the same
-        # input because beta/alpha/P carried over from the previous run.
         self.reset()
 
         # FIX Sprint 13: warn if series is shorter than warm_up threshold
-        # Without this, all rows would have is_warm=False silently.
         if len(y) < self.warm_up:
             logger.warning(
-                f"KalmanHedgeRatio.fit(): series length {len(y)} is shorter than "
-                f"warm_up={self.warm_up}. The filter will not warm up — "
-                f"is_warm will remain False for all bars. "
-                f"Consider reducing warm_up or providing more data."
+                "KalmanHedgeRatio.fit(): series length {} is shorter than "
+                "warm_up={}. The filter will not warm up — "
+                "is_warm will remain False for all bars. "
+                "Consider reducing warm_up or providing more data.",
+                len(y), self.warm_up,
             )
 
         rows = []
@@ -278,10 +313,8 @@ class KalmanHedgeRatio:
 
         df = pd.DataFrame(rows).set_index("timestamp")
         logger.info(
-            f"Kalman fit: {len(df)} bars | "
-            f"beta={df['beta'].iloc[-1]:.4f} | "
-            f"P_beta={df['P_beta'].iloc[-1]:.6f} | "
-            f"warm_up={self.warm_up}"
+            "Kalman fit: {} bars | beta={:.4f} | P_beta={:.6f} | warm_up={}",
+            len(df), df['beta'].iloc[-1], df['P_beta'].iloc[-1], self.warm_up,
         )
         return df
 
