@@ -4,12 +4,16 @@
 # Usage:
 #   docker compose --profile paper up --build
 #   docker compose --profile dashboard up --build
-#   docker compose --profile live up --build
+#   docker compose --profile all up --build
+#
+# NOTE: 'paper' and 'live' both run `python main.py` with DRY_RUN env.
+# The FastAPI dashboard is a separate service (api/main.py via uvicorn).
+# All three join quantluna-net so the bot can push metrics to the API.
 
 services:
 
   # --------------------------------------------------------------------------
-  # Paper trader — safe, no real orders
+  # Paper trader — safe, no real orders (DRY_RUN=true)
   # --------------------------------------------------------------------------
   paper:
     profiles: [paper, all]
@@ -18,21 +22,29 @@ services:
       target: production
     image: quantluna:latest
     container_name: quantluna-paper
-    command: ["paper", "--pair", "BTCUSDT", "ETHUSDT", "--exchange", "bybit", "--capital", "10000"]
+    # main.py reads SYMBOL_Y/SYMBOL_X from env; --dry-run forces paper mode
+    command: ["python", "main.py", "--dry-run", "--skip-health"]
     env_file: .env
     environment:
       - DRY_RUN=true
       - LOG_LEVEL=INFO
+      - SYMBOL_Y=BTCUSDT
+      - SYMBOL_X=ETHUSDT
     volumes:
       - ./data:/app/data
       - ./state:/app/state
       - ./logs:/app/logs
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      # Probe: can Python import the bot's core modules without errors?
+      test: ["CMD", "python", "-c",
+        "from execution.bybit_live_runner import BybitLiveRunnerConfig; BybitLiveRunnerConfig.from_env()"]
       interval: 60s
-      timeout: 10s
+      timeout: 15s
       retries: 3
+      start_period: 30s
+    networks:
+      - quantluna-net
 
   # --------------------------------------------------------------------------
   # Live trader — REAL ORDERS, requires valid API keys in .env
@@ -44,7 +56,7 @@ services:
       target: production
     image: quantluna:latest
     container_name: quantluna-live
-    command: ["live", "--pair", "BTCUSDT", "ETHUSDT", "--exchange", "bybit", "--mode", "live"]
+    command: ["python", "main.py"]
     env_file: .env
     environment:
       - DRY_RUN=false
@@ -54,12 +66,18 @@ services:
       - ./state:/app/state
       - ./logs:/app/logs
     restart: unless-stopped
-    # Live trader shares the same network as dashboard for metrics
+    healthcheck:
+      test: ["CMD", "python", "-c",
+        "from execution.bybit_live_runner import BybitLiveRunnerConfig; BybitLiveRunnerConfig.from_env()"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
     networks:
       - quantluna-net
 
   # --------------------------------------------------------------------------
-  # Dashboard — FastAPI monitoring server
+  # Dashboard — FastAPI + uvicorn (api/main.py)
   # --------------------------------------------------------------------------
   dashboard:
     profiles: [dashboard, all]
@@ -68,7 +86,14 @@ services:
       target: production
     image: quantluna:latest
     container_name: quantluna-dashboard
-    command: ["dashboard", "--host", "0.0.0.0", "--port", "8000"]
+    # api/main.py is the FastAPI app; run via uvicorn, NOT python main.py
+    command: [
+      "uvicorn", "api.main:app",
+      "--host", "0.0.0.0",
+      "--port", "8000",
+      "--workers", "1",
+      "--log-level", "info"
+    ]
     env_file: .env
     environment:
       - LOG_LEVEL=INFO
@@ -80,10 +105,12 @@ services:
       - ./logs:/app/logs
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      test: ["CMD", "python", "-c",
+        "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 20s
     networks:
       - quantluna-net
 
