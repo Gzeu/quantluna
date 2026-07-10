@@ -1,22 +1,22 @@
 """
-execution/resume_manager.py  —  QuantLuna Resume Manager (Sprint 28)
+execution/resume_manager.py  -  QuantLuna Resume Manager (Sprint 28)
 
-Problema rezolvată:
-  La restart după o întrerupere cu poziție deschisă, botul trebuie să:
-  1. Detecteze că există o poziție deschisă în checkpoint
-  2. Reconcilieze cu poziția reală de pe exchange (poate fi deja închisă
+Problema rezolvata:
+  La restart dupa o intrerupere cu pozitie deschisa, botul trebuie sa:
+  1. Detecteze ca exista o pozitie deschisa in checkpoint
+  2. Reconcilieze cu pozitia reala de pe exchange (poate fi deja inchisa
      de un SL, lichidare sau manual)
-  3. Decidă:
-     a) Poziție reală == checkpoint → preia poziția, continuă trading
-     b) Poziția reală lipsete (deja închisă) → curățește checkpoint, start fresh
-     c) Poziția reală diferă semnificativ → HALT + alert operator
+  3. Decida:
+     a) Pozitie reala == checkpoint -> preia pozitia, continua trading
+     b) Pozitia reala lipsete (deja inchisa) -> curateste checkpoint, start fresh
+     c) Pozitia reala diferit semnificativ -> HALT + alert operator
 
 Sprint 28 additions
 -------------------
 restart_after_external_close(symbol, on_cycle_restart)
-  — apelat când MarketTradeHandler / AdoptionEngine detectează că o poziție
-    adoptată s-a închis extern (SL hit, manual, lichidare). Curăță checkpoint
-    și declanșează on_cycle_restart(symbol) după cooldown.
+  - apelat cand MarketTradeHandler / AdoptionEngine detecteaza ca o pozitie
+    adoptata s-a inchis extern (SL hit, manual, lichidare). Curata checkpoint
+    si declanseaza on_cycle_restart(symbol) dupa cooldown.
 
 Usage:
     manager = ResumeManager(checkpoint, ccxt_exchange, alert_cfg)
@@ -24,9 +24,9 @@ Usage:
     if result.should_resume:
         live_trader.restore_position(result.position)
     elif result.should_halt:
-        # aşteaptă decizia operatorului
+        # asteapta decizia operatorului
 
-    # Sprint 28 — apelat de MarketTradeHandler la close extern:
+    # Sprint 28 - apelat de MarketTradeHandler la close extern:
     await manager.restart_after_external_close(
         symbol="BTCUSDT",
         on_cycle_restart=my_restart_fn,
@@ -47,23 +47,21 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ReconcileResult:
-    should_resume: bool       # True = preia poziția din checkpoint
-    should_halt: bool         # True = neștimt ce s-a întâmplat, halt
+    should_resume: bool
+    should_halt: bool
     position: Optional[PositionState] = None
     message: str = ""
 
 
 class ResumeManager:
-    """
-    Reconciliază starea checkpoint-ului cu poziția reală de pe exchange
+    Reconciliaza starea checkpoint-ului cu pozitia reala de pe exchange
     la fiecare startup.
 
     Args:
         checkpoint:  PositionCheckpoint instance
         exchange:    ccxt async exchange instance (deja autentificat)
-        alert_cfg:   AlertConfig pentru notificări (optional)
-        qty_tolerance: toleranță relativă la compararea qty (default 5%)
-    """
+        alert_cfg:   AlertConfig pentru notificari (optional)
+        qty_tolerance: toleranta relativa la compararea qty (default 5%)
 
     def __init__(
         self,
@@ -72,19 +70,13 @@ class ResumeManager:
         alert_cfg: Any = None,
         qty_tolerance: float = 0.05,
     ) -> None:
-        self._cp          = checkpoint
-        self._exchange    = exchange
-        self._alert       = alert_cfg
-        self._tol         = qty_tolerance
-
-    # ------------------------------------------------------------------
-    # Startup reconciliation (unchanged from Sprint 17)
-    # ------------------------------------------------------------------
+        self._cp = checkpoint
+        self._exchange = exchange
+        self._alert = alert_cfg
+        self._tol = qty_tolerance
 
     async def reconcile_on_startup(self) -> ReconcileResult:
-        """
         Pasul principal de reconciliere la startup.
-        """
         saved = self._cp.load()
 
         if saved is None:
@@ -97,27 +89,23 @@ class ResumeManager:
             f"{saved.side_y} qty={saved.qty_y:.4f} opened_at={saved.opened_at}"
         )
 
-        # încearcă să interogăm poziția reală de pe exchange
         real_y = await self._fetch_position(saved.sym_y)
         real_x = await self._fetch_position(saved.sym_x)
 
         if real_y is None and real_x is None:
-            # exchange inaccessibil — halt conservator
-            msg = "[Resume] Nu pot verifica poziția pe exchange (timeout/auth) — HALT conservator"
+            msg = "[Resume] Nu pot verifica pozitia pe exchange (timeout/auth) — HALT conservator"
             logger.error(msg)
             await self._send_alert(msg)
             return ReconcileResult(should_resume=False, should_halt=True, message=msg)
 
-        # Poziții de pe exchange
         exch_qty_y = abs(real_y.get("contracts", 0) if real_y else 0)
         exch_qty_x = abs(real_x.get("contracts", 0) if real_x else 0)
 
-        # Dacă ambele qty sunt ~0 → poziția a fost închisă extern (SL, lichidare, manual)
         if exch_qty_y < 0.0001 and exch_qty_x < 0.0001:
             msg = (
-                f"[Resume] Poziția din checkpoint ({saved.sym_y}/{saved.sym_x}) "
-                f"nu mai există pe exchange — probabil închisă extern (SL/liq/manual). "
-                f"Checkpoint şters, start fresh."
+                f"[Resume] Pozitia din checkpoint ({saved.sym_y}/{saved.sym_x}) "
+                f"nu mai exista pe exchange — probabil inchisa extern (SL/liq/manual). "
+                f"Checkpoint sters, start fresh."
             )
             logger.warning(msg)
             await self._send_alert(msg)
@@ -127,15 +115,14 @@ class ResumeManager:
                 position=None, message=msg,
             )
 
-        # Verifică dacă qty-urile sunt în toleranță
         qty_y_ok = self._within_tolerance(exch_qty_y, saved.qty_y)
         qty_x_ok = self._within_tolerance(exch_qty_x, saved.qty_x)
 
         if qty_y_ok and qty_x_ok:
             msg = (
-                f"[Resume] Poziția reconciliată OK: {saved.sym_y} qty={exch_qty_y:.4f} / "
-                f"{saved.sym_x} qty={exch_qty_x:.4f} — în toleranță {self._tol*100:.0f}%. "
-                f"Preluare poziție şi continuare trading."
+                f"[Resume] Pozitia reconciliata OK: {saved.sym_y} qty={exch_qty_y:.4f} / "
+                f"{saved.sym_x} qty={exch_qty_x:.4f} — in toleranta {self._tol*100:.0f}%. "
+                f"Preluare pozitie si continuare trading."
             )
             logger.info(msg)
             return ReconcileResult(
@@ -143,21 +130,16 @@ class ResumeManager:
                 position=saved, message=msg,
             )
         else:
-            # Diferență semnificativă — halt + alert operator
             msg = (
-                f"[Resume] DISCREPANȚĂ poziție! "
+                f"[Resume] DISCREPANTA pozitie! "
                 f"Checkpoint: Y={saved.qty_y:.4f} X={saved.qty_x:.4f} | "
                 f"Exchange: Y={exch_qty_y:.4f} X={exch_qty_x:.4f} | "
-                f"Diferența depăşeşte toleranța {self._tol*100:.0f}%. "
-                f"HALT — verifică manual pozițiile pe exchange!"
+                f"Diferenta depaseste toleranta {self._tol*100:.0f}%. "
+                f"HALT — verifica manual pozitiile pe exchange!"
             )
             logger.error(msg)
             await self._send_alert(msg)
             return ReconcileResult(should_resume=False, should_halt=True, message=msg)
-
-    # ------------------------------------------------------------------
-    # Sprint 28: restart after external close
-    # ------------------------------------------------------------------
 
     async def restart_after_external_close(
         self,
@@ -166,62 +148,55 @@ class ResumeManager:
         cooldown_s: float = 10.0,
         alert_msg: Optional[str] = None,
     ) -> None:
-        """
-        Apelat de MarketTradeHandler sau AdoptionEngine când detectează că
-        o poziție adoptată (sau monitorizată) s-a închis extern.
+        Apelat de MarketTradeHandler sau AdoptionEngine cand detecteaza ca
+        o pozitie adoptata (sau monitorizata) s-a inchis extern.
 
-        Pași:
-          1. Curăță checkpoint-ul pentru symbol
-          2. Trimite alert opțional
-          3. Așteaptă cooldown_s secunde (piața să se stabilizeze)
-          4. Apelează on_cycle_restart(symbol) pentru a porni un nou ciclu
+        Pas:
+          1. Curata checkpoint-ul pentru symbol
+          2. Trimite alert optional
+          3. Asteapta cooldown_s secunde (piata sa se stabilizeze)
+          4. Apeleaza on_cycle_restart(symbol) pentru a porni un nou ciclu
 
         Parameters
         ----------
-        symbol           : simbolul pentru care se restartează ciclul
-        on_cycle_restart : corutină async(symbol: str) — callback de restart
-        cooldown_s       : secunde de aşteptare înainte de restart (default 10)
-        alert_msg        : mesaj custom pentru alertă (optional)
-        """
+        symbol           : simbolul pentru care se restarteaza ciclul
+        on_cycle_restart : corutina async(symbol: str) — callback de restart
+        cooldown_s       : secunde de asteptare inainte de restart (default 10)
+        alert_msg        : mesaj custom pentru alerta (optional)
+
         msg = alert_msg or (
-            f"[Resume] Poziție {symbol} închisă extern — "
-            f"checkpoint curăţat, restart ciclu în {cooldown_s}s"
+            f"[Resume] Pozitie {symbol} inchisa extern — "
+            f"checkpoint curatat, restart ciclu in {cooldown_s}s"
         )
         logger.info(msg)
         await self._send_alert(msg)
 
-        # Curăță checkpoint pentru symbol
         try:
             self._cp.save_closed()
-            logger.debug(f"[Resume] Checkpoint curăţat pentru {symbol}")
+            logger.debug(f"[Resume] Checkpoint curatat pentru {symbol}")
         except Exception as exc:
-            logger.warning(f"[Resume] Nu am putut curăța checkpoint-ul: {exc}")
+            logger.warning(f"[Resume] Nu am putut curata checkpoint-ul: {exc}")
 
-        # Cooldown — piața să se stabilizeze după close
         if cooldown_s > 0:
             logger.info(f"[Resume] Cooldown {cooldown_s}s pentru {symbol}...")
             await asyncio.sleep(cooldown_s)
 
-        # Restart ciclu
         try:
             logger.info(f"[Resume] Pornesc ciclu nou pentru {symbol}")
             await on_cycle_restart(symbol)
         except Exception as exc:
             logger.error(f"[Resume] restart_after_external_close: on_cycle_restart failed: {exc}")
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
     async def _fetch_position(self, symbol: str) -> Optional[dict]:
-        """Interoghează poziția curentă pentru un simbol de pe exchange."""
+        Interogheaza pozitia curenta pentru un simbol de pe exchange.
         try:
-            positions = await self._exchange.fetch_positions([symbol])
+            positions = await self._exchange.fetch_positions(symbol)
             for p in positions:
                 sym = p.get("symbol", "")
-                if symbol.replace("/USDT:USDT", "").upper() in sym.upper():
+                clean_symbol = symbol.replace("/USDT:USDT", "").upper()
+                if clean_symbol in sym.upper():
                     return p
-            return {"contracts": 0}  # simbol găsit dar fără poziție
+            return {"contracts": 0}
         except Exception as exc:
             logger.warning(f"[Resume] fetch_position({symbol}) failed: {exc}")
             return None
