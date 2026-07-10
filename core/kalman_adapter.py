@@ -3,7 +3,7 @@ QuantLuna — Kalman Adapter (Sprint 20)
 
 Bridge între core.KalmanFilter (API internă) și IntegrationLoop.
 
-IntegrationLoop aşteaptă un obiect cu:
+IntegrationLoop așteaptă un obiect cu:
   - update(price_y, price_x)  → None
   - .zscore       → float
   - .half_life    → float  (ore)
@@ -72,10 +72,6 @@ class KalmanAdapter:
             except Exception as exc:
                 logger.warning(f"KalmanAdapter: KalmanFilter init failed ({exc}), using fallback")
 
-    # ------------------------------------------------------------------
-    # Main interface
-    # ------------------------------------------------------------------
-
     def update(self, price_y: float, price_x: float) -> None:
         """Process one price bar."""
         self._bar_count += 1
@@ -84,10 +80,6 @@ class KalmanAdapter:
             self._update_kf(price_y, price_x)
         else:
             self._update_fallback(price_y, price_x)
-
-    # ------------------------------------------------------------------
-    # Properties (IntegrationLoop interface)
-    # ------------------------------------------------------------------
 
     @property
     def zscore(self) -> float:
@@ -113,36 +105,23 @@ class KalmanAdapter:
     def is_warmed_up(self) -> bool:
         return self._bar_count >= self._window
 
-    # ------------------------------------------------------------------
-    # Internal: KalmanFilter path
-    # ------------------------------------------------------------------
-
     def _update_kf(self, price_y: float, price_x: float) -> None:
         kf = self._kf
         try:
-            # KalmanHedgeRatio.update returns a KalmanState
-            state = kf.update(price_y, price_x)  # type: ignore[union-attr]
-
-            # Extract properties from KalmanState
+            state = kf.update(price_y, price_x)
             self._spread    = float(state.innovation)
-            self._zscore    = 0.0  # KalmanHedgeRatio does not compute z-score directly
+            self._zscore    = 0.0
             self._half_life = float(self._get_attr(state, ["half_life_hours"], self._half_life_h))
             self._p_diag    = float(state.P_beta)
-
-            # Compute z-score from spread history if not provided
             if self._zscore == 0.0:
                 self._compute_zscore_from_spread(self._spread)
-
-            # If KF doesn't compute z-score directly, compute from spread history
             if self._zscore == 0.0 and self._spread != 0.0:
                 self._compute_zscore_from_spread(self._spread)
-
         except Exception as exc:
             logger.warning(f"KalmanAdapter: KF update error ({exc}), falling back")
             self._update_fallback(price_y, price_x)
 
     def _update_fallback(self, price_y: float, price_x: float) -> None:
-        """Simple spread = price_y - price_x, z-score from rolling window."""
         spread = price_y - price_x
         self._spread = spread
         self._compute_zscore_from_spread(spread)
@@ -158,7 +137,7 @@ class KalmanAdapter:
         self._zscore = (spread - mu) / sigma if sigma > 1e-10 else 0.0
 
     @staticmethod
-    def _get_attr(obj, names: list, default):
+    def _get_attr(obj, names, default):
         for name in names:
             val = getattr(obj, name, None)
             if val is not None:

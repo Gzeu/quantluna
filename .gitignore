@@ -85,3 +85,5 @@ SDIST/
 # OS
 .DS_Store
 *.orig
+*.db-shm
+*.db-wal
