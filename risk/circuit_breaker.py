@@ -1,9 +1,23 @@
 """
-risk/circuit_breaker.py — circuit breaker pentru oprirea automata a trading-ului.
+risk/circuit_breaker.py — Risk-layer circuit breaker (P&L / drawdown aware).
 
-Monitorizeaza pierderi consecutive, drawdown rapid si erori de executie.
-Dupa atingerea pragurilor configura, blocheaza toate ordinele noi
-pentru o perioada de cooldown.
+This module contains TWO circuit breaker implementations with distinct roles:
+
+  RiskCircuitBreaker  (defined here)
+    - Sync, P&L-aware breaker used by the risk layer.
+    - Monitors: consecutive losses, drawdown %, execution error count.
+    - State machine: CLOSED → OPEN → HALF_OPEN (time-based cooldown).
+    - Use this when reacting to trading outcomes (wins/losses/errors).
+
+  CircuitBreaker  (from execution.circuit_breaker — re-exported here)
+    - Async context-manager, used for WebSocket / CCXT connection protection.
+    - Monitors: consecutive connection/API failures.
+    - Use this when wrapping async I/O calls.
+
+Quick-reference:
+    from risk.circuit_breaker import RiskCircuitBreaker   # P&L breaker
+    from risk.circuit_breaker import CircuitBreaker        # WS/async breaker (re-export)
+    from execution.circuit_breaker import CircuitBreaker   # same, direct import
 """
 from __future__ import annotations
 
@@ -12,11 +26,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional
 
+# Re-export the canonical async CircuitBreaker so callers that previously
+# imported it from risk.circuit_breaker keep working without changes.
+from execution.circuit_breaker import CircuitBreaker, CircuitOpenError, CircuitState  # noqa: F401
+
 
 class BreakerState(Enum):
-    CLOSED = "closed"      # normal, trading permis
-    OPEN = "open"          # blocat
-    HALF_OPEN = "half_open"  # test dupa cooldown
+    CLOSED    = "closed"       # normal, trading permis
+    OPEN      = "open"         # blocat
+    HALF_OPEN = "half_open"    # test dupa cooldown
 
 
 @dataclass
@@ -25,17 +43,20 @@ class BreakerEvent:
     ts: float = field(default_factory=time.time)
 
 
-class CircuitBreaker:
+class RiskCircuitBreaker:
     """
-    Circuit breaker cu stari CLOSED / OPEN / HALF_OPEN.
+    Sync circuit breaker for the risk layer.
+
+    Monitors P&L outcomes and drawdown to halt new order placement
+    during adverse streaks. Operates independently of the async
+    execution.CircuitBreaker (which guards WS/API connectivity).
 
     Usage::
 
-        cb = CircuitBreaker(max_consecutive_losses=3, cooldown_seconds=300)
-
+        cb = RiskCircuitBreaker(max_consecutive_losses=3, cooldown_seconds=300)
         cb.record_loss(50.0)
         if not cb.allow():
-            logger.warning("Circuit breaker OPEN: %s", cb.last_reason)
+            logger.warning("RiskCircuitBreaker OPEN: %s", cb.last_reason)
     """
 
     def __init__(
@@ -74,7 +95,7 @@ class CircuitBreaker:
             self._peak_equity = self._current_equity
 
     def record_loss(self, pnl: float) -> None:
-        """pnl deve essere negativo o positivo (viene trattato come perdita)."""
+        """pnl can be positive or negative — treated as an absolute loss."""
         loss = abs(pnl)
         self._current_equity -= loss
         self._consecutive_losses += 1
@@ -122,3 +143,12 @@ class CircuitBreaker:
     @property
     def events(self) -> List[BreakerEvent]:
         return list(self._events)
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility alias: code that imported CircuitBreaker from here
+# previously got the sync P&L breaker. New code should use RiskCircuitBreaker
+# explicitly. This alias will be removed in a future release.
+# ---------------------------------------------------------------------------
+# NOTE: CircuitBreaker is now the ASYNC version re-exported from execution/.
+# If you need the sync P&L breaker, use RiskCircuitBreaker.
