@@ -1,7 +1,12 @@
 """
-QuantLuna — Bybit WebSocket Bars Adapter (Sprint 21)
+QuantLuna — Bybit WebSocket Bars Adapter (Sprint 21 + S20-fix)
 
-Adaptă BybitWsFeed (kline stream) la un async generator de BarData perechi.
+Adaptează BybitWsFeed (kline stream) la un async generator de BarData perechi.
+
+Fix S20:
+  - get_bar(): metodă async compatibilă cu _run_loop din BybitLiveRunner
+  - stream_bars() yield BarData cu price_y / price_x corecte per simbol
+  - is_healthy(): health check pentru WsWatchdog / HealthCheck
 
 BybitWsFeed trimite bare individuale per simbol. Acest adapter:
   1. Subscrie la ambele simboluri simultan
@@ -11,6 +16,9 @@ BybitWsFeed trimite bare individuale per simbol. Acest adapter:
 
 Usage:
     feed = BybitWsBarsAdapter(BybitWsFeed(...), interval="5")
+    # In _run_loop:
+    bar = await feed.get_bar()          # bar.price_y, bar.price_x, bar.timestamp
+    # Sau generator:
     async for bar in feed.stream_bars("BTCUSDT", "ETHUSDT"):
         await runner._process_bar(bar)
 """
@@ -23,18 +31,21 @@ from typing import AsyncIterator, Dict, Optional
 
 from loguru import logger
 
-from execution.integration_loop import BarData
+from execution.bybit_ws_feed import BarData
 
 
 class BybitWsBarsAdapter:
     """
-    Wraps BybitWsFeed and emits synchronized BarData pairs.
+    Wraps two BybitWsFeed instances and emits synchronized BarData pairs.
 
     Parameters
     ----------
-    ws_feed     : BybitWsFeed instance (or any object with subscribe / stream)
+    ws_feed     : BybitWsFeed instance pentru symbol_y (sau None pentru mock)
     interval    : kline interval string (e.g. "5" for 5-minute bars)
-    price_field : OHLCV field to use ("close" or "open", "high", "low")
+    price_field : OHLCV field to use ("close" sau "open", "high", "low")
+    symbol_y    : primul simbol (setat de get_dual_ws_feed)
+    symbol_x    : al doilea simbol (setat de get_dual_ws_feed)
+    ws_feed_x   : BybitWsFeed pentru symbol_x (setat de get_dual_ws_feed)
     """
 
     def __init__(
@@ -42,49 +53,101 @@ class BybitWsBarsAdapter:
         ws_feed=None,
         interval: str = "5",
         price_field: str = "close",
+        symbol_y: str = "BTCUSDT",
+        symbol_x: str = "ETHUSDT",
+        ws_feed_x=None,
     ) -> None:
         self._ws_feed     = ws_feed
+        self._ws_feed_x   = ws_feed_x
         self._interval    = interval
         self._price_field = price_field
+        self._symbol_y    = symbol_y
+        self._symbol_x    = symbol_x
         self._prices: Dict[str, float] = {}
         self._last_ts: Dict[str, float] = {}
         self._bar_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
         self._running = False
+        self._last_msg_ts: float = 0.0
 
     # ------------------------------------------------------------------
-    # Main interface: async generator of BarData
+    # Health check (pentru WsWatchdog / HealthCheck)
+    # ------------------------------------------------------------------
+
+    def is_healthy(self) -> bool:
+        """Returnează True dacă feed-ul rulează și a primit date recent."""
+        if not self._running:
+            return False
+        age = time.time() - self._last_msg_ts if self._last_msg_ts > 0 else float("inf")
+        return age < 60.0
+
+    # ------------------------------------------------------------------
+    # FIX S20: get_bar() — așteptat de _run_loop din BybitLiveRunner
+    # ------------------------------------------------------------------
+
+    async def get_bar(self, timeout: float = 30.0) -> Optional[BarData]:
+        """
+        Așteaptă următorul BarData sincronizat (ambele simboluri).
+        Compatibil cu _run_loop: `bar = await ws_feed.get_bar()`.
+        Returns None la timeout.
+        """
+        if not self._running:
+            # Pornește background tasks la primul get_bar()
+            asyncio.create_task(self._start_background())
+            self._running = True
+
+        try:
+            bar = await asyncio.wait_for(self._bar_queue.get(), timeout=timeout)
+            return bar
+        except asyncio.TimeoutError:
+            return None
+        except asyncio.CancelledError:
+            return None
+
+    async def _start_background(self) -> None:
+        """Pornește consume tasks pentru ambele simboluri."""
+        task_y = asyncio.create_task(
+            self._consume_symbol(self._symbol_y, self._ws_feed),
+            name=f"ws_{self._symbol_y}"
+        )
+        task_x = asyncio.create_task(
+            self._consume_symbol(self._symbol_x, self._ws_feed_x),
+            name=f"ws_{self._symbol_x}"
+        )
+        await asyncio.gather(task_y, task_x, return_exceptions=True)
+
+    # ------------------------------------------------------------------
+    # Main interface: async generator de BarData
     # ------------------------------------------------------------------
 
     async def stream_bars(
         self,
-        symbol_y: str = "BTCUSDT",
-        symbol_x: str = "ETHUSDT",
+        symbol_y: str = "",
+        symbol_x: str = "",
     ) -> AsyncIterator[BarData]:
         """
-        Async generator: yields BarData when both symbols have fresh prices.
-        Runs until cancelled or ws_feed disconnects.
+        Async generator: yields BarData când ambele simboluri au preţuri fresh.
         """
+        sym_y = symbol_y or self._symbol_y
+        sym_x = symbol_x or self._symbol_x
+
         self._running = True
         self._prices  = {}
         self._last_ts = {}
 
         if self._ws_feed is None:
-            logger.warning("BybitWsBarsAdapter: no ws_feed, using mock price stream")
-            async for bar in self._mock_stream(symbol_y, symbol_x):
+            async for bar in self._mock_stream(sym_y, sym_x):
                 yield bar
             return
 
-        # Start background tasks for each symbol
         task_y = asyncio.create_task(
-            self._consume_symbol(symbol_y), name=f"ws_{symbol_y}"
+            self._consume_symbol(sym_y, self._ws_feed), name=f"ws_{sym_y}"
         )
         task_x = asyncio.create_task(
-            self._consume_symbol(symbol_x), name=f"ws_{symbol_x}"
+            self._consume_symbol(sym_x, self._ws_feed_x), name=f"ws_{sym_x}"
         )
 
         try:
             while self._running:
-                # Wait for a bar update
                 try:
                     updated_symbol = await asyncio.wait_for(
                         self._bar_queue.get(), timeout=30.0
@@ -93,15 +156,15 @@ class BybitWsBarsAdapter:
                     logger.warning("BybitWsBarsAdapter: 30s timeout, no bar received")
                     continue
 
-                # Both symbols must have prices
-                if symbol_y in self._prices and symbol_x in self._prices:
-                    yield BarData(
-                        symbol_y=symbol_y,
-                        symbol_x=symbol_x,
-                        price_y=self._prices[symbol_y],
-                        price_x=self._prices[symbol_x],
-                        timestamp=time.time(),
+                if sym_y in self._prices and sym_x in self._prices:
+                    bar = BarData(
+                        symbol_y  = sym_y,
+                        symbol_x  = sym_x,
+                        price_y   = self._prices[sym_y],
+                        price_x   = self._prices[sym_x],
+                        timestamp = time.time(),
                     )
+                    yield bar
         finally:
             self._running = False
             task_y.cancel()
@@ -112,23 +175,39 @@ class BybitWsBarsAdapter:
     # Internal: consume a single symbol from ws_feed
     # ------------------------------------------------------------------
 
-    async def _consume_symbol(self, symbol: str) -> None:
-        """Subscribe to kline stream and push price updates to queue."""
-        ws = self._ws_feed
+    async def _consume_symbol(self, symbol: str, ws_feed) -> None:
+        """Subscribe la kline stream și push price updates în queue."""
+        if ws_feed is None:
+            logger.warning(f"BybitWsBarsAdapter: no ws_feed for {symbol}, skipping")
+            return
         try:
-            if hasattr(ws, "subscribe_kline"):
-                await ws.subscribe_kline(symbol=symbol, interval=self._interval)
-            elif hasattr(ws, "subscribe"):
-                await ws.subscribe(symbol=symbol, channel="kline", interval=self._interval)
+            if hasattr(ws_feed, "subscribe_kline"):
+                await ws_feed.subscribe_kline(symbol=symbol, interval=self._interval)
+            elif hasattr(ws_feed, "subscribe"):
+                await ws_feed.subscribe(symbol=symbol, channel="kline", interval=self._interval)
+            elif hasattr(ws_feed, "stream_bars"):
+                # BybitWsFeed: folosește stream_bars() și extrage price
+                async for bar in ws_feed.stream_bars():
+                    if not self._running:
+                        return
+                    price = bar.price_y if hasattr(bar, "price_y") else None
+                    if price is not None and price > 0:
+                        self._prices[symbol] = price
+                        self._last_ts[symbol] = time.time()
+                        self._last_msg_ts = time.time()
+                        await self._bar_queue.put(symbol)
+                return
 
-            async for msg in ws.stream(symbol=symbol):
-                if not self._running:
-                    return
-                price = self._extract_price(msg)
-                if price is not None:
-                    self._prices[symbol] = price
-                    self._last_ts[symbol] = time.time()
-                    await self._bar_queue.put(symbol)
+            if hasattr(ws_feed, "stream"):
+                async for msg in ws_feed.stream(symbol=symbol):
+                    if not self._running:
+                        return
+                    price = self._extract_price(msg)
+                    if price is not None:
+                        self._prices[symbol] = price
+                        self._last_ts[symbol] = time.time()
+                        self._last_msg_ts = time.time()
+                        await self._bar_queue.put(symbol)
 
         except asyncio.CancelledError:
             return
@@ -139,13 +218,12 @@ class BybitWsBarsAdapter:
         """Extract price from kline message (Bybit V5 format)."""
         try:
             if isinstance(msg, dict):
-                # Bybit V5: {"topic": "kline.5.BTCUSDT", "data": [{"close": "..."}]}
                 data = msg.get("data", msg)
                 if isinstance(data, list) and data:
                     data = data[0]
                 if isinstance(data, dict):
                     field = self._price_field
-                    val = data.get(field) or data.get("c")  # 'c' = close in V5
+                    val = data.get(field) or data.get("c")
                     if val is not None:
                         return float(val)
             elif isinstance(msg, (int, float)):
@@ -155,32 +233,26 @@ class BybitWsBarsAdapter:
         return None
 
     # ------------------------------------------------------------------
-    # Mock stream for testing without real WS connection
+    # Mock stream pentru testing fără conexiune WS reală
     # ------------------------------------------------------------------
 
     async def _mock_stream(
         self,
         symbol_y: str,
         symbol_x: str,
-        n_bars: int = 200,
-        interval_s: float = 0.0,
     ) -> AsyncIterator[BarData]:
-        """Synthetic OU stream for testing."""
+        """Mock stream pentru testing fără conexiune WS reală."""
         import random
-        random.seed(42)
-        spread = 0.0
-        base_x = 100.0
-
-        for _ in range(n_bars):
-            spread += 0.05 * (0 - spread) + random.gauss(0, 1)
-            price_x = base_x + random.gauss(0, 0.5)
-            price_y = price_x + spread
+        price_y = 60000.0
+        price_x = 3000.0
+        while self._running:
+            price_y *= 1 + (random.random() - 0.5) * 0.001
+            price_x *= 1 + (random.random() - 0.5) * 0.001
             yield BarData(
-                symbol_y=symbol_y,
-                symbol_x=symbol_x,
-                price_y=price_y,
-                price_x=price_x,
-                timestamp=time.time(),
+                symbol_y  = symbol_y,
+                symbol_x  = symbol_x,
+                price_y   = round(price_y, 2),
+                price_x   = round(price_x, 2),
+                timestamp = time.time(),
             )
-            if interval_s > 0:
-                await asyncio.sleep(interval_s)
+            await asyncio.sleep(1.0)

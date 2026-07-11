@@ -1,16 +1,21 @@
 """
 QuantLuna — BybitWsFeed
-Sprint 27 + July 2026 improvements
+Sprint 27 + July 2026 + S20-fix
 
 WebSocket feed via pybit v5 — kline + orderbook subscriptions.
 
+Fix S20:
+  - get_bar(): metodă async care returnează BarData (așteptat de _run_loop)
+  - stream_bars() yield BarData în loc de dict brut
+  - _normalize_bar_dict(): extrage close price din Bybit V5 format
+  - _BarData namedtuple: price_y, price_x, timestamp, symbol_y, symbol_x
+    (pentru BybitWsFeed single-symbol: price_y = price_x = close)
+
 Improvements (July 2026):
   - on_bar / on_orderbook callbacks can now be async coroutines
-  - Reconnect uses jitter (±20%%) to avoid thundering-herd on mass restart
+  - Reconnect uses jitter (±20%) to avoid thundering-herd on mass restart
   - Dead-feed detection: if is_dead fires twice consecutively, force WS reconnect
-    (previously the watchdog only logged; the feed stayed silently dead)
   - stream_bars() async generator for use in BybitLiveRunner
-    (avoids callback-based push, simplifies runner loop)
   - MAX_RECONNECT bumped from 5 to configurable via ws_max_reconnects param
   - Separate queue per subscription (kline vs orderbook) to prevent cross-topic drop
 
@@ -24,7 +29,10 @@ Usage:
 
     # Generator style (preferred in BybitLiveRunner):
     async for bar in feed.stream_bars():
-        process(bar)
+        process(bar)   # bar.price_y, bar.price_x, bar.timestamp
+
+    # get_bar() style (used in _run_loop):
+    bar = await feed.get_bar()   # blocks until next bar
 """
 from __future__ import annotations
 
@@ -34,6 +42,7 @@ import logging
 import os
 import random
 import time
+from collections import namedtuple
 from typing import AsyncIterator, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -44,11 +53,20 @@ _WATCHDOG_STALE  = 30.0   # seconds without message = stale
 _WATCHDOG_DEAD   = 60.0   # seconds without message = dead (triggers forced reconnect)
 _DEAD_RECONNECT_THRESHOLD = 2  # consecutive dead checks before forced reconnect
 
+# BarData namedtuple — compatibil cu _run_loop din BybitLiveRunner
+# price_y = price_x = close pentru single-symbol feed
+# Pentru dual-symbol, BybitWsBarsAdapter suprascrie aceste câmpuri
+BarData = namedtuple(
+    "BarData",
+    ["symbol_y", "symbol_x", "price_y", "price_x", "timestamp"],
+    defaults=["", "", 0.0, 0.0, 0.0],
+)
+
 
 class BybitWsFeed:
     """
     Async WebSocket feed for Bybit v5.
-    Runs in background asyncio task; exposes stream_bars() generator.
+    Runs in background asyncio task; exposes stream_bars() generator + get_bar().
     """
 
     def __init__(
@@ -114,24 +132,80 @@ class BybitWsFeed:
     def is_dead(self) -> bool:
         return self.last_msg_age_s > _WATCHDOG_DEAD
 
+    def is_healthy(self) -> bool:
+        """Health check pentru HealthCheck/Watchdog."""
+        return self._running and not self.is_stale
+
+    # ------------------------------------------------------------------
+    # FIX S20: get_bar() — așteptat de _run_loop din BybitLiveRunner
+    # ------------------------------------------------------------------
+
+    async def get_bar(self, timeout: float = 30.0) -> Optional[BarData]:
+        """
+        Așteaptă următorul bar și returnează un obiect BarData.
+
+        Pentru un feed single-symbol, price_y == price_x == close.
+        BybitWsBarsAdapter suprascrie această metodă pentru dual-symbol.
+
+        Returns None la timeout (runner-ul verifică None).
+        """
+        if not self._running:
+            await self.start()
+        try:
+            raw = await asyncio.wait_for(self._bar_queue.get(), timeout=timeout)
+            return self._normalize_to_bardata(raw)
+        except asyncio.TimeoutError:
+            return None
+        except asyncio.CancelledError:
+            return None
+
+    def _normalize_to_bardata(self, msg: dict) -> BarData:
+        """
+        Converteste un mesaj Bybit V5 kline dict în BarData.
+
+        Bybit V5 format:
+          {"topic": "kline.5.BTCUSDT", "data": [{"close": "...", "confirm": true}]}
+        """
+        close = 0.0
+        ts    = time.time()
+        try:
+            data = msg.get("data", msg)
+            if isinstance(data, list) and data:
+                data = data[0]
+            if isinstance(data, dict):
+                close = float(data.get("close") or data.get("c") or 0.0)
+                ts_raw = data.get("start") or data.get("timestamp") or data.get("ts")
+                if ts_raw:
+                    ts = float(ts_raw) / 1000.0  # ms → s
+        except Exception as exc:
+            logger.debug(f"BybitWsFeed._normalize_to_bardata: {exc}")
+
+        return BarData(
+            symbol_y  = self.symbol,
+            symbol_x  = self.symbol,
+            price_y   = close,
+            price_x   = close,
+            timestamp = ts,
+        )
+
     # ------------------------------------------------------------------
     # Public: async generator (preferred usage in BybitLiveRunner)
     # ------------------------------------------------------------------
 
-    async def stream_bars(self) -> AsyncIterator[dict]:
+    async def stream_bars(self) -> AsyncIterator[BarData]:
         """
-        Async generator that yields closed kline bar dicts.
+        Async generator that yields BarData objects (FIX S20: nu mai dict brut).
         Usage:
             async for bar in feed.stream_bars():
-                # bar = {"symbol": ..., "close": ..., "volume": ..., "ts": ...}
+                # bar.price_y, bar.price_x, bar.timestamp
         Blocks until feed is stopped.
         """
         if not self._running:
             await self.start()
         while self._running:
             try:
-                bar = await asyncio.wait_for(self._bar_queue.get(), timeout=5.0)
-                yield bar
+                raw = await asyncio.wait_for(self._bar_queue.get(), timeout=5.0)
+                yield self._normalize_to_bardata(raw)
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
@@ -164,7 +238,6 @@ class BybitWsFeed:
                         f"BybitWsFeed {self.symbol}: max reconnects reached, stopping"
                     )
                     break
-                # Jitter: ±20% of delay to spread reconnects across instances
                 jitter  = delay * 0.2 * (random.random() * 2 - 1)
                 wait    = max(0.5, min(delay + jitter, _RECONNECT_MAX))
                 logger.debug(f"BybitWsFeed {self.symbol}: reconnect in {wait:.1f}s")
@@ -190,7 +263,7 @@ class BybitWsFeed:
             channel_type=self.category,
         )
 
-        if self.on_bar or True:   # always subscribe bars for stream_bars() generator
+        if self.on_bar or True:   # always subscribe bars for stream_bars() / get_bar()
             ws.kline_stream(
                 interval=int(self.interval) if self.interval.isdigit() else 1,
                 symbol=self.symbol,
@@ -247,7 +320,7 @@ class BybitWsFeed:
                             f"BybitWsFeed {self.symbol}: forcing reconnect after "
                             f"{self._dead_count} dead checks"
                         )
-                        break  # exit _connect_and_listen → triggers reconnect in _run_loop
+                        break
 
                 await asyncio.sleep(1.0)
         finally:
