@@ -14,6 +14,10 @@ Score logic:
 
 Fix #6: KalmanScoringWeights dataclass — all score() numeric adjustments
   are now configurable and can be tuned via the Optuna optimizer's SearchSpace.
+
+Fix #7 (Gap #3): generate_batch() now accepts coint_pvalue_series: Optional[pd.Series]
+  so the real per-bar ADF p-value produced by WalkForwardEngine._build_coint_pvalue_series
+  reaches score() and the meta dict, instead of being discarded.
 """
 from __future__ import annotations
 
@@ -39,18 +43,12 @@ class KalmanScoringWeights:
       1. They can be passed as constructor args for A/B testing.
       2. optimizer.py SearchSpace can include them as Optuna parameters.
       3. Values are documented in one place with clear semantics.
-
-    Usage with optimizer:
-        ss.kalman_score_baseline_low  = 0.50
-        ss.kalman_score_baseline_high = 0.70
-        # ... then trial.suggest_float("kalman_score_baseline", ...)
-        # and pass KalmanScoringWeights(baseline=params["kalman_score_baseline"])
     """
     # Starting score before adjustments
     baseline: float = 0.60
 
     # Regime adjustments
-    regime_ranging_bonus:   float =  0.15
+    regime_ranging_bonus:    float =  0.15
     regime_trending_penalty: float = -0.20
     regime_breakout_penalty: float = -0.10
 
@@ -60,25 +58,25 @@ class KalmanScoringWeights:
     coint_p010_penalty: float = -0.20   # p > 0.10
 
     # Half-life adjustments (hours)
-    hl_optimal_low:    float =   4.0   # optimal range lower bound
-    hl_optimal_high:   float =  48.0   # optimal range upper bound
-    hl_long_threshold: float = 120.0   # above this → penalty
-    hl_short_threshold: float =  2.0   # below this → penalty
-    hl_optimal_bonus:  float =  0.10
-    hl_long_penalty:   float = -0.15
-    hl_short_penalty:  float = -0.05
+    hl_optimal_low:     float =   4.0
+    hl_optimal_high:    float =  48.0
+    hl_long_threshold:  float = 120.0
+    hl_short_threshold: float =   2.0
+    hl_optimal_bonus:   float =  0.10
+    hl_long_penalty:    float = -0.15
+    hl_short_penalty:   float = -0.05
 
     # Spread autocorrelation adjustments
-    autocorr_good_threshold: float = -0.15   # below → mean-reverting
-    autocorr_bad_threshold:  float =  0.20   # above → trending spread
+    autocorr_good_threshold: float = -0.15
+    autocorr_bad_threshold:  float =  0.20
     autocorr_good_bonus:     float =  0.10
     autocorr_bad_penalty:    float = -0.15
 
     # Volatility rank adjustments
-    vol_rank_good_low:   float = 0.15
-    vol_rank_good_high:  float = 0.80
-    vol_rank_extreme:    float = 0.95   # above → extreme vol penalty
-    vol_rank_good_bonus: float =  0.05
+    vol_rank_good_low:        float = 0.15
+    vol_rank_good_high:       float = 0.80
+    vol_rank_extreme:         float = 0.95
+    vol_rank_good_bonus:      float =  0.05
     vol_rank_extreme_penalty: float = -0.15
 
     # Recent win rate adjustments
@@ -109,7 +107,6 @@ class KalmanPairsTrading(BaseStrategy):
             funding_threshold_annual=funding_threshold_annual,
         )
         self._spread_engine = spread_engine
-        # Fix #6: use configurable weights instead of hardcoded literals
         self._weights = scoring_weights or KalmanScoringWeights()
 
     @property
@@ -118,7 +115,7 @@ class KalmanPairsTrading(BaseStrategy):
 
     @property
     def version(self) -> str:
-        return "4.1"
+        return "4.2"
 
     def generate_live(
         self,
@@ -143,7 +140,19 @@ class KalmanPairsTrading(BaseStrategy):
         funding_annual: Optional[pd.Series] = None,
         regime_multiplier: Optional[pd.Series] = None,
         coint_valid_series: Optional[pd.Series] = None,
+        coint_pvalue_series: Optional[pd.Series] = None,
     ) -> pd.DataFrame:
+        """
+        Fix #7 (Gap #3): added coint_pvalue_series parameter.
+
+        Previously generate_batch() only accepted coint_valid_series (bool) which
+        prevented the real per-bar ADF p-value from reaching the downstream meta dict
+        and score() comparisons (p < 0.01 / p < 0.05 / p > 0.10 thresholds).
+
+        Now: if coint_pvalue_series is provided its values are attached to every row
+        in the result DataFrame under column 'coint_pvalue', making them available
+        to AutoStrategySelector.generate_batch() and MarketContext construction.
+        """
         result = self._generator.generate_batch(
             df=df,
             funding_annual=funding_annual,
@@ -151,18 +160,24 @@ class KalmanPairsTrading(BaseStrategy):
             coint_valid_series=coint_valid_series,
         )
         result["strategy_name"] = self.name
+
+        # Fix #7: propagate real p-value per bar so callers can wire it into MarketContext
+        if coint_pvalue_series is not None:
+            pv = coint_pvalue_series.reset_index(drop=True)
+            result["coint_pvalue"] = pv.reindex(result.index).fillna(0.05).to_numpy(dtype=float)
+        else:
+            result["coint_pvalue"] = 0.05
+
         return result
 
     def score(self, context: MarketContext) -> float:
         """
         Fix #6: all numeric adjustments read from self._weights (KalmanScoringWeights)
-        instead of inline magic numbers. Semantics are unchanged; values are identical
-        to the previous hardcoded defaults.
+        instead of inline magic numbers.
         """
         w = self._weights
         score = w.baseline
 
-        # Regime
         if context.regime == "ranging":
             score += w.regime_ranging_bonus
         elif context.regime == "trending":
@@ -170,7 +185,6 @@ class KalmanPairsTrading(BaseStrategy):
         elif context.regime == "breakout":
             score += w.regime_breakout_penalty
 
-        # Cointegration p-value
         if context.coint_pvalue < 0.01:
             score += w.coint_p001_bonus
         elif context.coint_pvalue < 0.05:
@@ -178,7 +192,6 @@ class KalmanPairsTrading(BaseStrategy):
         elif context.coint_pvalue > 0.10:
             score += w.coint_p010_penalty
 
-        # Half-life
         hl = context.half_life_hours
         if w.hl_optimal_low <= hl <= w.hl_optimal_high:
             score += w.hl_optimal_bonus
@@ -187,20 +200,17 @@ class KalmanPairsTrading(BaseStrategy):
         elif hl < w.hl_short_threshold:
             score += w.hl_short_penalty
 
-        # Spread autocorrelation
         if context.spread_autocorr < w.autocorr_good_threshold:
             score += w.autocorr_good_bonus
         elif context.spread_autocorr > w.autocorr_bad_threshold:
             score += w.autocorr_bad_penalty
 
-        # Volatility rank
         vr = context.vol_rank
         if w.vol_rank_good_low <= vr <= w.vol_rank_good_high:
             score += w.vol_rank_good_bonus
         elif vr > w.vol_rank_extreme:
             score += w.vol_rank_extreme_penalty
 
-        # Recent win rate
         if context.recent_win_rate > w.win_rate_good_threshold:
             score += w.win_rate_good_bonus
         elif context.recent_win_rate < w.win_rate_bad_threshold:

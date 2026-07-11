@@ -7,7 +7,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.14.0-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.15.0-green.svg)](CHANGELOG.md)
 
 ---
 
@@ -23,8 +23,9 @@
 │  BinanceFetcher      Cointegration        ├─ BybitRouter    │
 │  OKXFetcher          SpreadSignal         ├─ BinanceRouter  │
 │  MarketDataCache     MultiTimeframe       └─ OKXRouter      │
-│                      VolatilityRegime                        │
-│                      RegimeFilter    →    CircuitBreaker     │
+│                      AutoStrategySelector                   │
+│                      VolatilityRegime                       │
+│                      RegimeFilter    →    CircuitBreaker    │
 │                      SpreadMonitor        PositionScanner   │
 │                                          AdoptionEngine     │
 │                                          ProfitOptimizer    │
@@ -34,8 +35,14 @@
 │  CircuitBreaker  →  NotifierBus  →  Slack / Telegram /      │
 │  HealthCheck        PnLReconciler    Discord                 │
 │  WsWatchdog         Checkpoint                              │
-│  AutoRebalancer     CorrelationFilter                        │
+│  AutoRebalancer     CorrelationFilter                       │
 │  DrawdownController KellyPositionSizer                      │
+│                                                             │
+│  Backtest / Optimizer                                       │
+│  ────────────────────                                       │
+│  WalkForwardEngine   KalmanScoringWeights SearchSpace       │
+│  coint_pvalue_series (rolling ADF, per-bar)                 │
+│  Optuna TPE optimizer (16 ks_* params)                      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -72,11 +79,19 @@ quantluna/
 │   └── market_data_cache.py      # Cache date de piata
 │
 ├── strategy/
-│   ├── signal_generator.py       # Generator semnale intrare/iesire
+│   ├── signal.py                 # SignalGenerator v4 — logica principala
+│   ├── kalman_pairs_trading.py   # KalmanPairsTrading BaseStrategy wrapper (v4.2)
+│   ├── auto_selector.py          # AutoStrategySelector — scorer + switcher
+│   ├── optimizer.py              # Optuna optimizer + KalmanScoringWeights SearchSpace
 │   ├── multi_timeframe.py        # Confirmare MTF (LTF + HTF)
 │   ├── regime_filter.py          # Gate unificat regim
-│   ├── auto_selector.py          # Selectie automata perechi
-│   └── trend_regime_detector.py  # Detectie trend vs mean-reversion
+│   ├── regime_detector.py        # Detectie trend vs mean-reversion
+│   ├── pair_selector.py          # Selectie perechi cointegrate
+│   ├── live_pair_scanner.py      # Scanner live perechi
+│   ├── bb_mean_reversion.py      # Bollinger Bands mean reversion
+│   ├── zscore_momentum.py        # Z-score momentum strategy
+│   ├── funding_arb.py            # Funding rate arbitrage
+│   └── signal_combiner.py        # Combinator semnale multi-strategie
 │
 ├── execution/
 │   ├── order_manager.py          # Lifecycle comenzi multi-exchange
@@ -125,7 +140,7 @@ quantluna/
 │   └── discord.py                # Notificari Discord
 │
 ├── backtest/
-│   ├── engine.py                 # Engine backtest vectorizat
+│   ├── engine.py                 # WalkForwardEngine + coint_pvalue_series (FIX-BT-7)
 │   ├── walk_forward.py           # Walk-forward validation
 │   ├── walk_forward_optimizer.py # Optimizare Optuna walk-forward
 │   └── report_builder.py         # Rapoarte HTML/JSON backtest
@@ -139,13 +154,9 @@ quantluna/
 │   ├── dashboard_api.py          # REST API dashboard (FastAPI)
 │   └── strategy_api.py           # API strategie
 │
-├── analytics/
-│   ├── analytics.py              # Metrici performanta
-│   └── risk_dashboard.py         # Dashboard risc
-│
 ├── tests/                        # 45+ fisiere de teste
 │   ├── conftest.py
-│   └── ...                       # Teste pentru fiecare modul
+│   └── ...
 │
 ├── main.py                       # Entry point principal
 ├── config.py                     # Configurare globala
@@ -174,6 +185,7 @@ numpy >= 1.26
 pandas >= 2.1
 scipy >= 1.11
 statsmodels >= 0.14
+optuna >= 3.6
 aiohttp >= 3.9
 fastapi >= 0.111
 loguru >= 0.7
@@ -237,12 +249,14 @@ python main.py backtest --pair BTCUSDT ETHUSDT --days 90 --timeframe 1h
 make backtest
 ```
 
-### Walk-forward + Optuna
+### Walk-forward + Optuna (KalmanScoringWeights inclus)
 
 ```bash
-python main.py scan --exchange bybit --top 20
-# urmat de:
+# Optimizare completa cu 16 parametri ks_* in SearchSpace
 python scripts/optimize_params.py --pair BTCUSDT ETHUSDT --trials 200
+
+# Cu optimize_kalman_score=False pentru spatiu mai mic
+python scripts/optimize_params.py --pair BTCUSDT ETHUSDT --trials 100 --no-ks
 ```
 
 ### Dashboard
@@ -253,6 +267,28 @@ uvicorn dashboard.server:app --reload --port 8000
 # sau
 make docker-dashboard
 ```
+
+---
+
+## Optimizer — KalmanScoringWeights SearchSpace
+
+Din `v0.15.0`, toti parametrii `KalmanScoringWeights` sunt inclusi in `SearchSpace` si pot fi optimizati via Optuna:
+
+```python
+from strategy.optimizer import QuantLunaOptimizer, OptimizerConfig
+
+opt = QuantLunaOptimizer(OptimizerConfig(
+    n_trials=200,
+    optimize_kalman_score=True,   # activeaza cei 16 ks_* params
+    objective="sharpe",
+    seed=42,
+))
+best = opt.optimize(ohlcv_y, ohlcv_x)
+best.save_json("best_params.json")
+print(f"Sharpe test: {best.sharpe_test:.3f}")
+```
+
+Parametrii optimizati includ: `ks_baseline`, `ks_regime_*`, `ks_coint_p*`, `ks_hl_*`, `ks_autocorr_*`, `ks_vol_rank_*`, `ks_win_rate_*`.
 
 ---
 
@@ -276,6 +312,26 @@ pytest tests/test_smoke_s18.py tests/test_smoke_s15_s17.py -v
 ---
 
 ## Componente cheie
+
+### AutoStrategySelector — Scoring inteligent
+
+```python
+from strategy.auto_selector import AutoStrategySelector
+from strategy.kalman_pairs_trading import KalmanPairsTrading, KalmanScoringWeights
+
+# Scoring weights customizabile (sau optimizate via Optuna)
+weights = KalmanScoringWeights(baseline=0.65, regime_ranging_bonus=0.18)
+kalman = KalmanPairsTrading(spread_engine=engine, scoring_weights=weights)
+
+selector = AutoStrategySelector(strategies=[kalman, bb, zscore_mom, funding_arb])
+
+# generate_batch cu coint_pvalue_series float real
+signals = selector.generate_batch(
+    df=spread_df,
+    coint_pvalue_series=coint_pvalue_series,  # pd.Series de float (ADF p-values)
+    coint_valid_series=coint_valid_series,
+)
+```
 
 ### RegimeFilter — Gatekeeper central
 
@@ -325,19 +381,6 @@ if not cb.is_open:
     print(cb.status())
 ```
 
-### NotifierBus — Fan-out notificari
-
-```python
-from notifications.notifier_bus import NotifierBus
-from notifications.slack_notifier import SlackNotifier, SlackConfig
-
-bus = NotifierBus()
-bus.register("slack", SlackNotifier(SlackConfig(webhook_url="https://...")))
-
-await bus.send_entry_signal("BTCUSDT", "LONG", zscore=2.4)
-await bus.send_circuit_breaker_trip("drawdown", "5% hit", cooldown_s=3600)
-```
-
 ---
 
 ## Roadmap
@@ -351,7 +394,7 @@ await bus.send_circuit_breaker_trip("drawdown", "5% hit", cooldown_s=3600)
 | S16    | ✅ Done | OKX router, Multi-timeframe, Vol regime, Dashboard API |
 | S17    | ✅ Done | OrderManager, CircuitBreaker, Slack, AdoptionEngine, ProfitOptimizer |
 | S18    | ✅ Done | SpreadMonitor, RegimeFilter, NotifierBus, `__init__` completat |
-| S19    | 🔲 Next | Live integration test end-to-end, paper run 48h |
+| S19    | ✅ Done | KalmanScoringWeights SearchSpace, coint_pvalue_series rolling ADF, FIX-BT-7, Gap #1–#3 |
 | S20    | 🔲 Next | Prometheus metrics endpoint, alerting rules |
 | S21    | 🔲 Next | Web UI React dashboard (replace FastAPI Jinja) |
 

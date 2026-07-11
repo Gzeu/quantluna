@@ -29,6 +29,23 @@ Format: [Semantic Versioning](https://semver.org/) — `MAJOR.MINOR.PATCH`
 
 ---
 
+## [0.15.0] — 2026-07-11
+
+### Added — Sprint 19 / Fix-BT-7 / Optimizer SearchSpace
+
+- `strategy/optimizer.py` — `SearchSpace` extins cu 16 câmpuri `ks_*` pentru toți parametrii din `KalmanScoringWeights`; `OptimizerConfig.optimize_kalman_score: bool = True` toggle; `_objective()` sugerează parametrii `ks_*` via Optuna cu constraint `p001 > p005 > 0 > p010`; `_run_backtest()` construiește `KalmanScoringWeights` din params și îl transmite în `BacktestConfig`.
+- `backtest/engine.py` — `BacktestConfig` extins cu `coint_pvalue_window`, `coint_retest_interval_bars`, `kalman_scoring_weights`; helper static `_build_coint_pvalue_series()` pentru rolling ADF float p-values cu carry-forward fără lookahead; seria `coint_pvalue` calculată și atașată per bar în fold-urile IS și OOS (FIX-BT-7).
+- `strategy/kalman_pairs_trading.py` — `generate_batch()` acceptă acum `coint_pvalue_series: Optional[pd.Series]`; valorile sunt atașate coloanei `coint_pvalue` în DataFrame-ul rezultat și disponibile downstream pentru `MarketContext` și `score()` (Fix #7 / Gap #3). Versiunea bumped la `4.2`.
+- `strategy/auto_selector.py` — `generate_batch()` transmite `coint_pvalue_series` la `KalmanPairsTrading.generate_batch()` via introspectie `inspect.signature`; `MarketContext.coint_pvalue` primeşte `float` real per bar (nu `bool`) din `coint_p_arr` (Fix #7 / Gap #1). Wiring complet end-to-end: engine → fold_df["coint_pvalue"] → AutoStrategySelector → MarketContext → score().
+
+### Fixed
+- FIX-BT-7: `coint_pvalue` era hardcodat la `0.05` în toate apelurile `generate_batch()` — acum este calculat rolling (ADF) per bar cu carry-forward între retestări la interval configurabil.
+- Gap #1: `MarketContext.coint_pvalue` primea `bool` (din `coint_valid`) în loc de `float` — corectat în `auto_selector.py`.
+- Gap #2: `kalman_scoring_weights` din `BacktestConfig` acum construit și transmis corect la `KalmanPairsTrading` prin optimizer.
+- Gap #3: `generate_batch()` în `KalmanPairsTrading` nu accepta `coint_pvalue_series` — parametru adăugat, valorile propagate în coloana `coint_pvalue`.
+
+---
+
 ## [0.14.0] — 2026-07
 
 ### Added — Sprint 31
