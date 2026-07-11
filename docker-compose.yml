@@ -2,10 +2,15 @@
 # Profiles: paper | live | dashboard | all
 #
 # Usage:
-#   docker compose --profile paper up --build          # paper trading
+#   docker compose --profile paper up --build          # paper trading only
 #   docker compose --profile live up --build           # LIVE TRADING (bani reali!)
-#   docker compose --profile all up --build            # paper + dashboard
-#   docker compose --profile live --profile dashboard up --build  # live + dashboard
+#   docker compose --profile all up --build            # paper + FastAPI dashboard + Next.js
+#   docker compose --profile live --profile dashboard up --build  # live + full dashboard
+#
+# Porturi:
+#   :8081  runner health endpoint  (paper / live)
+#   :8000  FastAPI dashboard API   (dashboard, all)
+#   :3000  Next.js frontend UI     (dashboard, all)
 #
 # Secrete: toate credentialele vin din .env (nu se hardcodeaza aici)
 # Volumes: data/, state/, logs/ sunt montate din host pentru persistenta
@@ -74,9 +79,7 @@ services:
       - ./data:/app/data
       - ./state:/app/state
       - ./logs:/app/logs
-    # restart: always — reporneste automat dupa crash sau restart server
     restart: always
-    # Oprire gratiosa: asteapta max 30s pentru inchiderea pozitiilor deschise
     stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "python", "-c",
@@ -84,12 +87,13 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s    # mai mult timp pentru REST warm-up la pornire
+      start_period: 60s
     networks:
       - quantluna-net
 
   # --------------------------------------------------------------------------
-  # Dashboard — FastAPI + uvicorn (api/main.py)
+  # Dashboard backend — FastAPI + uvicorn (dashboard/server.py)
+  # Expune: /api/*, /ws/live, /metrics (Prometheus)
   # --------------------------------------------------------------------------
   dashboard:
     profiles: [dashboard, all]
@@ -99,7 +103,7 @@ services:
     image: quantluna:latest
     container_name: quantluna-dashboard
     command: [
-      "uvicorn", "api.main:app",
+      "uvicorn", "dashboard.server:app",
       "--host", "0.0.0.0",
       "--port", "8000",
       "--workers", "1",
@@ -117,11 +121,45 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",
-        "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8000/health',timeout=8); sys.exit(0 if r.status==200 else 1)"]
+        "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8000/api/health',timeout=8); sys.exit(0 if r.status==200 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 20s
+    networks:
+      - quantluna-net
+
+  # --------------------------------------------------------------------------
+  # Frontend — Next.js 14 (dashboard/Dockerfile)
+  # Expune: UI React pe portul 3000
+  # Depinde de: dashboard (FastAPI backend pe :8000) service_healthy
+  # --------------------------------------------------------------------------
+  frontend:
+    profiles: [dashboard, all]
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=http://localhost:8000
+    image: quantluna-frontend:latest
+    container_name: quantluna-frontend
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=http://dashboard:8000
+      - NEXT_PUBLIC_WS_URL=ws://dashboard:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      dashboard:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e",
+        "require('http').get('http://localhost:3000', r => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
     networks:
       - quantluna-net
 

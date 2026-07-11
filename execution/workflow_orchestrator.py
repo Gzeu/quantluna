@@ -1,7 +1,7 @@
 """
-execution/workflow_orchestrator.py  -  QuantLuna Startup Workflow Orchestrator v2
+execution/workflow_orchestrator.py  -  QuantLuna Startup Workflow Orchestrator v3
 
-Sprint 28 rev-4 (fix: loguru, docstrings, wiring):
+Sprint 28 -> v3 (2026-07-11):
   Orchestratorul complet care leaga TOATE modulele existente:
 
   FAZA 0: Pre-flight HealthCheck      <- health_check.HealthCheck
@@ -10,6 +10,7 @@ Sprint 28 rev-4 (fix: loguru, docstrings, wiring):
   FAZA 3: Adoptie pozitii orfane       <- adoption_engine.AdoptionEngine
   FAZA 4: Initializare ProfitOptimizer <- profit_optimizer.ProfitOptimizer
   FAZA 5: Pornire BybitLiveRunner      <- bybit_live_runner.BybitLiveRunner
+  FAZA 6: Dashboard health ping        <- Next.js :3000 + FastAPI :8000  [NOU v3]
 
   Subsisteme integrate:
   - ExchangeFactory  : instanta CCXT shared pentru toate fazele
@@ -17,6 +18,7 @@ Sprint 28 rev-4 (fix: loguru, docstrings, wiring):
   - EmergencyStop    : apelat la halt (FAZA 0 sau FAZA 2)
   - NotifierBus      : inlocuieste live_trader._send_alert
   - StateBus         : bot publica RiskDashboardEngine -> API il citeste
+  - Dashboard        : ping Next.js + FastAPI la startup [NOU v3]
 
 Usage (din main.py)::
 
@@ -35,6 +37,11 @@ from typing import Awaitable, Callable, List, Optional
 
 from loguru import logger
 
+# Timeout / retry config pentru ping dashboard in FAZA 6
+_DASHBOARD_PING_RETRIES = 3
+_DASHBOARD_PING_DELAY_S = 2.0
+_DASHBOARD_PING_TIMEOUT_S = 5.0
+
 
 @dataclass
 class StartupContext:
@@ -48,6 +55,10 @@ class StartupContext:
 
     should_halt: bool = False
     halt_reason: str = ""
+
+    # FAZA 6 - rezultate ping dashboard [v3]
+    dashboard_api_ok: bool = False
+    dashboard_frontend_ok: bool = False
 
     @property
     def has_adopted_positions(self) -> bool:
@@ -90,7 +101,7 @@ class StartupContext:
 
 class WorkflowOrchestrator:
     """
-    Orchestrator complet Sprint 28.
+    Orchestrator complet Sprint 28 -> v3.
 
     Preferred constructor: ``WorkflowOrchestrator.from_runner_cfg(cfg, bus)``
 
@@ -111,6 +122,8 @@ class WorkflowOrchestrator:
         private_ws=None,
         ws_feed=None,
         skip_health_check: bool = False,
+        dashboard_api_url: str = "",
+        dashboard_frontend_url: str = "",
     ) -> None:
         """Initialise orchestrator. Prefer from_runner_cfg() over direct init."""
         self._exchange = exchange
@@ -123,6 +136,15 @@ class WorkflowOrchestrator:
         self._private_ws = private_ws
         self._ws_feed = ws_feed
         self._skip_health = skip_health_check
+        # URL-uri dashboard - citite din env daca nu sunt furnizate explicit
+        self._dashboard_api_url = (
+            dashboard_api_url
+            or os.getenv("DASHBOARD_API_URL", "http://localhost:8000")
+        )
+        self._dashboard_frontend_url = (
+            dashboard_frontend_url
+            or os.getenv("DASHBOARD_FRONTEND_URL", "http://localhost:3000")
+        )
 
     @classmethod
     def from_runner_cfg(
@@ -132,6 +154,8 @@ class WorkflowOrchestrator:
         ws_feed=None,
         private_ws=None,
         skip_health_check: bool = False,
+        dashboard_api_url: str = "",
+        dashboard_frontend_url: str = "",
     ) -> "WorkflowOrchestrator":
         """
         Build orchestrator from a BybitLiveRunnerConfig.
@@ -139,6 +163,17 @@ class WorkflowOrchestrator:
         Exchange is built lazily via ExchangeFactory inside
         run_startup_workflow so that any auth errors surface there with
         full context instead of at import time.
+
+        Args:
+            cfg: BybitLiveRunnerConfig instance.
+            notifier_bus: NotifierBus instance (optional).
+            ws_feed: WebSocket feed (optional).
+            private_ws: Private WebSocket (optional).
+            skip_health_check: Skip FAZA 0 pre-flight checks.
+            dashboard_api_url: Override URL FastAPI dashboard
+                (default: $DASHBOARD_API_URL sau http://localhost:8000).
+            dashboard_frontend_url: Override URL Next.js frontend
+                (default: $DASHBOARD_FRONTEND_URL sau http://localhost:3000).
         """
         return cls(
             exchange=None,
@@ -148,6 +183,8 @@ class WorkflowOrchestrator:
             ws_feed=ws_feed,
             private_ws=private_ws,
             skip_health_check=skip_health_check,
+            dashboard_api_url=dashboard_api_url,
+            dashboard_frontend_url=dashboard_frontend_url,
         )
 
     async def run_startup_workflow(self) -> StartupContext:
@@ -198,7 +235,7 @@ class WorkflowOrchestrator:
             ctx.scan_report = await scanner.scan()
             logger.info("[Orchestrator] {}", ctx.scan_report.summary())
         except Exception as exc:
-            logger.error("[Orchestrator] Scan failed: {} — skip", exc)
+            logger.error("[Orchestrator] Scan failed: {} - skip", exc)
 
         # ----------------------------------------------------------------
         # FAZA 2: Reconciliere checkpoint
@@ -224,7 +261,7 @@ class WorkflowOrchestrator:
                 await self._emergency_stop(ctx.halt_reason)
                 return ctx
         except Exception as exc:
-            logger.error("[Orchestrator] Reconciliere failed: {} — continuam", exc)
+            logger.error("[Orchestrator] Reconciliere failed: {} - continuam", exc)
 
         # ----------------------------------------------------------------
         # FAZA 3: Adoptie pozitii orfane
@@ -239,7 +276,7 @@ class WorkflowOrchestrator:
                 "[Orchestrator] FAZA 3: Adoptie {} pozitii orfane", orphan_count
             )
             await self._alert(
-                f"{orphan_count} pozitii orfane detectate — procesare..."
+                f"{orphan_count} pozitii orfane detectate - procesare..."
             )
             try:
                 from execution.adoption_engine import AdoptionEngine
@@ -260,7 +297,7 @@ class WorkflowOrchestrator:
             except Exception as exc:
                 logger.error("[Orchestrator] Adoptie failed: {}", exc)
         else:
-            logger.info("[Orchestrator] FAZA 3: Nicio pozitie orfana — skip")
+            logger.info("[Orchestrator] FAZA 3: Nicio pozitie orfana - skip")
 
         # ----------------------------------------------------------------
         # FAZA 4: ProfitOptimizer
@@ -295,13 +332,72 @@ class WorkflowOrchestrator:
                 )
         else:
             logger.info(
-                "[Orchestrator] FAZA 4: Nicio pozitie adoptata — optimizer idle"
+                "[Orchestrator] FAZA 4: Nicio pozitie adoptata - optimizer idle"
             )
 
+        # ----------------------------------------------------------------
+        # FAZA 6: Dashboard health ping - Next.js :3000 + FastAPI :8000
+        # Non-blocking: runner porneste chiar daca dashboard-ul nu e UP.
+        # Util pentru dev local fara docker-compose --profile dashboard.
+        # ----------------------------------------------------------------
+        logger.info("[Orchestrator] FAZA 6: Dashboard health ping")
+        ctx.dashboard_api_ok = await self._ping_url(
+            f"{self._dashboard_api_url}/api/health",
+            label="FastAPI dashboard :8000",
+        )
+        ctx.dashboard_frontend_ok = await self._ping_url(
+            self._dashboard_frontend_url,
+            label="Next.js frontend :3000",
+        )
+
+        if ctx.dashboard_api_ok and ctx.dashboard_frontend_ok:
+            logger.info(
+                "[Orchestrator] FAZA 6: Dashboard FULL UP - API={} UI={}",
+                self._dashboard_api_url,
+                self._dashboard_frontend_url,
+            )
+        elif ctx.dashboard_api_ok:
+            logger.warning(
+                "[Orchestrator] FAZA 6: FastAPI OK dar Next.js offline ({}). "
+                "Porneste cu: docker compose --profile dashboard up",
+                self._dashboard_frontend_url,
+            )
+        elif ctx.dashboard_frontend_ok:
+            logger.warning(
+                "[Orchestrator] FAZA 6: Next.js OK dar FastAPI offline ({}). "
+                "Verifica: docker compose --profile dashboard up",
+                self._dashboard_api_url,
+            )
+        else:
+            logger.info(
+                "[Orchestrator] FAZA 6: Dashboard offline - runner porneste fara UI. "
+                "Porneste cu: docker compose --profile dashboard up"
+            )
+
+        # ----------------------------------------------------------------
+        # Startup complet
+        # ----------------------------------------------------------------
+        dashboard_status = (
+            f"UI: {self._dashboard_frontend_url}" if ctx.dashboard_frontend_ok
+            else "UI offline"
+        )
+        api_status = (
+            f"API: {self._dashboard_api_url}" if ctx.dashboard_api_ok
+            else "API offline"
+        )
         logger.info(
-            "[Orchestrator] Startup workflow COMPLET — runner poate porni"
+            "[Orchestrator] Startup workflow COMPLET - runner poate porni | {} | {}",
+            dashboard_status, api_status,
         )
         logger.info(sep)
+
+        await self._alert(
+            f"QuantLuna pornit OK\n"
+            f"  Dashboard: {dashboard_status} | {api_status}\n"
+            f"  Pairs: {getattr(self._runner_cfg, 'symbol_y', '?')} / "
+            f"{getattr(self._runner_cfg, 'symbol_x', '?')}\n"
+            f"  Mode: {'DRY' if getattr(self._runner_cfg, 'dry_run', True) else 'LIVE'}"
+        )
         return ctx
 
     async def start_runner(
@@ -312,12 +408,12 @@ class WorkflowOrchestrator:
         """
         FAZA 5: Porneste BybitLiveRunner si (optional) optimizer loop.
 
-        ``price_feed_callback`` — ``async () -> Dict[symbol, price]``.
+        ``price_feed_callback`` - ``async () -> Dict[symbol, price]``.
         If None and adopted positions exist, a simple CCXT poller is used.
         """
         if ctx.should_halt:
             logger.error(
-                "[Orchestrator] start_runner: context HALT — nu pornesc runner"
+                "[Orchestrator] start_runner: context HALT - nu pornesc runner"
             )
             return
 
@@ -344,7 +440,7 @@ class WorkflowOrchestrator:
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
-            logger.info("[Orchestrator] Tasks cancelled — stopping runner")
+            logger.info("[Orchestrator] Tasks cancelled - stopping runner")
             await runner.stop()
         except Exception as exc:
             logger.error("[Orchestrator] Runner error: {}", exc)
@@ -394,11 +490,50 @@ class WorkflowOrchestrator:
     # Private helpers
     # ------------------------------------------------------------------
 
+    async def _ping_url(
+        self,
+        url: str,
+        label: str = "",
+        retries: int = _DASHBOARD_PING_RETRIES,
+        delay_s: float = _DASHBOARD_PING_DELAY_S,
+        timeout_s: float = _DASHBOARD_PING_TIMEOUT_S,
+    ) -> bool:
+        """
+        Ping un URL HTTP cu retry. Returneaza True daca raspunde cu status < 500.
+
+        Non-blocking fata de startup - esecul nu opreste runner-ul.
+        Folosit in FAZA 6 pentru a verifica daca dashboard-ul e UP.
+        """
+        import urllib.request
+        import urllib.error
+
+        for attempt in range(1, retries + 1):
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={"User-Agent": "QuantLuna-Orchestrator/3"},
+                )
+                with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                    if resp.status < 500:
+                        logger.debug(
+                            "[Orchestrator] {} ping OK (HTTP {})",
+                            label, resp.status,
+                        )
+                        return True
+            except Exception as exc:
+                logger.debug(
+                    "[Orchestrator] {} ping attempt {}/{} failed: {}",
+                    label, attempt, retries, exc,
+                )
+                if attempt < retries:
+                    await asyncio.sleep(delay_s)
+        return False
+
     async def _run_health_check(self):
         """Run HealthCheck against current runner config."""
         cfg = self._runner_cfg
         if cfg is None:
-            logger.warning("[Orchestrator] No runner_cfg — skipping HealthCheck")
+            logger.warning("[Orchestrator] No runner_cfg - skipping HealthCheck")
             return None
         try:
             from execution.health_check import HealthCheck, HealthConfig
