@@ -1,0 +1,78 @@
+name: Deploy to Production
+# Deploy automat pe server SSH la orice tag v*.*.*
+# Necesita GitHub Secrets:
+#   DEPLOY_HOST   - IP sau hostname server
+#   DEPLOY_USER   - user SSH (ex: ubuntu)
+#   DEPLOY_KEY    - SSH private key (ed25519 sau rsa)
+#   DEPLOY_PATH   - path pe server (ex: /opt/quantluna)
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  deploy:
+    name: SSH Deploy
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check required secrets
+        run: |
+          if [ -z "${{ secrets.DEPLOY_HOST }}" ]; then
+            echo "::warning::DEPLOY_HOST secret not set — skipping SSH deploy"
+            echo "SKIP=true" >> $GITHUB_ENV
+          else
+            echo "SKIP=false" >> $GITHUB_ENV
+          fi
+
+      - name: Deploy via SSH
+        if: env.SKIP == 'false'
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_KEY }}
+          script: |
+            set -e
+            cd ${{ secrets.DEPLOY_PATH || '/opt/quantluna' }}
+
+            echo "==> Pulling latest code for tag ${{ github.ref_name }}"
+            git fetch --tags
+            git checkout ${{ github.ref_name }}
+
+            echo "==> Building and starting live container"
+            docker compose --profile live up -d --build --remove-orphans
+
+            echo "==> Waiting for health check (60s)..."
+            sleep 60
+
+            echo "==> Verifying health endpoint"
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8081/api/health || echo "000")
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "::error::Health check failed (HTTP $HTTP_CODE) — initiating rollback"
+              PREV_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+              if [ -n "$PREV_TAG" ]; then
+                echo "==> Rolling back to $PREV_TAG"
+                git checkout $PREV_TAG
+                docker compose --profile live up -d --build
+              fi
+              exit 1
+            fi
+
+            echo "==> Deploy ${{ github.ref_name }} OK — health check passed"
+
+      - name: Notify deploy result
+        if: always()
+        uses: appleboy/telegram-action@master
+        continue-on-error: true
+        with:
+          to: ${{ secrets.TELEGRAM_CHAT_ID }}
+          token: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          message: |
+            ${{ job.status == 'success' && '✅' || '❌' }} QuantLuna Deploy ${{ github.ref_name }}
+            Status: ${{ job.status }}
+            Commit: ${{ github.sha }}
+            Actor: ${{ github.actor }}

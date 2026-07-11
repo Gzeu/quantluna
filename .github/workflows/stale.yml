@@ -1,0 +1,48 @@
+name: Stale Issues
+# Marcheaza si inchide automat issues/PR inactive
+
+on:
+  schedule:
+    # Ruleaza zilnic la 02:00 UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    name: Mark stale issues and PRs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v9
+        with:
+          # Issues inactive 30 zile -> stale, 7 zile dupa -> close
+          days-before-issue-stale: 30
+          days-before-issue-close: 7
+          stale-issue-label: 'stale'
+          stale-issue-message: >
+            Aceasta issue este marcata ca inactiva deoarece nu a avut
+            activitate in ultimele 30 de zile. Va fi inchisa in 7 zile
+            daca nu exista activitate.
+          close-issue-message: >
+            Aceasta issue a fost inchisa automat datorita inactivitatii.
+            Redeschide daca este inca relevanta.
+
+          # PRs inactive 14 zile -> stale, 7 zile dupa -> close
+          days-before-pr-stale: 14
+          days-before-pr-close: 7
+          stale-pr-label: 'stale'
+          stale-pr-message: >
+            Acest PR este marcat ca inactiv deoarece nu a avut activitate
+            in ultimele 14 zile. Va fi inchis in 7 zile daca nu exista
+            activitate.
+          close-pr-message: >
+            Acest PR a fost inchis automat datorita inactivitatii.
+            Redeschide daca este inca relevant.
+
+          # Nu marca niciodata issues/PR cu aceste label-uri
+          exempt-issue-labels: 'pinned,security,in-progress,blocked'
+          exempt-pr-labels: 'pinned,security,in-progress,blocked,dependencies'
+          exempt-all-milestones: true

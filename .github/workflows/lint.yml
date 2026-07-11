@@ -1,22 +1,29 @@
 name: Lint
+# Ruff check + format — blocheaza PR daca lint esueaza
 
 on:
   push:
-    branches: [main]
+    branches: [main, "fix/**", "feat/**", "hotfix/**"]
   pull_request:
     branches: [main]
 
 jobs:
   ruff:
-    name: Ruff linter
+    name: Ruff lint + format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
+
       - name: Install ruff
-        run: pip install ruff
-      - name: Run ruff check
-        run: ruff check . --select E,F,W --ignore E501,F401 --exclude tests/
+        run: pip install "ruff>=0.4.8"
+
+      - name: Ruff check (errors + warnings)
+        run: ruff check . --output-format=github
+
+      - name: Ruff format check
+        run: ruff format --check . --diff
