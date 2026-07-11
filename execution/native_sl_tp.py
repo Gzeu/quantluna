@@ -9,20 +9,38 @@ Two strategies (tried in order):
      Works for linear perpetuals on Bybit V5.
   2. Fallback: two separate STOP_MARKET orders via order_router.create_order().
 
+position_idx (Bybit hedge mode)::
+    0  =  one-way mode (default, backwards compatible)
+    1  =  hedge mode LONG leg  (positionIdx=1)
+    2  =  hedge mode SHORT leg (positionIdx=2)
+
 Usage::
     from execution.native_sl_tp import place_sl_tp, calc_sl_price, calc_tp_price
 
     sl_price = calc_sl_price(entry=67000.0, side="long", sl_pct=0.02)  # 2%
     tp_price = calc_tp_price(entry=67000.0, side="long", tp_pct=0.04)  # 4%
 
+    # One-way mode (default)
     success = await place_sl_tp(
         order_router=order_router,
         symbol="BTCUSDT",
-        side="long",          # "long" or "short"
+        side="long",
         qty=0.001,
         sl_price=sl_price,
         tp_price=tp_price,
         category="linear",
+    )
+
+    # Hedge mode — EGLD LONG leg
+    success = await place_sl_tp(
+        order_router=order_router,
+        symbol="EGLDUSDT",
+        side="long",
+        qty=10.0,
+        sl_price=sl_price,
+        tp_price=tp_price,
+        category="linear",
+        position_idx=1,       # <- hedge mode LONG
     )
 
 Returns True if at least SL was placed, False if both strategies failed.
@@ -76,27 +94,44 @@ async def place_sl_tp(
     sl_price: float,
     tp_price: float,
     category: str = "linear",
+    position_idx: int = 0,
 ) -> bool:
     """
     Place native SL + TP on Bybit. Returns True if at least SL was placed.
 
     Tries strategy 1 (combined) first, then fallback (separate orders).
+
+    Parameters
+    ----------
+    position_idx : int
+        0 = one-way mode (default, backwards compatible)
+        1 = hedge mode LONG leg
+        2 = hedge mode SHORT leg
     """
     if sl_price <= 0 and tp_price <= 0:
-        logger.warning("native_sl_tp: ambele SL(%s) si TP(%s) <= 0 — skip", sl_price, tp_price)
+        logger.warning(
+            "native_sl_tp: ambele SL(%s) si TP(%s) <= 0 — skip",
+            sl_price, tp_price,
+        )
         return False
 
     # Strategy 1: Combined order via order_router raw API call
     try:
-        success = await _place_combined(order_router, symbol, side, qty, sl_price, tp_price, category)
+        success = await _place_combined(
+            order_router, symbol, side, qty,
+            sl_price, tp_price, category, position_idx,
+        )
         if success:
             logger.info(
-                "native_sl_tp: ✅ SL/TP nativ plasat (combined) | %s %s SL=%.4f TP=%.4f",
-                symbol, side, sl_price, tp_price,
+                "native_sl_tp: ✅ SL/TP nativ plasat (combined) | "
+                "%s %s SL=%.4f TP=%.4f posIdx=%d",
+                symbol, side, sl_price, tp_price, position_idx,
             )
             return True
     except Exception as exc:
-        logger.warning("native_sl_tp: strategy 1 (combined) failed (%s) — fallback", exc)
+        logger.warning(
+            "native_sl_tp: strategy 1 (combined) failed (%s) — fallback", exc
+        )
 
     # Strategy 2: Fallback separate STOP_MARKET orders
     sl_ok = False
@@ -107,6 +142,7 @@ async def place_sl_tp(
             sl_ok = await _place_stop_order(
                 order_router, symbol, side, qty, sl_price,
                 order_label="SL", category=category,
+                position_idx=position_idx,
             )
         except Exception as exc:
             logger.error("native_sl_tp: SL fallback failed: %s", exc)
@@ -117,19 +153,20 @@ async def place_sl_tp(
                 order_router, symbol, side, qty, tp_price,
                 order_label="TP", category=category,
                 is_tp=True,
+                position_idx=position_idx,
             )
         except Exception as exc:
             logger.error("native_sl_tp: TP fallback failed: %s", exc)
 
     if sl_ok or tp_ok:
         logger.info(
-            "native_sl_tp: ✅ SL/TP fallback | %s %s SL_ok=%s TP_ok=%s",
-            symbol, side, sl_ok, tp_ok,
+            "native_sl_tp: ✅ SL/TP fallback | %s %s SL_ok=%s TP_ok=%s posIdx=%d",
+            symbol, side, sl_ok, tp_ok, position_idx,
         )
     else:
         logger.error(
-            "native_sl_tp: ❌ Ambele strategii esuate | %s %s SL=%.4f TP=%.4f",
-            symbol, side, sl_price, tp_price,
+            "native_sl_tp: ❌ Ambele strategii esuate | %s %s SL=%.4f TP=%.4f posIdx=%d",
+            symbol, side, sl_price, tp_price, position_idx,
         )
 
     return sl_ok or tp_ok
@@ -143,19 +180,21 @@ async def _place_combined(
     sl_price: float,
     tp_price: float,
     category: str,
+    position_idx: int = 0,
 ) -> bool:
     """
     Use Bybit V5 /v5/order/create with stopLoss + takeProfit fields.
     order_router must expose a raw_post(path, params) method, OR
     we fall back to using set_trading_stop via HTTP.
     """
-    # Prefer raw_post if available (BybitOrderRouter exposes it)
+    # Prefer set_sl_tp if available (BybitOrderRouter exposes it)
     if hasattr(order_router, "set_sl_tp"):
         return await order_router.set_sl_tp(
             symbol=symbol,
             sl_price=str(sl_price) if sl_price > 0 else "",
             tp_price=str(tp_price) if tp_price > 0 else "",
             category=category,
+            position_idx=position_idx,
         )
 
     if hasattr(order_router, "raw_post"):
@@ -167,6 +206,7 @@ async def _place_combined(
             "orderType": "Market",
             "qty": str(qty),
             "reduceOnly": True,
+            "positionIdx": position_idx,
         }
         if sl_price > 0:
             params["stopLoss"] = str(sl_price)
@@ -185,9 +225,12 @@ async def _place_combined(
             sl=sl_price,
             tp=tp_price,
             category=category,
+            position_idx=position_idx,
         )
 
-    raise NotImplementedError("order_router nu are set_sl_tp / raw_post / set_trading_stop")
+    raise NotImplementedError(
+        "order_router nu are set_sl_tp / raw_post / set_trading_stop"
+    )
 
 
 async def _place_stop_order(
@@ -199,6 +242,7 @@ async def _place_stop_order(
     order_label: str,
     category: str,
     is_tp: bool = False,
+    position_idx: int = 0,
 ) -> bool:
     """Place a single STOP_MARKET reduce-only order (SL or TP)."""
     try:
@@ -207,7 +251,11 @@ async def _place_stop_order(
         req = OrderRequest(
             symbol=symbol,
             side=close_side,
-            order_type=OrderType.STOP_MARKET if hasattr(OrderType, "STOP_MARKET") else OrderType.MARKET,
+            order_type=(
+                OrderType.STOP_MARKET
+                if hasattr(OrderType, "STOP_MARKET")
+                else OrderType.MARKET
+            ),
             qty=qty,
             price=trigger_price,
             reduce_only=True,
@@ -217,17 +265,18 @@ async def _place_stop_order(
                 "orderFilter": "StopOrder",
                 "tpslMode": "Full",
                 "label": order_label,
+                "positionIdx": position_idx,
             },
         )
-        result = await order_router.create_order(req)
+        await order_router.create_order(req)
         logger.info(
-            "native_sl_tp: %s ordin plasat | %s trigger=%.4f",
-            order_label, symbol, trigger_price,
+            "native_sl_tp: %s ordin plasat | %s trigger=%.4f posIdx=%d",
+            order_label, symbol, trigger_price, position_idx,
         )
         return True
     except Exception as exc:
         logger.error(
-            "native_sl_tp: %s ordin esuat | %s trigger=%.4f | %s",
-            order_label, symbol, trigger_price, exc,
+            "native_sl_tp: %s ordin esuat | %s trigger=%.4f posIdx=%d | %s",
+            order_label, symbol, trigger_price, position_idx, exc,
         )
         return False
