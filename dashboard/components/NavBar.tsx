@@ -1,16 +1,8 @@
 /**
- * dashboard/components/NavBar.tsx  -  QuantLuna Navigation Bar v1.0
- * Sprint S43 (2026-07-12)
- *
- * Navbar orizontal top cu:
- *   - Logo QuantLuna cu dot verde (live)
- *   - Link-uri: Dashboard | Portfolio | Services | Optimizer
- *   - Badge running count pe Services (ex: "⚙ Services 7/9")
- *   - Badge optimizer status pe Optimizer (● running / ● idle)
- *   - Indicator pagina activa (border-bottom colorat)
- *   - Polling fiecare 3s pentru status badges
+ * dashboard/components/NavBar.tsx  -  QuantLuna Navigation Bar v1.1
+ * Sprint S45 (2026-07-12): adauga link Watchdog cu badge alerte recente
  */
-
+'use client'
 import React, { useEffect, useState } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/router';
@@ -18,33 +10,47 @@ import { useRouter } from 'next/router';
 const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
 
 interface NavBadge {
-  servicesRunning: number;
-  servicesTotal: number;
-  optimizerRunning: boolean;
-  optimizerAutoActive: boolean;
+  servicesRunning:      number;
+  servicesTotal:        number;
+  optimizerRunning:     boolean;
+  optimizerAutoActive:  boolean;
+  watchdogActive:       boolean;
+  watchdogAlertsRecent: number;   // alerte in ultimele 5min
 }
 
 export default function NavBar() {
   const router = useRouter();
   const [badge, setBadge] = useState<NavBadge>({
-    servicesRunning: 0,
-    servicesTotal: 0,
-    optimizerRunning: false,
-    optimizerAutoActive: false,
+    servicesRunning: 0, servicesTotal: 0,
+    optimizerRunning: false, optimizerAutoActive: false,
+    watchdogActive: false, watchdogAlertsRecent: 0,
   });
 
   useEffect(() => {
     async function fetchBadges() {
       try {
-        const [svc, opt] = await Promise.all([
+        const [svc, opt, wd] = await Promise.all([
           fetch(`${API}/api/services/list`).then(r => r.json()).catch(() => null),
           fetch(`${API}/api/optimizer/status`).then(r => r.json()).catch(() => null),
+          fetch(`${API}/api/watchdog/status`).then(r => r.json()).catch(() => null),
         ]);
+
+        // Alerte recente (ultimele 5min)
+        let alertsRecent = 0;
+        if (wd?.recent_alerts) {
+          const now = Date.now();
+          alertsRecent = (wd.recent_alerts as any[]).filter(a => {
+            return now - new Date(a.timestamp).getTime() < 5 * 60 * 1000;
+          }).length;
+        }
+
         setBadge({
-          servicesRunning: svc?.running ?? 0,
-          servicesTotal: svc?.total ?? 0,
-          optimizerRunning: opt?.running ?? false,
-          optimizerAutoActive: opt?.auto_reoptimizer_active ?? false,
+          servicesRunning:      svc?.running  ?? 0,
+          servicesTotal:        svc?.total    ?? 0,
+          optimizerRunning:     opt?.running  ?? false,
+          optimizerAutoActive:  opt?.auto_reoptimizer_active ?? false,
+          watchdogActive:       wd?.running   ?? false,
+          watchdogAlertsRecent: alertsRecent,
         });
       } catch {}
     }
@@ -56,9 +62,7 @@ export default function NavBar() {
   const current = router.pathname;
 
   const links: Array<{
-    href: string;
-    label: string;
-    badge?: React.ReactNode;
+    href: string; label: string; badge?: React.ReactNode;
   }> = [
     { href: '/', label: '📈 Dashboard' },
     { href: '/portfolio', label: '💼 Portfolio' },
@@ -67,12 +71,9 @@ export default function NavBar() {
       label: '⚙ Services',
       badge: badge.servicesTotal > 0 ? (
         <span style={{
-          fontSize: 10, fontWeight: 700,
+          fontSize: 10, fontWeight: 700, marginLeft: 4,
           color: badge.servicesRunning > 0 ? '#4ade80' : '#666',
-          marginLeft: 4,
-        }}>
-          {badge.servicesRunning}/{badge.servicesTotal}
-        </span>
+        }}>{badge.servicesRunning}/{badge.servicesTotal}</span>
       ) : undefined,
     },
     {
@@ -81,13 +82,31 @@ export default function NavBar() {
       badge: (
         <span style={{
           fontSize: 9, marginLeft: 5,
-          color: badge.optimizerRunning ? '#4ade80'
+          color: badge.optimizerRunning    ? '#4ade80'
                : badge.optimizerAutoActive ? '#8b5cf6'
                : '#555',
         }}>
-          {badge.optimizerRunning ? '● run'
+          {badge.optimizerRunning    ? '● run'
            : badge.optimizerAutoActive ? '● auto'
            : '○'}
+        </span>
+      ),
+    },
+    {
+      href: '/watchdog',
+      label: '👁 Watchdog',
+      badge: (
+        <span style={{
+          fontSize: 9, marginLeft: 5,
+          color: badge.watchdogAlertsRecent > 0 ? '#f87171'
+               : badge.watchdogActive           ? '#4ade80'
+               : '#555',
+          fontWeight: badge.watchdogAlertsRecent > 0 ? 700 : 400,
+        }}>
+          {badge.watchdogAlertsRecent > 0
+            ? `🚨 ${badge.watchdogAlertsRecent}`
+            : badge.watchdogActive ? '●'
+            : '○'}
         </span>
       ),
     },
@@ -126,7 +145,7 @@ export default function NavBar() {
         }} />
       </div>
 
-      {/* Nav links */}
+      {/* Links */}
       <div style={{ display: 'flex', gap: 2, flex: 1 }}>
         {links.map(({ href, label, badge }) => {
           const isActive = current === href
@@ -141,9 +160,7 @@ export default function NavBar() {
                 textDecoration: 'none',
                 fontSize: 13, fontWeight: isActive ? 700 : 400,
                 color: isActive ? '#e0e0ff' : '#666',
-                borderBottom: isActive
-                  ? '2px solid #8b5cf6'
-                  : '2px solid transparent',
+                borderBottom: isActive ? '2px solid #8b5cf6' : '2px solid transparent',
                 transition: 'color 0.15s, border-color 0.15s',
               }}
               onMouseEnter={e => {
@@ -154,14 +171,11 @@ export default function NavBar() {
                 if (!isActive)
                   (e.currentTarget as HTMLAnchorElement).style.color = '#666';
               }}
-            >
-              {label}{badge}
-            </Link>
+            >{label}{badge}</Link>
           );
         })}
       </div>
 
-      {/* Right: timestamp live */}
       <LiveClock />
     </nav>
   );
