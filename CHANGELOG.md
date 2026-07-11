@@ -6,26 +6,66 @@ Format: [Semantic Versioning](https://semver.org/) — `MAJOR.MINOR.PATCH`
 
 ---
 
-## [Unreleased]
+## [1.0.0-rc] — 2026-07-11
 
-### Added
-- `Makefile` — comenzi dev unificte: `make test`, `make lint`, `make paper`, `make docker-build` etc.
-- `CHANGELOG.md` — fisier change log
-- `.env.example` — template complet cu toate variabilele documentate
-- `.pre-commit-config.yaml` — hooks: trailing-whitespace, ruff, mypy, detect-private-key, no-commit-to-main
-- `.dockerignore` — exclude data/, state/, logs/, .env, __pycache__ din build context
-- CI: Python 3.10 adaugat in matrix (era declarat in pyproject.toml dar nu testat)
-- CI: Codecov upload cu `codecov-action@v4`
-- CI: Job `typecheck` cu mypy pe `core/`, `risk/`, `execution/`, `strategy/`
-- CI: Job `lint` cu ruff check + ruff format --check
-- `Dockerfile`: HEALTHCHECK, `/app/state` directory, `APP_VERSION` build-arg, OCI labels, non-root user
-- `docker-compose.yml`: healthchecks pe toate serviciile, `state/` volume, `stop_grace_period: 30s` pentru live, `x-common` YAML anchor, serviciu `backtest`, `DASHBOARD_PORT` env configurabil
-- `requirements.txt`: `loguru`, `mypy`, `ruff`, `types-requests`, `coverage[toml]` adaugate explicit
-- `README.md`: badges CI/codecov/ruff/version, Quick Start section, Docker section, Contributing section, roadmap extins S20/S21
+### Fixed — `bybit_live_runner.py` v3.3 · Sprint S20 review fixes
 
-### Fixed
-- `README.md`: comenzile CLI actualizate sa foloseasca noul format `main.py paper/live/backtest` (vechile `--mode` flags)
-- `README.md`: structura proiectului actualizata cu toate modulele din `risk/` (auto_rebalancer, bybit_position_sizer, correlation_filter, correlation_matrix etc.)
+> Toate fix-urile de mai jos sunt prezente în fișierul
+> `execution/bybit_live_runner.py`, clasa `BybitLiveRunner`.
+
+- **FIX-1 [CRITIC]** `CircuitBreaker` — apeluri statice înlocuite cu apeluri pe instanță.
+  `record_failure()` / `record_success()` / `.state` apelate pe obiectul `circuit_breaker`
+  pasat explicit în `_execute_action()`. Nu mai există risc de state global.
+
+- **FIX-2 [CRITIC]** Dual-leg partial fill — helper `_send_legs()` cu `try/except` per leg.
+  Dacă `leg_x` eșuează după ce `leg_y` a reușit: se trimite emergency market-close pe `leg_y`
+  (best-effort), se apelează `circuit_breaker.record_failure()` și se trimite alertă `critical`
+  prin `NotifierBus`.
+
+- **FIX-3 [CRITIC]** `FundingMonitor` singleton — nu mai este recreat la fiecare bar.
+  `self._funding_monitor` inițializat o singură dată în `_build_components()` și reutilizat în
+  `_check_funding_gate()`. Gate returnează `True` (deschis) dacă monitorul nu a putut fi inițializat.
+
+- **FIX-4 [IMPORTANT]** `is_warmed_up` fallback `False` — anterior `True` pornea trading
+  fără warm-up la orice refactor al `SpreadMonitor`.
+  `getattr(spread_monitor, 'is_warmed_up', False)` în `_run_loop()`.
+
+- **FIX-5 [IMPORTANT]** `price_x == 0` guard — bar malformat la restart WS cauzau
+  `ZeroDivisionError` la calculul `x_qty = base_qty * price_y / price_x`.
+  Guard prezent în `_run_loop()` (bar ignorat cu `continue`) și în `_execute_action()` (return
+  imediat cu log `error`).
+
+- **FIX-6 [IMPORTANT]** Import watchdog corectat: `execution.watchdog` → `execution.ws_watchdog`.
+  Fișierul real este `ws_watchdog.py`.
+
+- **FIX-7 [MINOR]** `BybitLiveRunnerConfig` — toate câmpurile folosesc
+  `field(default_factory=lambda: os.getenv(...))` în loc de `os.getenv()` evaluat la import-time.
+  Garantează citirea corectă a variabilelor de mediu la fiecare instanțiere.
+
+### Added — Sprint 20 · Infrastructură
+
+- `tests/test_sprint20.py` — 22 teste de regresie FIX-1..5:
+  `TestCircuitBreakerFix1` (9 teste), `TestDualLegPartialFillFix2` (3),
+  `TestFundingMonitorSingletonFix3` (5), `TestIsWarmedUpFallbackFix4` (3),
+  `TestPriceXZeroGuardFix5` (4).
+
+- `.github/workflows/ci.yml` — `mypy || true` înlocuit cu threshold 20 erori activ.
+  Script bash extrage `ERROR_COUNT` din `--error-summary` și blochează CI dacă depășește pragul.
+  Plan reducere: `v1.1.0 → 10 | v1.2.0 → 5 | v2.0.0 → strict`.
+
+- `mypy.ini` — configurație mypy cu `ignore_missing_imports = True` global +
+  suprimări explicite pentru: pybit, ccxt, aiohttp, loguru, statsmodels, scipy,
+  sklearn, ta, redis, prometheus_client.
+
+- `docs/ORPHAN_AUDIT.md` — audit fișiere orfane `execution/` cu decizie per fișier
+  (`ACTIVE_SECONDARY` / `LEGACY` / `CANDIDATE_DELETE`) și plan de execuție v1.1.0.
+
+- CI: Smoke test v3.3 în job `docker` — validează FIX-1 (instanțe independente),
+  FIX-3 (singleton pattern), FIX-4 (`getattr` fallback), FIX-5 (`inspect.getsource` guard).
+
+- `deploy.yml` — health check post-deploy cu rollback automat la tag anterior confirmat prezent.
+
+- `state_bus.py` root — `DeprecationWarning(stacklevel=2)` confirmat prezent din Sprint 13.
 
 ---
 
@@ -43,6 +83,28 @@ Format: [Semantic Versioning](https://semver.org/) — `MAJOR.MINOR.PATCH`
 - Gap #1: `MarketContext.coint_pvalue` primea `bool` (din `coint_valid`) în loc de `float` — corectat în `auto_selector.py`.
 - Gap #2: `kalman_scoring_weights` din `BacktestConfig` acum construit și transmis corect la `KalmanPairsTrading` prin optimizer.
 - Gap #3: `generate_batch()` în `KalmanPairsTrading` nu accepta `coint_pvalue_series` — parametru adăugat, valorile propagate în coloana `coint_pvalue`.
+
+---
+
+## [Unreleased → integrat în 1.0.0-rc]
+
+### Added
+- `Makefile` — comenzi dev unificate: `make test`, `make lint`, `make paper`, `make docker-build` etc.
+- `.env.example` — template complet cu toate variabilele documentate
+- `.pre-commit-config.yaml` — hooks: trailing-whitespace, ruff, mypy, detect-private-key, no-commit-to-main
+- `.dockerignore` — exclude data/, state/, logs/, .env, __pycache__ din build context
+- CI: Python 3.10 adăugat în matrix (era declarat în pyproject.toml dar nu testat)
+- CI: Codecov upload cu `codecov-action@v4`
+- CI: Job `typecheck` cu mypy pe `core/`, `risk/`, `execution/`, `strategy/`
+- CI: Job `lint` cu ruff check + ruff format --check
+- `Dockerfile`: HEALTHCHECK, `/app/state` directory, `APP_VERSION` build-arg, OCI labels, non-root user
+- `docker-compose.yml`: healthchecks pe toate serviciile, `state/` volume, `stop_grace_period: 30s` pentru live, `x-common` YAML anchor, serviciu `backtest`, `DASHBOARD_PORT` env configurabil
+- `requirements.txt`: `loguru`, `mypy`, `ruff`, `types-requests`, `coverage[toml]` adăugate explicit
+- `README.md`: badges CI/codecov/ruff/version, Quick Start section, Docker section, Contributing section, roadmap extins S20/S21
+
+### Fixed
+- `README.md`: comenzile CLI actualizate să folosească noul format `main.py paper/live/backtest` (vechile `--mode` flags)
+- `README.md`: structura proiectului actualizată cu toate modulele din `risk/` (auto_rebalancer, bybit_position_sizer, correlation_filter, correlation_matrix etc.)
 
 ---
 
