@@ -1,5 +1,12 @@
 """
-execution/workflow_orchestrator.py  -  QuantLuna Startup Workflow Orchestrator v3.2
+execution/workflow_orchestrator.py  -  QuantLuna Startup Workflow Orchestrator v3.3
+
+Sprint S29 v3.3 (2026-07-12):
+  FIX-O3 [CRITIC]  _build_runner() si start_runner() apeleaza automat
+                   mark_orchestrator_active() din bybit_live_runner.
+                   Acopera ambele cazuri: runner intern + runner injectat extern.
+                   Standalone-guard din FIX-C1 (bybit_live_runner v3.9) nu
+                   mai triggereaza fals cand orchestratorul e activ.
 
 Sprint S29 v3.9 (2026-07-12):
   FEAT-C1 [CRITIC]  FAZA 3.5 NOU: StrategyClassifier dupa boot scan
@@ -105,7 +112,7 @@ class StartupContext:
 
 class WorkflowOrchestrator:
     """
-    Orchestrator complet Sprint S29 -> v3.2.
+    Orchestrator complet Sprint S29 -> v3.3.
 
     Preferred constructor: ``WorkflowOrchestrator.from_runner_cfg(cfg, bus)``
     """
@@ -386,6 +393,11 @@ class WorkflowOrchestrator:
             return
 
         logger.info("[Orchestrator] FAZA 5: Pornire BybitLiveRunner + HedgeManagers")
+
+        # FIX-O3 v3.3: Seteaza flag-ul INAINTE de a construi/folosi runner-ul,
+        # indiferent daca e intern sau injectat extern.
+        # Astfel _reconcile_positions() din runner nu mai triggereaza standalone-guard.
+        _mark_runner_orchestrated()
 
         runner = self._runner
         if runner is None:
@@ -684,7 +696,9 @@ class WorkflowOrchestrator:
 
     def _build_runner(self):
         """
-        FIX-O1: Instanta BybitLiveRunner v3.6+ cu parametrii corecti.
+        FIX-O1: Instanta BybitLiveRunner v3.9 cu parametrii corecti.
+        FIX-O3: mark_orchestrator_active() apelat in start_runner() INAINTE
+                de a apela aceasta metoda.
         """
         from execution.bybit_live_runner import BybitLiveRunner
         return BybitLiveRunner(
@@ -731,3 +745,27 @@ class WorkflowOrchestrator:
             await es.trigger(reason=reason)
         except Exception as exc:
             logger.error("[Orchestrator] EmergencyStop failed: {}", exc)
+
+
+# ---------------------------------------------------------------------------
+# FIX-O3 v3.3: helper care seteaza flag-ul global din bybit_live_runner.
+# Apelat din start_runner() inainte de a porni orice task.
+# Separat de _build_runner() ca sa acopere si cazul runner-ului injectat extern.
+# ---------------------------------------------------------------------------
+
+def _mark_runner_orchestrated() -> None:
+    """
+    Seteaza _ORCHESTRATOR_ACTIVE=True in bybit_live_runner.
+    Silent daca modulul nu e importat inca (va fi setat la primul import).
+    """
+    try:
+        from execution.bybit_live_runner import mark_orchestrator_active
+        mark_orchestrator_active()
+        logger.debug(
+            "[Orchestrator] FIX-O3: mark_orchestrator_active() OK — "
+            "standalone-guard dezactivat in runner"
+        )
+    except Exception as exc:
+        logger.warning(
+            "[Orchestrator] FIX-O3: mark_orchestrator_active() failed: %s", exc
+        )
