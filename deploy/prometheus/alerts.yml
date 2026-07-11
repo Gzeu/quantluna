@@ -1,0 +1,102 @@
+# deploy/prometheus/alerts.yml — QuantLuna Prometheus Alerting Rules
+# Sprint S20 — 2026-07-11
+#
+# Folosire în prometheus.yml:
+#   rule_files:
+#     - /etc/prometheus/alerts.yml
+
+groups:
+  - name: quantluna_trading
+    interval: 30s
+    rules:
+
+      # ── Circuit Breaker deschis ─────────────────────────────────────────
+      - alert: CircuitBreakerOpen
+        expr: quantluna_circuit_breaker_open == 1
+        for: 0m
+        labels:
+          severity: critical
+          team: trading
+        annotations:
+          summary: "QuantLuna Circuit Breaker OPEN"
+          description: |
+            Circuit breaker-ul s-a deschis imediat.
+            Tranzacționarea este suspendată până la expirarea cooldown-ului.
+            Verifică drawdown și numărul de pierderi consecutive.
+
+      # ── Drawdown mare ───────────────────────────────────────────────────
+      - alert: HighDrawdown
+        expr: quantluna_drawdown_pct > 8
+        for: 5m
+        labels:
+          severity: warning
+          team: trading
+        annotations:
+          summary: "Drawdown > 8% pentru 5 minute"
+          description: "Drawdown curent: {{ $value | humanize }}%"
+
+      - alert: CriticalDrawdown
+        expr: quantluna_drawdown_pct > 12
+        for: 1m
+        labels:
+          severity: critical
+          team: trading
+        annotations:
+          summary: "Drawdown CRITIC > 12%"
+          description: "Drawdown curent: {{ $value | humanize }}% — consideră oprirea manuală."
+
+      # ── Warm-up blocat ──────────────────────────────────────────────────
+      - alert: WarmupStalled
+        expr: rate(quantluna_warmup_bars_done[5m]) == 0
+        for: 10m
+        labels:
+          severity: warning
+          team: trading
+        annotations:
+          summary: "Warm-up blocat — nicio bară în 10 minute"
+          description: |
+            Warm-up-ul nu primește bare noi de 10 minute.
+            Posibilă problemă cu WS feed sau exchange-ul este oprit.
+
+      # ── Z-score extrem (potențial trend, nu mean-reversion) ─────────────
+      - alert: ExtremeZScore
+        expr: quantluna_spread_zscore > 4 or quantluna_spread_zscore < -4
+        for: 15m
+        labels:
+          severity: warning
+          team: trading
+        annotations:
+          summary: "Z-score extrem (|z| > 4) pentru 15 minute"
+          description: "Z-score curent: {{ $value | humanize }} — posibilă breakare a cointegration."
+
+      # ── Niciun client WS conectat ────────────────────────────────────────
+      - alert: DashboardOffline
+        expr: quantluna_websocket_clients == 0
+        for: 30m
+        labels:
+          severity: info
+          team: ops
+        annotations:
+          summary: "Niciun client WS conectat la dashboard de 30 minute"
+
+      # ── PnL negativ semnificativ ─────────────────────────────────────────
+      - alert: NegativePnL
+        expr: quantluna_pnl_usdt < -100
+        for: 5m
+        labels:
+          severity: warning
+          team: trading
+        annotations:
+          summary: "PnL negativ > -100 USDT"
+          description: "PnL curent: {{ $value | humanize }} USDT"
+
+      # ── Vol regime HIGH persistent ────────────────────────────────────────
+      - alert: HighVolRegimePersistent
+        expr: quantluna_vol_regime_high == 1
+        for: 2h
+        labels:
+          severity: info
+          team: trading
+        annotations:
+          summary: "Regim de volatilitate HIGH de 2+ ore"
+          description: "Consideră reducerea position size sau dezactivarea entry-urilor."
