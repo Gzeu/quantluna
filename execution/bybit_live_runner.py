@@ -1,11 +1,20 @@
 """
-execution/bybit_live_runner.py — QuantLuna Bybit Live Runner v3.8
+execution/bybit_live_runner.py — QuantLuna Bybit Live Runner v3.9
 Sprint S20 — review fixes 2026-07-11
 Sprint S21 — position reconciliation + full automation 2026-07-11
 Sprint S21 review-fix — 6 issues rezolvate 2026-07-11
 Sprint S28 v3.6 — wiring fix: parametri optionali din WorkflowOrchestrator
 Sprint S28 v3.7 — 3 fixuri critice de siguranta
 Sprint S28 v3.8 — Boot Scan complet: balanta + toate pozitiile + Telegram
+Sprint S29 v3.9 — bump versiune; standalone guard pentru pozitii SOLO
+
+Changelog v3.9 (standalone-guard):
+  FIX-C1 [CRITIC]  _reconcile_positions() emite WARNING explicit daca runner-ul
+                   e pornit standalone (fara WorkflowOrchestrator) si exista
+                   pozitii SOLO in cont (ex: EGLD hedge).
+                   SingleHedgeManager NU e pornit din runner — gestionat de
+                   WorkflowOrchestrator (FAZA 3.5). Telegram primeste alerta.
+  FIX-C2 [CRITIC]  Bump versiune v3.8 → v3.9 in Telegram + log + docstring.
 
 Changelog v3.8 (boot-scan):
   FEAT-B1 [CRITIC]  _reconcile_positions() foloseste boot_scan() complet
@@ -98,6 +107,20 @@ try:
     _HAS_METRICS = True
 except Exception:
     _HAS_METRICS = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sentinel: runner pornit standalone (fara WorkflowOrchestrator)
+# Setat din exterior de orchestrator inainte de a injecta runner-ul.
+# ─────────────────────────────────────────────────────────────────────────────
+_ORCHESTRATOR_ACTIVE = False
+
+
+def mark_orchestrator_active() -> None:
+    """Apelat de WorkflowOrchestrator inainte de start_runner() pentru a
+    semnala ca FAZA 3.5 (SingleHedgeManager) e gestionata extern."""
+    global _ORCHESTRATOR_ACTIVE
+    _ORCHESTRATOR_ACTIVE = True
 
 
 # =============================================================================
@@ -198,12 +221,19 @@ class RunnerContext:
 
 
 # =============================================================================
-# BybitLiveRunner v3.8
+# BybitLiveRunner v3.9
 # =============================================================================
 
 class BybitLiveRunner:
     """
-    Main live trading loop v3.8.
+    Main live trading loop v3.9.
+
+    FIX-C1: Standalone guard — daca runner-ul e pornit fara WorkflowOrchestrator
+             si exista pozitii SOLO (ex: EGLD hedge mode), emite WARNING si
+             alerta Telegram. SingleHedgeManager nu e pornit din runner;
+             el e responsabilitatea WorkflowOrchestrator (FAZA 3.5).
+
+    FIX-C2: Bump versiune v3.8 → v3.9 in Telegram si log.
 
     FEAT-B1..B4: Boot Scan complet la pornire:
       - scan_wallet_balance() — balanta USDT (equity, available, uPnL)
@@ -221,6 +251,7 @@ class BybitLiveRunner:
     Startup sequence:
       Phase 0   — REST warm-up (bare istorice)
       Phase 0.5 — Boot Scan: balanta + toate pozitiile + adoptie y/x + Telegram
+                  + FIX-C1: standalone guard pentru pozitii SOLO
       Phase 1   — Build exchange clients
       Phase 2   — Build shared components
       Phase 3   — Start health server
@@ -416,7 +447,8 @@ class BybitLiveRunner:
             return 0
 
     # -------------------------------------------------------------------------
-    # Phase 0.5: Boot Scan v3.8 — balanta + toate pozitiile + adoptie + Telegram
+    # Phase 0.5: Boot Scan v3.9 — balanta + toate pozitiile + adoptie + Telegram
+    #            + FIX-C1: standalone guard pentru pozitii SOLO
     # -------------------------------------------------------------------------
 
     async def _reconcile_positions(
@@ -426,12 +458,18 @@ class BybitLiveRunner:
         notifier_bus: Optional[NotifierBus] = None,
     ) -> None:
         """
-        Phase 0.5 v3.8 — Boot Scan complet:
+        Phase 0.5 v3.9 — Boot Scan complet:
           1. Citeste balanta USDT (equity, available, uPnL total)
           2. Scaneaza TOATE pozitiile deschise din cont (nu doar symbol_y/x)
           3. Trimite BootScanResult.to_telegram_msg() la Telegram
           4. Identifica si adopta pozitia y/x in OrderManager
              Prioritate: REST Bybit > checkpoint local
+
+          FIX-C1 v3.9:
+          5. Daca runner e STANDALONE (fara WorkflowOrchestrator) si exista
+             pozitii SOLO in cont (ex: EGLD hedge mode), emite WARNING si
+             alerta Telegram. SingleHedgeManager NU este pornit din runner —
+             este responsabilitatea WorkflowOrchestrator (FAZA 3.5).
 
         In dry_run sau daca position_reconcile_enabled=false, se sare complet.
         Nu ridica exceptii — orice eroare e logata si runner continua.
@@ -440,7 +478,7 @@ class BybitLiveRunner:
             logger.info("BybitLiveRunner: Position reconciliation dezactivata (dry_run=%s)", self.cfg.dry_run)
             return
 
-        logger.info("BybitLiveRunner: \U0001f50d Phase 0.5 — Boot Scan (v3.8)...")
+        logger.info("BybitLiveRunner: \U0001f50d Phase 0.5 — Boot Scan (v3.9)...")
 
         # Citeste checkpoint local inainte de REST (va fi folosit ca fallback)
         checkpoint_adopted = self._checkpoint.load()
@@ -469,6 +507,36 @@ class BybitLiveRunner:
                 )
             except Exception as exc:
                 logger.debug("BybitLiveRunner: Telegram boot scan msg failed: %s", exc)
+
+        # ── FIX-C1 v3.9: Standalone guard ────────────────────────────────────
+        # Daca runner e pornit fara WorkflowOrchestrator si exista pozitii SOLO
+        # (simboluri in afara perechii y/x), emite WARNING si alerta Telegram.
+        # SingleHedgeManager NU e pornit din runner — responsabilitate orch.
+        if not _ORCHESTRATOR_ACTIVE and boot_result.positions:
+            pairs_symbols = {self.cfg.symbol_y, self.cfg.symbol_x}
+            solo_positions = [
+                p for p in boot_result.positions
+                if p.symbol not in pairs_symbols
+            ]
+            if solo_positions:
+                solo_symbols = [p.symbol for p in solo_positions]
+                warn_msg = (
+                    f"\u26a0\ufe0f STANDALONE MODE: Runner pornit fara WorkflowOrchestrator.\n"
+                    f"Pozitii SOLO detectate care NU sunt gestionate: "
+                    f"{', '.join(solo_symbols)}\n"
+                    f"SingleHedgeManager (trailing SL/TP) este inactiv.\n"
+                    f"Porneste prin WorkflowOrchestrator pentru gestionare completa."
+                )
+                logger.warning(
+                    "BybitLiveRunner: STANDALONE MODE — pozitii SOLO negestionate: %s",
+                    solo_symbols,
+                )
+                if notifier_bus:
+                    try:
+                        await notifier_bus.send_alert(warn_msg, level="critical")
+                    except Exception:
+                        pass
+        # ─────────────────────────────────────────────────────────────────────
 
         # Adoptia pozitiei y/x
         # Prioritate: REST (sursa adevar) > checkpoint local
@@ -1283,7 +1351,7 @@ class BybitLiveRunner:
     # -------------------------------------------------------------------------
 
     async def run(self) -> int:
-        logger.info("BybitLiveRunner: ========== Starting Live Runner v3.8 ==========")
+        logger.info("BybitLiveRunner: ========== Starting Live Runner v3.9 ==========")
         logger.info(
             "BybitLiveRunner: %s/%s | interval=%dm | dry_run=%s",
             self.cfg.symbol_y, self.cfg.symbol_x, self.cfg.interval, self.cfg.dry_run,
@@ -1292,6 +1360,13 @@ class BybitLiveRunner:
             logger.info(
                 "BybitLiveRunner: Native SL/TP activ | SL=%.1f%% TP=%.1f%%",
                 self.cfg.sl_pct * 100, self.cfg.tp_pct * 100,
+            )
+
+        # FIX-C1: log explicit daca runner e pornit standalone
+        if not _ORCHESTRATOR_ACTIVE:
+            logger.warning(
+                "BybitLiveRunner: STANDALONE MODE — WorkflowOrchestrator inactiv. "
+                "Pozitiile SOLO (ex: EGLD hedge) NU vor fi gestionate de SingleHedgeManager."
             )
 
         order_router, built_ws_feed = await self._build_exchange_via_factory()
@@ -1316,8 +1391,7 @@ class BybitLiveRunner:
         # Phase 0: REST warm-up
         await self._warmup_from_rest(spread_monitor)
 
-        # Phase 0.5 v3.8: Boot Scan complet (balanta + pozitii + Telegram)
-        # Trimite to_telegram_msg() INAINTE de mesajul de start al runner-ului
+        # Phase 0.5 v3.9: Boot Scan complet (balanta + pozitii + Telegram + standalone guard)
         await self._reconcile_positions(order_router, order_manager, notifier_bus)
 
         # Mesaj de start runner (dupa boot scan, pentru context cronologic in Telegram)
@@ -1326,9 +1400,13 @@ class BybitLiveRunner:
                 f"\nSL={self.cfg.sl_pct*100:.1f}% TP={self.cfg.tp_pct*100:.1f}%"
                 if self.cfg.native_sl_tp_enabled else ""
             )
+            standalone_warn = (
+                "\n\u26a0\ufe0f STANDALONE MODE — SingleHedgeManager inactiv"
+                if not _ORCHESTRATOR_ACTIVE else ""
+            )
             await notifier_bus.send_alert(
-                f"\u26a1 QuantLuna v3.8 LIVE | {self.cfg.symbol_y}/{self.cfg.symbol_x} | "
-                f"dry_run={self.cfg.dry_run}{sl_tp_msg}",
+                f"\u26a1 QuantLuna v3.9 LIVE | {self.cfg.symbol_y}/{self.cfg.symbol_x} | "
+                f"dry_run={self.cfg.dry_run}{sl_tp_msg}{standalone_warn}",
                 level="info",
             )
 
