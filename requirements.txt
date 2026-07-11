@@ -1,11 +1,12 @@
 # QuantLuna — Python dependencies
-# July 2026 (v0.14.0+)
+# Sprint S45  (v0.30.0+  — July 2026)
 
 # --- Web Framework ---
 fastapi>=0.111.0
 uvicorn[standard]>=0.29.0
 pydantic>=2.7.0
 pydantic-settings>=2.2.0
+sse-starlette>=1.8.0
 
 # --- Async / WebSocket ---
 websockets>=12.0
@@ -44,7 +45,6 @@ python-dotenv>=1.0.0
 apscheduler>=3.10.4
 
 # --- Logging ---
-# loguru replaces structlog: simpler API, better async support, colours out-of-box
 loguru>=0.7.2
 structlog>=24.1.0
 
