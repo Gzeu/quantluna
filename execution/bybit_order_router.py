@@ -1,7 +1,7 @@
 """
 QuantLuna — BybitOrderRouter
 Sprint 27 + July 2026 improvements
-v3.5-compat: create_order / connect / place_market_order wrappers adaugate
+v3.5-final: OrderRequest / OrderSide / OrderType + create_order/connect/place_market_order wrappers
 
 Execută ordine pe Bybit V5 Unified Account via pybit.
 API identic cu BinanceOrderRouter — plug-and-play prin ExchangeFactory.
@@ -17,12 +17,18 @@ Improvements (July 2026):
   - _instrument_cache extended to store minOrderQty + tickSize
   - cancel_all_orders() helper
 
-v3.5-compat (2026-07-11):
+v3.5-compat (2026-07-11 commit 7f9e681):
   - connect()            — no-op async, necesar pentru order_router.connect() din runner
   - create_order(req)    — dispatcher: accepta OrderRequest din order_manager.py
   - place_market_order() — alias la market_order() cu interfata runner-compatibila
   - place_limit_order()  — alias la limit_order() cu interfata runner-compatibila
   - get_positions()      — alias la get_open_positions() pentru PositionReconciler
+
+v3.5-final (2026-07-11):
+  - OrderSide   — Enum(Buy/Sell) cu aliasuri Long/Short
+  - OrderType   — Enum(Market/Limit)
+  - OrderRequest— dataclass cu: symbol, side, order_type, qty, price, reduce_only, post_only
+    Importat de bybit_live_runner._execute_action()
 
 Features:
   - Market + Limit orders pe Spot / Linear (USDT Perpetual)
@@ -49,6 +55,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -57,6 +64,56 @@ _POLL_INTERVAL = 0.5
 _POLL_TIMEOUT = 10.0
 _MAX_RETRIES = 3
 
+
+# =============================================================================
+# v3.5-final: OrderSide / OrderType / OrderRequest
+# Importate din bybit_live_runner._execute_action()
+# =============================================================================
+
+class OrderSide(str, Enum):
+    """
+    Directia ordinului.
+    Valorile string sunt direct compatibile cu Bybit V5 API ('Buy' / 'Sell').
+    """
+    BUY  = "Buy"
+    SELL = "Sell"
+    # Aliasuri semantice pentru pair-trading (long spread = BUY Y / SELL X)
+    LONG  = "Buy"
+    SHORT = "Sell"
+
+
+class OrderType(str, Enum):
+    """Tipul ordinului. Market sau Limit."""
+    MARKET = "Market"
+    LIMIT  = "Limit"
+
+
+@dataclass
+class OrderRequest:
+    """
+    Cerere de ordin trimisa catre order_router.create_order(req).
+
+    Campuri:
+      symbol      — ex. 'BTCUSDT'
+      side        — OrderSide.BUY / OrderSide.SELL
+      order_type  — OrderType.MARKET / OrderType.LIMIT
+      qty         — cantitate in units ale bazei (ex. 0.001 BTC)
+      price       — pret pentru Limit (0.0 pentru Market)
+      reduce_only — True = inchidere pozitie existenta
+      post_only   — True = maker only (Limit orders)
+    """
+    symbol:      str
+    side:        OrderSide
+    order_type:  OrderType
+    qty:         float
+    price:       float       = 0.0
+    reduce_only: bool        = False
+    post_only:   bool        = False
+
+
+# =============================================================================
+# OrderReceipt
+# =============================================================================
 
 @dataclass
 class OrderReceipt:
@@ -91,6 +148,10 @@ class _InstrumentInfo:
     min_order_qty: float = 0.001
 
 
+# =============================================================================
+# BybitOrderRouter
+# =============================================================================
+
 class BybitOrderRouter:
     """
     Bybit V5 order router cu retry, qty + price rounding, reduce-only support.
@@ -117,8 +178,7 @@ class BybitOrderRouter:
         self._instrument_cache: dict[str, _InstrumentInfo] = {}
 
     # -------------------------------------------------------------------------
-    # v3.5-compat: connect() — apelat din bybit_live_runner.run() inainte de
-    # reconciliere REST. pybit HTTP e sync/stateless, deci e no-op.
+    # v3.5-compat: connect()
     # -------------------------------------------------------------------------
 
     async def connect(self) -> None:
@@ -127,7 +187,6 @@ class BybitOrderRouter:
             f"BybitOrderRouter: connect() — mode={self.mode} "
             f"testnet={self.testnet} category={self.category}"
         )
-        # Pre-warm client so first order has no extra latency
         if self.mode == "live":
             try:
                 _ = self._get_client()
@@ -136,57 +195,46 @@ class BybitOrderRouter:
                 logger.warning(f"BybitOrderRouter: connect() pre-warm failed: {exc}")
 
     # -------------------------------------------------------------------------
-    # v3.5-compat: create_order(req) — interfata unica pentru runner
-    # Accepta un obiect cu atributele: symbol, side, order_type, qty, price
+    # v3.5-compat: create_order(req)
     # -------------------------------------------------------------------------
 
-    async def create_order(self, req: Any) -> OrderReceipt:
+    async def create_order(self, req: "OrderRequest") -> OrderReceipt:
         """
-        Dispatcher universal — accepta OrderRequest din order_manager.py sau
-        orice obiect cu atributele: symbol, side, order_type, qty, price.
-
-        Apelat din bybit_live_runner._execute_action().
+        Dispatcher universal — accepta OrderRequest din bybit_live_runner.
+        Apelat din _execute_action() la fiecare trade.
         """
-        symbol     = getattr(req, "symbol", None)
-        side       = getattr(req, "side", "Buy")
-        order_type = getattr(req, "order_type", "market")
-        qty        = float(getattr(req, "qty", 0.0))
-        price      = getattr(req, "price", None)
-        reduce_only = bool(getattr(req, "reduce_only", False))
-        post_only   = bool(getattr(req, "post_only", False))
+        symbol      = req.symbol
+        qty         = float(req.qty)
+        reduce_only = bool(req.reduce_only)
+        post_only   = bool(req.post_only)
 
-        if symbol is None:
-            raise ValueError("create_order: req.symbol este None")
-
-        # Normalizeaza side: OrderSide enum / string → 'Buy' | 'Sell'
-        side_str = str(side.value if hasattr(side, "value") else side).lower()
+        # Normalizeaza side: OrderSide enum -> string Bybit
+        side_str = str(req.side.value if hasattr(req.side, "value") else req.side).lower()
         bybit_side = "Buy" if side_str in ("buy", "long") else "Sell"
 
         # Normalizeaza order_type
         otype_str = str(
-            order_type.value if hasattr(order_type, "value") else order_type
+            req.order_type.value if hasattr(req.order_type, "value") else req.order_type
         ).lower()
 
-        if otype_str == "limit" and price is not None and float(price) > 0:
+        if otype_str == "limit" and req.price and float(req.price) > 0:
             return await self.limit_order(
                 symbol=symbol,
                 side=bybit_side,
                 qty=qty,
-                price=float(price),
+                price=float(req.price),
                 reduce_only=reduce_only,
                 post_only=post_only,
             )
-        else:
-            return await self.market_order(
-                symbol=symbol,
-                side=bybit_side,
-                qty=qty,
-                reduce_only=reduce_only,
-            )
+        return await self.market_order(
+            symbol=symbol,
+            side=bybit_side,
+            qty=qty,
+            reduce_only=reduce_only,
+        )
 
     # -------------------------------------------------------------------------
     # v3.5-compat: place_market_order / place_limit_order
-    # Interfata folosita de OrderManager.submit() intern
     # -------------------------------------------------------------------------
 
     async def place_market_order(
@@ -217,8 +265,7 @@ class BybitOrderRouter:
         )
 
     # -------------------------------------------------------------------------
-    # v3.5-compat: get_positions() — alias pentru PositionReconciler
-    # PositionReconciler face: router.get_positions(symbol)
+    # v3.5-compat: get_positions()
     # -------------------------------------------------------------------------
 
     async def get_positions(self, symbol: Optional[str] = None) -> dict:
