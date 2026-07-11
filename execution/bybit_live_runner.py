@@ -1,8 +1,14 @@
 """
-execution/bybit_live_runner.py — QuantLuna Bybit Live Runner v3.0
+execution/bybit_live_runner.py — QuantLuna Bybit Live Runner v3.1
 Sprint S20 — 2026-07-11
 
-Changelog:
+Changelog v3.1:
+  - run(): Phase 0 (REST warm-up) via BybitWarmupFetcher înainte de _run_loop
+  - _warmup_from_rest(): fetch N bare istorice, inject în SpreadMonitor, fail-safe
+  - _bar_count presetat după warm-up REST → WS loop pornește direct în trading
+  - Fallback transparent dacă REST eșuează: warm-up progresiv via WS (v3.0)
+
+Changelog v3.0 (S20):
   - _run_loop(): state_bus.publish("bar", {...}) după fiecare bar procesat
   - state_bus.publish("warmup_status", {...}) la fiecare 10 bare în warm-up
   - Metrici Prometheus actualizate în timp real (zscore, pnl, drawdown, circuit)
@@ -112,6 +118,10 @@ class BybitLiveRunnerConfig:
     best_params_path: str = os.getenv("BEST_PARAMS_PATH", "best_params.json")
     state_bus_publish_interval: int = int(os.getenv("STATE_BUS_PUBLISH_INTERVAL", "1"))
 
+    # S20 Phase 0: REST warm-up
+    rest_warmup_enabled: bool = os.getenv("REST_WARMUP_ENABLED", "true").lower() == "true"
+    bybit_category: str = os.getenv("BYBIT_CATEGORY", "linear")
+
     @classmethod
     def from_env(cls) -> "BybitLiveRunnerConfig":
         return cls()
@@ -139,8 +149,9 @@ class BybitLiveRunner:
     """
     Main live trading loop.
 
-    S20: Publică state în state_bus după fiecare bar pentru dashboard real-time.
-    S28: Toate subsistemele delegate la clase dedicate.
+    S20 v3.1: Phase 0 REST warm-up via BybitWarmupFetcher.
+    S20 v3.0: Publică state în state_bus după fiecare bar pentru dashboard real-time.
+    S28:      Toate subsistemele delegate la clase dedicate.
     """
 
     def __init__(self, cfg: BybitLiveRunnerConfig) -> None:
@@ -153,6 +164,65 @@ class BybitLiveRunner:
     @classmethod
     def from_config(cls, cfg: BybitLiveRunnerConfig) -> "BybitLiveRunner":
         return cls(cfg)
+
+    # -------------------------------------------------------------------------
+    # Phase 0: REST warm-up (NOU S20 v3.1)
+    # -------------------------------------------------------------------------
+
+    async def _warmup_from_rest(
+        self,
+        spread_monitor: SpreadMonitor,
+    ) -> int:
+        """
+        Phase 0: Fetch bare istorice din Bybit REST și injectează în spread_monitor.
+
+        - Dacă reușește: _bar_count este presetat, WS loop pornește direct în trading
+        - Dacă eșuează: returnează 0, warm-up progresiv via WS (comportament anterior)
+
+        Returns
+        -------
+        int : numărul de bare injectate (0 = fallback la WS warm-up)
+        """
+        if not self.cfg.rest_warmup_enabled:
+            logger.info("BybitLiveRunner: REST warm-up dezactivat (REST_WARMUP_ENABLED=false)")
+            return 0
+
+        logger.info(
+            f"BybitLiveRunner: ⏳ Phase 0 — REST warm-up "
+            f"{self.cfg.warmup_bars} bare {self.cfg.symbol_y}/{self.cfg.symbol_x}"
+        )
+
+        try:
+            from execution.bybit_warmup_fetcher import BybitWarmupFetcher
+            fetcher = BybitWarmupFetcher(
+                symbol_y        = self.cfg.symbol_y,
+                symbol_x        = self.cfg.symbol_x,
+                interval        = self.cfg.interval,
+                n_bars          = self.cfg.warmup_bars,
+                testnet         = self.cfg.testnet,
+                category        = self.cfg.bybit_category,
+                request_timeout = 15,
+            )
+            n = await fetcher.fetch(spread_monitor, _state_bus)
+            if n > 0:
+                # Presetăm _bar_count pentru a reflecta barele deja procesate
+                self._bar_count = n
+                logger.info(
+                    f"BybitLiveRunner: ✅ Phase 0 complet — {n} bare injectate, "
+                    "WS loop porneste cu warm-up complet"
+                )
+            else:
+                logger.warning(
+                    "BybitLiveRunner: ⚠️ Phase 0 a returnat 0 bare — "
+                    "fallback la warm-up progresiv via WS"
+                )
+            return n
+        except Exception as exc:
+            logger.warning(
+                f"BybitLiveRunner: Phase 0 eșuat ({exc}) — "
+                "fallback la warm-up progresiv via WS"
+            )
+            return 0
 
     # -------------------------------------------------------------------------
     # state_bus helpers
@@ -267,6 +337,7 @@ class BybitLiveRunner:
                 "half_life_h": round(half_life_h, 2),
                 "regime": vol_regime,
                 "ready": pct >= 1.0,
+                "source": "ws",
                 "ts": int(time.time() * 1000),
             })
         except Exception as exc:
@@ -459,7 +530,8 @@ class BybitLiveRunner:
 
                 if first_bar:
                     logger.info(
-                        f"BybitLiveRunner: First bar | spread={spread:.6f} | zscore={zscore:.4f}"
+                        f"BybitLiveRunner: First WS bar | spread={spread:.6f} | zscore={zscore:.4f} "
+                        f"| bar_count={self._bar_count} (REST pre-loaded)"
                     )
                     first_bar = False
 
@@ -469,7 +541,7 @@ class BybitLiveRunner:
                     if self._bar_count % 10 == 0:
                         self._publish_warmup_status(spread_monitor)
                         logger.info(
-                            f"[Warm-up] {self._bar_count}/{self.cfg.warmup_bars} bare "
+                            f"[Warm-up WS] {self._bar_count}/{self.cfg.warmup_bars} bare "
                             f"({100 * self._bar_count / self.cfg.warmup_bars:.0f}%)"
                         )
                     # Publică bar chiar și în warm-up (pentru grafice)
@@ -660,8 +732,8 @@ class BybitLiveRunner:
     # -------------------------------------------------------------------------
 
     async def run(self) -> int:
-        """Full run: build, start, trade."""
-        logger.info("BybitLiveRunner: ========== Starting Live Runner ==========")
+        """Full run: Phase 0 REST warm-up → build → start → trade."""
+        logger.info("BybitLiveRunner: ========== Starting Live Runner v3.1 ==========")
         logger.info(
             f"BybitLiveRunner: {self.cfg.symbol_y}/{self.cfg.symbol_x} | "
             f"interval={self.cfg.interval}m | dry_run={self.cfg.dry_run}"
@@ -672,6 +744,10 @@ class BybitLiveRunner:
         (
             spread_monitor, circuit_breaker, order_manager, watchdog, notifier_bus,
         ) = await self._build_components(order_router, ws_feed)
+
+        # ── Phase 0: REST warm-up (S20 v3.1) ──────────────────────────────────
+        await self._warmup_from_rest(spread_monitor)
+        # ──────────────────────────────────────────────────────────────────────
 
         if notifier_bus:
             await notifier_bus.send_alert(
