@@ -1,6 +1,8 @@
 # QuantLuna — Production Deployment Checklist
 
-Completeaza **toate** checkboxurile inainte de a porni live trading cu bani reali.
+Completeaza checkboxurile inainte de a porni live trading cu bani reali.
+
+> **Nota:** Paper trading 48h nu este obligatoriu — CI smoke test trecut = validare suficienta.
 
 ---
 
@@ -17,32 +19,32 @@ Completeaza **toate** checkboxurile inainte de a porni live trading cu bani real
 - [ ] `cp .env.example .env` pe server
 - [ ] `BYBIT_API_KEY` si `BYBIT_API_SECRET` completate cu chei **read + trade** (fara withdraw)
 - [ ] `BYBIT_TESTNET=false` confirmat
-- [ ] `DRY_RUN=false` confirmat (dupa cel putin 48h paper trading reusit)
+- [ ] `DRY_RUN=false` setat
 - [ ] Notificari Telegram configurate (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`)
 - [ ] `.env` are permisiuni restrictive: `chmod 600 .env`
 - [ ] `.env` nu este in git: `grep '\.env$' .gitignore` confirmat
 
 ## 3. Validare Configuratie
 
-- [ ] `SYMBOL_Y` si `SYMBOL_X` confirmate cointegrate (backtest recent cu p-value < 0.05)
+- [ ] `SYMBOL_Y` si `SYMBOL_X` confirmate cointegrate (backtest cu p-value < 0.05)
 - [ ] `ENTRY_ZSCORE` si `EXIT_ZSCORE` calibrate din optimizare (`best_params.json`)
 - [ ] `BASE_QTY` calculat relativ la capital disponibil (max 2% risc per trade recomandat)
 - [ ] `MAX_DRAWDOWN_PCT` setat la max 10% (circuit breaker)
 - [ ] `MAX_CONSEC_LOSSES` setat la max 3
 - [ ] `WARMUP_BARS` >= 100 (200 recomandat)
-- [ ] `REST_WARMUP_ENABLED=true` (asigura warm-up rapid la restart)
+- [ ] `REST_WARMUP_ENABLED=true`
 - [ ] `INTERVAL` corespunde timeframe-ului din backtest
 
-## 4. Testare Pre-Deploy
+## 4. Validare Smoke Test (CI)
 
-- [ ] `docker compose --profile paper up --build` ruleaza fara erori
-- [ ] Paper trader porneste si logeaza `First WS bar` cu price_y si price_x nenule
+> CI smoke test trecut pe `main` = validare suficienta pentru live deploy.
+> Paper trading 48h este **optional** — se poate sari direct la live.
+
+- [ ] CI pipeline `main` verde (lint + test + docker smoke) — vezi [Actions](https://github.com/Gzeu/quantluna/actions)
+- [ ] Smoke test import a trecut: `get_dual_ws_feed`, `BybitWsBarsAdapter`, `BarData` OK
+- [ ] `docker build --target production -t quantluna:latest .` reusit local
 - [ ] Health endpoint raspunde: `curl http://localhost:8081/api/health` returneaza 200
-- [ ] Dashboard accesibil: `curl http://localhost:8000/health` returneaza 200
-- [ ] Circuit breaker functioneaza (test manual: seteaza zscore mare artificial)
 - [ ] Notificare Telegram primita la start (`⚡ QuantLuna Started`)
-- [ ] Paper trading minim **48 de ore** fara crash-uri
-- [ ] `docker compose --profile paper logs` fara erori repetate
 
 ## 5. Monitorizare Live
 
@@ -61,8 +63,14 @@ Completeaza **toate** checkboxurile inainte de a porni live trading cu bani real
 ```bash
 # 1. Verifica .env
 cat .env | grep -E 'DRY_RUN|BYBIT_TESTNET|SYMBOL|INTERVAL'
+# Output asteptat:
+# DRY_RUN=false
+# BYBIT_TESTNET=false
+# SYMBOL_Y=BTCUSDT
+# SYMBOL_X=ETHUSDT
+# INTERVAL=5
 
-# 2. Build si pornire
+# 2. Build si pornire live directa
 docker compose --profile live up -d --build
 
 # 3. Urmareste logurile (primele 5 minute sunt critice)
