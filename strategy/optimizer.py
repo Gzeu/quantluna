@@ -6,6 +6,7 @@ Sprint 12 — Optuna-based parameter search pentru:
   - Signal: zscore_entry, zscore_exit
   - Risk: kelly_fraction, vol_target
   - Regime: stability gate params
+  - KalmanScoringWeights (Sprint 19 / Fix #6 extension)
 
 Features:
   - Optuna TPE sampler (Tree-structured Parzen Estimator)
@@ -16,6 +17,7 @@ Features:
   - Reproducibil: seed configurabil
   - Rezultate salvate în SQLite Optuna storage (opțional)
   - Export best params ca dict / JSON / LiveConfig patch
+  - KalmanScoringWeights în SearchSpace: toti parametrii score() sunt optimizabili
 
 Usage:
     from strategy.optimizer import QuantLunaOptimizer, OptimizerConfig
@@ -31,10 +33,11 @@ Usage:
         objective="sharpe",
         train_ratio=0.7,
         seed=42,
+        optimize_kalman_score=True,
     ))
     best = opt.optimize(ohlcv_y, ohlcv_x)
-    print(best.params)        # best hyperparams
-    print(best.sharpe_test)   # out-of-sample Sharpe
+    print(best.params)
+    print(best.sharpe_test)
     best.save_json("best_params.json")
 """
 
@@ -43,7 +46,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field, asdict
-from typing import Dict, List, Literal, Optional
+from typing import Dict, Literal, Optional
 
 import numpy as np
 import pandas as pd
@@ -56,50 +59,75 @@ ObjectiveType = Literal["sharpe", "sortino", "calmar", "profit_factor"]
 @dataclass
 class SearchSpace:
     """Defines the hyperparameter search space bounds."""
-    # Kalman Filter
-    delta_low:  float = 1e-6
+    delta_low: float = 1e-6
     delta_high: float = 1e-2
-    R_low:      float = 1e-4
-    R_high:     float = 1e-1
-    # Signal / z-score
-    zscore_entry_low:  float = 1.5
+    R_low: float = 1e-4
+    R_high: float = 1e-1
+    zscore_entry_low: float = 1.5
     zscore_entry_high: float = 3.5
-    zscore_exit_low:   float = 0.1
-    zscore_exit_high:  float = 1.0
-    # Risk
-    kelly_fraction_low:  float = 0.1
+    zscore_exit_low: float = 0.1
+    zscore_exit_high: float = 1.0
+    kelly_fraction_low: float = 0.1
     kelly_fraction_high: float = 0.5
-    vol_target_low:  float = 0.005
+    vol_target_low: float = 0.005
     vol_target_high: float = 0.03
-    # Regime
-    half_life_min_h_low:  float = 6.0
+    half_life_min_h_low: float = 6.0
     half_life_min_h_high: float = 24.0
-    half_life_max_h_low:  float = 48.0
+    half_life_max_h_low: float = 48.0
     half_life_max_h_high: float = 240.0
-    # Warmup
-    min_warmup_bars_low:  int = 20
+    min_warmup_bars_low: int = 20
     min_warmup_bars_high: int = 80
+
+    ks_baseline_low: float = 0.45
+    ks_baseline_high: float = 0.75
+    ks_regime_ranging_low: float = 0.05
+    ks_regime_ranging_high: float = 0.25
+    ks_regime_trending_low: float = -0.35
+    ks_regime_trending_high: float = -0.05
+    ks_regime_breakout_low: float = -0.25
+    ks_regime_breakout_high: float = 0.00
+    ks_coint_p001_low: float = 0.05
+    ks_coint_p001_high: float = 0.30
+    ks_coint_p005_low: float = 0.02
+    ks_coint_p005_high: float = 0.15
+    ks_coint_p010_low: float = -0.35
+    ks_coint_p010_high: float = -0.05
+    ks_hl_optimal_bonus_low: float = 0.02
+    ks_hl_optimal_bonus_high: float = 0.20
+    ks_hl_long_penalty_low: float = -0.30
+    ks_hl_long_penalty_high: float = -0.05
+    ks_hl_short_penalty_low: float = -0.15
+    ks_hl_short_penalty_high: float = 0.00
+    ks_autocorr_good_low: float = 0.02
+    ks_autocorr_good_high: float = 0.20
+    ks_autocorr_bad_low: float = -0.30
+    ks_autocorr_bad_high: float = -0.02
+    ks_vol_rank_good_low: float = 0.00
+    ks_vol_rank_good_high: float = 0.15
+    ks_vol_rank_extreme_low: float = -0.30
+    ks_vol_rank_extreme_high: float = -0.02
+    ks_win_rate_good_low: float = 0.00
+    ks_win_rate_good_high: float = 0.15
+    ks_win_rate_bad_low: float = -0.20
+    ks_win_rate_bad_high: float = -0.02
 
 
 @dataclass
 class OptimizerConfig:
     n_trials: int = 150
-    n_jobs: int = 1              # -1 = all CPUs (requires Optuna joblib backend)
+    n_jobs: int = 1
     objective: ObjectiveType = "sharpe"
-    train_ratio: float = 0.70    # 70% train, 30% test (no leakage)
+    train_ratio: float = 0.70
     seed: int = 42
     search_space: SearchSpace = field(default_factory=SearchSpace)
-    # Pruning
     pruning_enabled: bool = True
     pruning_warmup_steps: int = 10
-    # Optuna storage (None = in-memory)
     storage_url: Optional[str] = None
     study_name: str = "quantluna_opt"
-    # Backtest config
     bar_freq: str = "1h"
     capital_usdt: float = 10_000.0
-    # Minimum trades for valid trial
     min_trades: int = 10
+    optimize_kalman_score: bool = True
 
 
 @dataclass
@@ -141,13 +169,6 @@ class OptimizationResult:
 
 
 class QuantLunaOptimizer:
-    """
-    Optuna-based hyperparameter optimizer pentru QuantLuna.
-
-    Folosește backtestul vectorizat intern pentru a evalua fiecare trial.
-    Train/test split strict — fără leakage.
-    """
-
     def __init__(self, config: OptimizerConfig) -> None:
         self.cfg = config
 
@@ -156,34 +177,22 @@ class QuantLunaOptimizer:
         ohlcv_y: pd.DataFrame,
         ohlcv_x: pd.DataFrame,
     ) -> OptimizationResult:
-        """
-        Rulează căutarea de parametri și returnează cel mai bun rezultat.
-
-        Args:
-            ohlcv_y: OHLCV DataFrame pentru simbolul Y (index = DatetimeIndex)
-            ohlcv_x: OHLCV DataFrame pentru simbolul X
-
-        Returns:
-            OptimizationResult cu best params + metrici out-of-sample
-        """
         try:
             import optuna
             optuna.logging.set_verbosity(optuna.logging.WARNING)
         except ImportError:
-            raise ImportError(
-                "Optuna not installed. Run: pip install optuna"
-            )
+            raise ImportError("Optuna not installed. Run: pip install optuna")
 
-        # Train / test split — strict non-leakage
         split_idx = int(len(ohlcv_y) * self.cfg.train_ratio)
         train_y = ohlcv_y.iloc[:split_idx].copy()
         train_x = ohlcv_x.iloc[:split_idx].copy()
-        test_y  = ohlcv_y.iloc[split_idx:].copy()
-        test_x  = ohlcv_x.iloc[split_idx:].copy()
+        test_y = ohlcv_y.iloc[split_idx:].copy()
+        test_x = ohlcv_x.iloc[split_idx:].copy()
 
         logger.info(
             f"Optimizer: {len(train_y)} train bars / {len(test_y)} test bars "
-            f"| {self.cfg.n_trials} trials | objective={self.cfg.objective}"
+            f"| {self.cfg.n_trials} trials | objective={self.cfg.objective} "
+            f"| optimize_kalman_score={self.cfg.optimize_kalman_score}"
         )
 
         sampler = optuna.samplers.TPESampler(seed=self.cfg.seed)
@@ -214,11 +223,6 @@ class QuantLunaOptimizer:
 
         best_params = study.best_params
         sharpe_train = study.best_value
-
-        logger.info(f"Best train {self.cfg.objective}: {sharpe_train:.3f}")
-        logger.info(f"Evaluating best params on test set...")
-
-        # Out-of-sample evaluation
         test_metrics = self._run_backtest(best_params, test_y, test_x)
 
         result = OptimizationResult(
@@ -238,27 +242,48 @@ class QuantLunaOptimizer:
         return result
 
     def _objective(self, trial, ohlcv_y: pd.DataFrame, ohlcv_x: pd.DataFrame) -> float:
-        """Optuna objective — returns score to maximize."""
         import optuna
+
         ss = self.cfg.search_space
         params = {
-            "delta":            trial.suggest_float("delta", ss.delta_low, ss.delta_high, log=True),
-            "R":                trial.suggest_float("R", ss.R_low, ss.R_high, log=True),
-            "zscore_entry":     trial.suggest_float("zscore_entry", ss.zscore_entry_low, ss.zscore_entry_high),
-            "zscore_exit":      trial.suggest_float("zscore_exit", ss.zscore_exit_low, ss.zscore_exit_high),
-            "kelly_fraction":   trial.suggest_float("kelly_fraction", ss.kelly_fraction_low, ss.kelly_fraction_high),
-            "vol_target":       trial.suggest_float("vol_target", ss.vol_target_low, ss.vol_target_high),
-            "half_life_min_h":  trial.suggest_float("half_life_min_h", ss.half_life_min_h_low, ss.half_life_min_h_high),
-            "half_life_max_h":  trial.suggest_float("half_life_max_h", ss.half_life_max_h_low, ss.half_life_max_h_high),
-            "min_warmup_bars":  trial.suggest_int("min_warmup_bars", ss.min_warmup_bars_low, ss.min_warmup_bars_high),
+            "delta": trial.suggest_float("delta", ss.delta_low, ss.delta_high, log=True),
+            "R": trial.suggest_float("R", ss.R_low, ss.R_high, log=True),
+            "zscore_entry": trial.suggest_float("zscore_entry", ss.zscore_entry_low, ss.zscore_entry_high),
+            "zscore_exit": trial.suggest_float("zscore_exit", ss.zscore_exit_low, ss.zscore_exit_high),
+            "kelly_fraction": trial.suggest_float("kelly_fraction", ss.kelly_fraction_low, ss.kelly_fraction_high),
+            "vol_target": trial.suggest_float("vol_target", ss.vol_target_low, ss.vol_target_high),
+            "half_life_min_h": trial.suggest_float("half_life_min_h", ss.half_life_min_h_low, ss.half_life_min_h_high),
+            "half_life_max_h": trial.suggest_float("half_life_max_h", ss.half_life_max_h_low, ss.half_life_max_h_high),
+            "min_warmup_bars": trial.suggest_int("min_warmup_bars", ss.min_warmup_bars_low, ss.min_warmup_bars_high),
         }
 
-        # Constraint: half_life_min < half_life_max
         if params["half_life_min_h"] >= params["half_life_max_h"]:
             raise optuna.exceptions.TrialPruned()
-        # Constraint: zscore_exit < zscore_entry
         if params["zscore_exit"] >= params["zscore_entry"]:
             raise optuna.exceptions.TrialPruned()
+
+        if self.cfg.optimize_kalman_score:
+            ks_params = {
+                "ks_baseline": trial.suggest_float("ks_baseline", ss.ks_baseline_low, ss.ks_baseline_high),
+                "ks_regime_ranging": trial.suggest_float("ks_regime_ranging", ss.ks_regime_ranging_low, ss.ks_regime_ranging_high),
+                "ks_regime_trending": trial.suggest_float("ks_regime_trending", ss.ks_regime_trending_low, ss.ks_regime_trending_high),
+                "ks_regime_breakout": trial.suggest_float("ks_regime_breakout", ss.ks_regime_breakout_low, ss.ks_regime_breakout_high),
+                "ks_coint_p001": trial.suggest_float("ks_coint_p001", ss.ks_coint_p001_low, ss.ks_coint_p001_high),
+                "ks_coint_p005": trial.suggest_float("ks_coint_p005", ss.ks_coint_p005_low, ss.ks_coint_p005_high),
+                "ks_coint_p010": trial.suggest_float("ks_coint_p010", ss.ks_coint_p010_low, ss.ks_coint_p010_high),
+                "ks_hl_optimal_bonus": trial.suggest_float("ks_hl_optimal_bonus", ss.ks_hl_optimal_bonus_low, ss.ks_hl_optimal_bonus_high),
+                "ks_hl_long_penalty": trial.suggest_float("ks_hl_long_penalty", ss.ks_hl_long_penalty_low, ss.ks_hl_long_penalty_high),
+                "ks_hl_short_penalty": trial.suggest_float("ks_hl_short_penalty", ss.ks_hl_short_penalty_low, ss.ks_hl_short_penalty_high),
+                "ks_autocorr_good": trial.suggest_float("ks_autocorr_good", ss.ks_autocorr_good_low, ss.ks_autocorr_good_high),
+                "ks_autocorr_bad": trial.suggest_float("ks_autocorr_bad", ss.ks_autocorr_bad_low, ss.ks_autocorr_bad_high),
+                "ks_vol_rank_good": trial.suggest_float("ks_vol_rank_good", ss.ks_vol_rank_good_low, ss.ks_vol_rank_good_high),
+                "ks_vol_rank_extreme": trial.suggest_float("ks_vol_rank_extreme", ss.ks_vol_rank_extreme_low, ss.ks_vol_rank_extreme_high),
+                "ks_win_rate_good": trial.suggest_float("ks_win_rate_good", ss.ks_win_rate_good_low, ss.ks_win_rate_good_high),
+                "ks_win_rate_bad": trial.suggest_float("ks_win_rate_bad", ss.ks_win_rate_bad_low, ss.ks_win_rate_bad_high),
+            }
+            if not (ks_params["ks_coint_p001"] > ks_params["ks_coint_p005"] > 0 > ks_params["ks_coint_p010"]):
+                raise optuna.exceptions.TrialPruned()
+            params.update(ks_params)
 
         try:
             metrics = self._run_backtest(params, ohlcv_y, ohlcv_x)
@@ -270,18 +295,35 @@ class QuantLunaOptimizer:
             raise optuna.exceptions.TrialPruned()
 
         score = metrics.get(self.cfg.objective, 0.0)
-        # Guard against NaN/Inf
         if not np.isfinite(score):
             raise optuna.exceptions.TrialPruned()
         return float(score)
 
     def _run_backtest(self, params: Dict, ohlcv_y: pd.DataFrame, ohlcv_x: pd.DataFrame) -> Dict:
-        """
-        Runs the vectorised backtest with given params.
-        Returns metrics dict from PerformanceAnalytics.
-        """
         from backtest.engine import BacktestEngine, BacktestConfig
         from backtest.analytics import PerformanceAnalytics
+
+        kalman_scoring_weights = None
+        if self.cfg.optimize_kalman_score and "ks_baseline" in params:
+            from strategy.kalman_pairs_trading import KalmanScoringWeights
+            kalman_scoring_weights = KalmanScoringWeights(
+                baseline=params["ks_baseline"],
+                regime_ranging_bonus=params["ks_regime_ranging"],
+                regime_trending_penalty=params["ks_regime_trending"],
+                regime_breakout_penalty=params["ks_regime_breakout"],
+                coint_p001_bonus=params["ks_coint_p001"],
+                coint_p005_bonus=params["ks_coint_p005"],
+                coint_p010_penalty=params["ks_coint_p010"],
+                hl_optimal_bonus=params["ks_hl_optimal_bonus"],
+                hl_long_penalty=params["ks_hl_long_penalty"],
+                hl_short_penalty=params["ks_hl_short_penalty"],
+                autocorr_good_bonus=params["ks_autocorr_good"],
+                autocorr_bad_penalty=params["ks_autocorr_bad"],
+                vol_rank_good_bonus=params["ks_vol_rank_good"],
+                vol_rank_extreme_penalty=params["ks_vol_rank_extreme"],
+                win_rate_good_bonus=params["ks_win_rate_good"],
+                win_rate_bad_penalty=params["ks_win_rate_bad"],
+            )
 
         bt_cfg = BacktestConfig(
             delta=params["delta"],
@@ -295,6 +337,7 @@ class QuantLunaOptimizer:
             min_warmup_bars=params.get("min_warmup_bars", 30),
             capital_usdt=self.cfg.capital_usdt,
             bar_freq=self.cfg.bar_freq,
+            kalman_scoring_weights=kalman_scoring_weights,
         )
         engine = BacktestEngine(bt_cfg)
         result = engine.run(ohlcv_y, ohlcv_x)
@@ -307,10 +350,17 @@ class QuantLunaOptimizer:
 
 
 def _bar_freq_to_hours(bar_freq: str) -> float:
-    """Converts bar_freq string to float hours."""
     mapping = {
-        "1m": 1/60, "5m": 5/60, "15m": 0.25, "30m": 0.5,
-        "1h": 1.0, "2h": 2.0, "4h": 4.0, "6h": 6.0,
-        "8h": 8.0, "12h": 12.0, "1d": 24.0,
+        "1m": 1 / 60,
+        "5m": 5 / 60,
+        "15m": 0.25,
+        "30m": 0.5,
+        "1h": 1.0,
+        "2h": 2.0,
+        "4h": 4.0,
+        "6h": 6.0,
+        "8h": 8.0,
+        "12h": 12.0,
+        "1d": 24.0,
     }
     return mapping.get(bar_freq, 1.0)
