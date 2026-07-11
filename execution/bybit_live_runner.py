@@ -1,6 +1,14 @@
 """
-execution/bybit_live_runner.py — QuantLuna Bybit Live Runner v3.1
+execution/bybit_live_runner.py — QuantLuna Bybit Live Runner v3.2
 Sprint S20 — 2026-07-11
+
+Changelog v3.2 (S20-fix):
+  - _build_exchange_via_factory(): folosește get_dual_ws_feed(symbol_y, symbol_x)
+    în loc de get_ws_feed(symbol_y) — returnează BybitWsBarsAdapter sincronizat
+    cu get_bar() → BarData(price_y, price_x, timestamp) corect per simbol
+  - Import actualizat: get_dual_ws_feed adăugat din exchange_factory
+  - Fallback: BybitWsBarsAdapter(ws_feed=None) mock stream (fără deps externe)
+  - _run_loop: bar.price_y / bar.price_x funcționează fără modificări
 
 Changelog v3.1:
   - run(): Phase 0 (REST warm-up) via BybitWarmupFetcher înainte de _run_loop
@@ -33,11 +41,11 @@ from loguru import logger
 
 if TYPE_CHECKING:
     from execution.bybit_order_router import BybitOrderRouter
-    from execution.bybit_ws_feed import BybitWsFeed
+    from execution.bybit_ws_bars import BybitWsBarsAdapter  # S20-fix
 
 from core.spread_monitor import SpreadMonitor
 from execution.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
-from execution.exchange_factory import ExchangeFactory, get_order_router, get_ws_feed
+from execution.exchange_factory import ExchangeFactory, get_order_router, get_ws_feed, get_dual_ws_feed  # S20-fix
 from execution.health_check import HealthCheck, HealthCheckConfig, HealthStatus
 from execution.order_manager import OrderManager, OrderManagerConfig
 from execution.watchdog import WsWatchdog, WsWatchdogConfig
@@ -149,6 +157,8 @@ class BybitLiveRunner:
     """
     Main live trading loop.
 
+    S20 v3.2: _build_exchange_via_factory() folosește get_dual_ws_feed —
+              feed dual-symbol sincronizat cu BarData(price_y, price_x).
     S20 v3.1: Phase 0 REST warm-up via BybitWarmupFetcher.
     S20 v3.0: Publică state în state_bus după fiecare bar pentru dashboard real-time.
     S28:      Toate subsistemele delegate la clase dedicate.
@@ -205,7 +215,6 @@ class BybitLiveRunner:
             )
             n = await fetcher.fetch(spread_monitor, _state_bus)
             if n > 0:
-                # Presetăm _bar_count pentru a reflecta barele deja procesate
                 self._bar_count = n
                 logger.info(
                     f"BybitLiveRunner: ✅ Phase 0 complet — {n} bare injectate, "
@@ -288,7 +297,6 @@ class BybitLiveRunner:
         except Exception as exc:
             logger.debug(f"state_bus.publish bar failed: {exc}")
 
-        # Actualizare metrici Prometheus
         if _HAS_METRICS:
             try:
                 spread_zscore.set(zscore)
@@ -348,38 +356,66 @@ class BybitLiveRunner:
     # -------------------------------------------------------------------------
 
     async def _build_exchange_via_factory(self) -> tuple[Any, Any]:
-        """Build BybitOrderRouter + BybitWsFeed via ExchangeFactory."""
+        """
+        S20-fix v3.2: Build BybitOrderRouter + BybitWsBarsAdapter via ExchangeFactory.
+
+        Folosește get_dual_ws_feed(symbol_y, symbol_x, interval) în loc de
+        get_ws_feed(symbol_y) — returnează BybitWsBarsAdapter cu:
+          - get_bar() -> BarData(price_y, price_x, timestamp)  ← cerut de _run_loop
+          - stream_bars() -> AsyncIterator[BarData]
+          - is_healthy() pentru WsWatchdog
+        """
         try:
             order_router = get_order_router(
-                api_key=self.cfg.api_key,
-                api_secret=self.cfg.api_secret,
-                testnet=self.cfg.testnet,
-                dry_run=self.cfg.dry_run,
+                api_key    = self.cfg.api_key,
+                api_secret = self.cfg.api_secret,
+                testnet    = self.cfg.testnet,
+                dry_run    = self.cfg.dry_run,
             )
-            ws_feed = get_ws_feed(
-                symbol=self.cfg.symbol_y,
-                interval=self.cfg.interval,
-                testnet=self.cfg.testnet,
+            # S20-fix: get_dual_ws_feed în loc de get_ws_feed cu un singur simbol
+            ws_feed = get_dual_ws_feed(
+                symbol_y = self.cfg.symbol_y,
+                symbol_x = self.cfg.symbol_x,
+                interval = self.cfg.interval,
+                testnet  = self.cfg.testnet,
             )
-            logger.info("BybitLiveRunner: Exchange clients built via ExchangeFactory")
+            logger.info(
+                f"BybitLiveRunner: Exchange clients built via ExchangeFactory "
+                f"[dual-feed: {self.cfg.symbol_y}/{self.cfg.symbol_x}]"
+            )
             return order_router, ws_feed
+
         except Exception as exc:
-            logger.warning(f"BybitLiveRunner: ExchangeFactory failed ({exc}), falling back")
-            from execution.bybit_order_router import BybitOrderRouter, BybitOrderRouterConfig
-            from execution.bybit_ws_feed import BybitWsFeed, BybitWsFeedConfig
-            router_cfg = BybitOrderRouterConfig(
-                api_key=self.cfg.api_key,
-                api_secret=self.cfg.api_secret,
-                testnet=self.cfg.testnet,
-                dry_run=self.cfg.dry_run,
+            logger.warning(
+                f"BybitLiveRunner: ExchangeFactory failed ({exc}), "
+                "falling back to BybitWsBarsAdapter mock"
             )
-            order_router = BybitOrderRouter(router_cfg)
-            feed_cfg = BybitWsFeedConfig(
-                symbol=self.cfg.symbol_y,
-                interval=self.cfg.interval,
-                testnet=self.cfg.testnet,
+            # Fallback: mock feed fără conexiune WS reală
+            # BybitWsBarsAdapter(ws_feed=None) activează _mock_stream()
+            try:
+                from execution.bybit_order_router import BybitOrderRouter
+                order_router = BybitOrderRouter(
+                    api_key    = self.cfg.api_key,
+                    api_secret = self.cfg.api_secret,
+                    testnet    = self.cfg.testnet,
+                    category   = self.cfg.bybit_category,
+                    mode       = "paper" if self.cfg.dry_run else "live",
+                )
+            except Exception as exc2:
+                logger.error(f"BybitLiveRunner: Fallback BybitOrderRouter failed: {exc2}")
+                raise
+
+            from execution.bybit_ws_bars import BybitWsBarsAdapter
+            ws_feed = BybitWsBarsAdapter(
+                ws_feed   = None,  # activează mock stream
+                symbol_y  = self.cfg.symbol_y,
+                symbol_x  = self.cfg.symbol_x,
+                interval  = str(self.cfg.interval),
             )
-            ws_feed = BybitWsFeed.from_config(feed_cfg)
+            logger.warning(
+                "BybitLiveRunner: WS feed în mod MOCK "
+                f"({self.cfg.symbol_y}/{self.cfg.symbol_x})"
+            )
             return order_router, ws_feed
 
     # -------------------------------------------------------------------------
@@ -517,6 +553,8 @@ class BybitLiveRunner:
 
         while not self._stop_event.is_set():
             try:
+                # S20-fix: ws_feed este BybitWsBarsAdapter → get_bar() returnează
+                # BarData(symbol_y, symbol_x, price_y, price_x, timestamp)
                 bar = await ws_feed.get_bar()
                 if bar is None:
                     await asyncio.sleep(0.1)
@@ -530,12 +568,14 @@ class BybitLiveRunner:
 
                 if first_bar:
                     logger.info(
-                        f"BybitLiveRunner: First WS bar | spread={spread:.6f} | zscore={zscore:.4f} "
-                        f"| bar_count={self._bar_count} (REST pre-loaded)"
+                        f"BybitLiveRunner: First WS bar | "
+                        f"{self.cfg.symbol_y}={bar.price_y:.4f} "
+                        f"{self.cfg.symbol_x}={bar.price_x:.4f} | "
+                        f"spread={spread:.6f} | zscore={zscore:.4f} | "
+                        f"bar_count={self._bar_count} (REST pre-loaded)"
                     )
                     first_bar = False
 
-                # Warm-up barrier — publică progres la fiecare 10 bare
                 is_warmed_up = getattr(spread_monitor, "is_warmed_up", True)
                 if not is_warmed_up:
                     if self._bar_count % 10 == 0:
@@ -544,11 +584,9 @@ class BybitLiveRunner:
                             f"[Warm-up WS] {self._bar_count}/{self.cfg.warmup_bars} bare "
                             f"({100 * self._bar_count / self.cfg.warmup_bars:.0f}%)"
                         )
-                    # Publică bar chiar și în warm-up (pentru grafice)
                     self._publish_bar(bar, spread, zscore, spread_monitor, circuit_breaker, order_manager)
                     continue
 
-                # Publică warm-up complet la prima bara ready
                 if self._bar_count == self.cfg.warmup_bars:
                     self._publish_warmup_status(spread_monitor, coint_pvalue=0.0)
                     logger.info("[Warm-up] COMPLETE — trading enabled")
@@ -561,7 +599,6 @@ class BybitLiveRunner:
                         except Exception:
                             pass
 
-                # Circuit breaker check
                 if circuit_breaker.is_open():
                     logger.warning(
                         f"BybitLiveRunner: Circuit breaker OPEN | "
@@ -571,14 +608,12 @@ class BybitLiveRunner:
                     await asyncio.sleep(1.0)
                     continue
 
-                # Funding gate
                 if self.cfg.funding_gate_enabled:
                     if not self._check_funding_gate(ws_feed):
                         logger.info("BybitLiveRunner: Funding gate CLOSED")
                         self._publish_bar(bar, spread, zscore, spread_monitor, circuit_breaker, order_manager)
                         continue
 
-                # Decision
                 action = self._decide(
                     zscore=zscore,
                     spread=spread,
@@ -596,7 +631,6 @@ class BybitLiveRunner:
                         bar=bar,
                     )
 
-                # ── S20: Publică bar în state_bus după fiecare bar procesat ──
                 publish_counter += 1
                 if publish_counter >= self.cfg.state_bus_publish_interval:
                     self._publish_bar(
@@ -666,7 +700,9 @@ class BybitLiveRunner:
         from execution.bybit_order_router import OrderRequest, OrderSide, OrderType
 
         if self.cfg.dry_run:
-            logger.info(f"BybitLiveRunner: [DRY RUN] {action.upper()}")
+            logger.info(f"BybitLiveRunner: [DRY RUN] {action.upper()} "
+                        f"| {self.cfg.symbol_y}@{bar.price_y:.4f} "
+                        f"| {self.cfg.symbol_x}@{bar.price_x:.4f}")
             return
 
         try:
@@ -733,7 +769,7 @@ class BybitLiveRunner:
 
     async def run(self) -> int:
         """Full run: Phase 0 REST warm-up → build → start → trade."""
-        logger.info("BybitLiveRunner: ========== Starting Live Runner v3.1 ==========")
+        logger.info("BybitLiveRunner: ========== Starting Live Runner v3.2 ==========")
         logger.info(
             f"BybitLiveRunner: {self.cfg.symbol_y}/{self.cfg.symbol_x} | "
             f"interval={self.cfg.interval}m | dry_run={self.cfg.dry_run}"
@@ -745,9 +781,7 @@ class BybitLiveRunner:
             spread_monitor, circuit_breaker, order_manager, watchdog, notifier_bus,
         ) = await self._build_components(order_router, ws_feed)
 
-        # ── Phase 0: REST warm-up (S20 v3.1) ──────────────────────────────────
         await self._warmup_from_rest(spread_monitor)
-        # ──────────────────────────────────────────────────────────────────────
 
         if notifier_bus:
             await notifier_bus.send_alert(
