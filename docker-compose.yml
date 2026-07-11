@@ -1,14 +1,14 @@
-# QuantLuna — Docker Compose
+# QuantLuna — Docker Compose (production-ready)
 # Profiles: paper | live | dashboard | all
 #
 # Usage:
-#   docker compose --profile paper up --build
-#   docker compose --profile dashboard up --build
-#   docker compose --profile all up --build
+#   docker compose --profile paper up --build          # paper trading
+#   docker compose --profile live up --build           # LIVE TRADING (bani reali!)
+#   docker compose --profile all up --build            # paper + dashboard
+#   docker compose --profile live --profile dashboard up --build  # live + dashboard
 #
-# NOTE: 'paper' and 'live' both run `python main.py` with DRY_RUN env.
-# The FastAPI dashboard is a separate service (api/main.py via uvicorn).
-# All three join quantluna-net so the bot can push metrics to the API.
+# Secrete: toate credentialele vin din .env (nu se hardcodeaza aici)
+# Volumes: data/, state/, logs/ sunt montate din host pentru persistenta
 
 services:
 
@@ -22,32 +22,36 @@ services:
       target: production
     image: quantluna:latest
     container_name: quantluna-paper
-    # main.py reads SYMBOL_Y/SYMBOL_X from env; --dry-run forces paper mode
-    command: ["python", "main.py", "--dry-run", "--skip-health"]
+    command: ["python", "main.py", "--dry-run"]
     env_file: .env
     environment:
       - DRY_RUN=true
       - LOG_LEVEL=INFO
       - SYMBOL_Y=BTCUSDT
       - SYMBOL_X=ETHUSDT
+      - INTERVAL=5
+      - REST_WARMUP_ENABLED=true
+      - HEALTH_PORT=8081
+    ports:
+      - "8081:8081"   # runner health endpoint
     volumes:
       - ./data:/app/data
       - ./state:/app/state
       - ./logs:/app/logs
     restart: unless-stopped
     healthcheck:
-      # Probe: can Python import the bot's core modules without errors?
       test: ["CMD", "python", "-c",
-        "from execution.bybit_live_runner import BybitLiveRunnerConfig; BybitLiveRunnerConfig.from_env()"]
-      interval: 60s
-      timeout: 15s
+        "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8081/api/health',timeout=8); sys.exit(0 if r.status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 40s
     networks:
       - quantluna-net
 
   # --------------------------------------------------------------------------
-  # Live trader — REAL ORDERS, requires valid API keys in .env
+  # Live trader — ORDINE REALE — necesita API keys valide in .env
+  # Porneste DOAR cu: docker compose --profile live up
   # --------------------------------------------------------------------------
   live:
     profiles: [live]
@@ -61,18 +65,26 @@ services:
     environment:
       - DRY_RUN=false
       - LOG_LEVEL=INFO
+      - REST_WARMUP_ENABLED=true
+      - HEALTH_PORT=8081
+      - BYBIT_TESTNET=false
+    ports:
+      - "8081:8081"
     volumes:
       - ./data:/app/data
       - ./state:/app/state
       - ./logs:/app/logs
-    restart: unless-stopped
+    # restart: always — reporneste automat dupa crash sau restart server
+    restart: always
+    # Oprire gratiosa: asteapta max 30s pentru inchiderea pozitiilor deschise
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "python", "-c",
-        "from execution.bybit_live_runner import BybitLiveRunnerConfig; BybitLiveRunnerConfig.from_env()"]
-      interval: 60s
-      timeout: 15s
+        "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8081/api/health',timeout=8); sys.exit(0 if r.status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 60s    # mai mult timp pentru REST warm-up la pornire
     networks:
       - quantluna-net
 
@@ -86,7 +98,6 @@ services:
       target: production
     image: quantluna:latest
     container_name: quantluna-dashboard
-    # api/main.py is the FastAPI app; run via uvicorn, NOT python main.py
     command: [
       "uvicorn", "api.main:app",
       "--host", "0.0.0.0",
@@ -106,7 +117,7 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c",
-        "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+        "import urllib.request,sys; r=urllib.request.urlopen('http://localhost:8000/health',timeout=8); sys.exit(0 if r.status==200 else 1)"]
       interval: 30s
       timeout: 10s
       retries: 3

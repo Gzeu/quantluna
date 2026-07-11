@@ -5,13 +5,13 @@ on:
     tags:
       - "v*.*.*"
 
+permissions:
+  contents: write
+
 jobs:
   release:
-    name: Create GitHub Release
+    name: GitHub Release
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-
     steps:
       - uses: actions/checkout@v4
         with:
@@ -21,26 +21,25 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
-      - name: Extract changelog for this version
+      - name: Extract CHANGELOG section for this version
         id: changelog
         run: |
           VERSION=${{ steps.version.outputs.VERSION }}
-          # Extrage sectiunea din CHANGELOG.md pentru versiunea curenta
-          awk "/^## \\[$VERSION\\]/,/^## \\[/" CHANGELOG.md | head -n -1 > release_notes.md
-          echo "NOTES_FILE=release_notes.md" >> $GITHUB_OUTPUT
-
-      - name: Build distributable
-        run: |
-          pip install build
-          python -m build
+          awk "/^## \\[$VERSION\\]/{found=1; next} found && /^## \\[/{exit} found{print}" CHANGELOG.md > release_notes.txt
+          if [ ! -s release_notes.txt ]; then
+            echo "Release $VERSION" > release_notes.txt
+          fi
+          echo "NOTES<<EOF" >> $GITHUB_OUTPUT
+          cat release_notes.txt >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.version.outputs.VERSION }}
           name: "QuantLuna ${{ steps.version.outputs.VERSION }}"
-          body_path: release_notes.md
+          body: ${{ steps.changelog.outputs.NOTES }}
           draft: false
-          prerelease: ${{ contains(steps.version.outputs.VERSION, 'alpha') || contains(steps.version.outputs.VERSION, 'beta') || contains(steps.version.outputs.VERSION, 'rc') }}
-          files: dist/*
+          prerelease: ${{ contains(steps.version.outputs.VERSION, '-') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

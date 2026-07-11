@@ -2,7 +2,7 @@
 # QuantLuna — Multi-stage Docker build
 #
 # Stages:
-#   builder — compile wheels
+#   builder    — compile wheels
 #   production — minimal runtime image (~200MB)
 #
 # Usage:
@@ -14,7 +14,6 @@ FROM python:3.11-slim AS builder
 
 WORKDIR /build
 
-# System deps for compiling numpy / pandas extensions
 RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc g++ libffi-dev libssl-dev curl \
     && rm -rf /var/lib/apt/lists/*
@@ -31,7 +30,7 @@ LABEL org.opencontainers.image.title="QuantLuna" \
       org.opencontainers.image.source="https://github.com/Gzeu/quantluna" \
       org.opencontainers.image.licenses="MIT"
 
-# Non-root user for security
+# Non-root user pentru securitate
 RUN addgroup --system quantluna && adduser --system --ingroup quantluna quantluna
 
 WORKDIR /app
@@ -51,13 +50,21 @@ RUN mkdir -p /app/data /app/state /app/logs \
 
 USER quantluna
 
-# Health check — dashboard alive?
-HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')" || exit 1
+# Health check — runner HTTP health endpoint (port 8081)
+# Probe-ul loveste /api/health al runner-ului, nu dashboard-ul (8000)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
+    CMD python -c "
+import urllib.request, sys
+try:
+    r = urllib.request.urlopen('http://localhost:8081/api/health', timeout=8)
+    sys.exit(0 if r.status == 200 else 1)
+except Exception:
+    sys.exit(1)
+"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     LOG_LEVEL=INFO
 
 ENTRYPOINT ["python", "main.py"]
-CMD ["paper", "--pair", "BTCUSDT", "ETHUSDT"]
+CMD ["live", "--pair", "BTCUSDT", "ETHUSDT"]
