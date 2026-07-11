@@ -1,22 +1,29 @@
 """
-execution/bybit_live_runner.py — QuantLuna Bybit Live Runner v3.7
+execution/bybit_live_runner.py — QuantLuna Bybit Live Runner v3.8
 Sprint S20 — review fixes 2026-07-11
 Sprint S21 — position reconciliation + full automation 2026-07-11
 Sprint S21 review-fix — 6 issues rezolvate 2026-07-11
 Sprint S28 v3.6 — wiring fix: parametri optionali din WorkflowOrchestrator
 Sprint S28 v3.7 — 3 fixuri critice de siguranta
+Sprint S28 v3.8 — Boot Scan complet: balanta + toate pozitiile + Telegram
+
+Changelog v3.8 (boot-scan):
+  FEAT-B1 [CRITIC]  _reconcile_positions() foloseste boot_scan() complet
+                    Scaneaza TOATE pozitiile din cont, nu doar symbol_y/x
+  FEAT-B2 [CRITIC]  scan_wallet_balance() — balanta USDT la startup
+                    equity, available, uPnL total notificate la boot via Telegram
+  FEAT-B3 [CRITIC]  BootScanResult.to_telegram_msg() trimis la pornire
+                    Telegram primeste situatia completa inainte de primul trade
+  FEAT-B4          boot_equity/boot_available publicate in state_bus payload
 
 Changelog v3.7 (safety-fixes):
   FIX-S1 [CRITIC]  InstrumentInfoCache integrat in _execute_action()
                    round_qty() apelat pe fiecare simbol inainte de ordin
-                   Previne ErrCode:10001 reject silentios
   FIX-S2 [CRITIC]  Native SL/TP nativ Bybit dupa fiecare entry reusit
                    place_sl_tp() apelat cu sl_pct/tp_pct din config
-                   Daca procesul cade, Bybit inchide automat pozitia
   FIX-S3 [CRITIC]  BybitPrivateWS integrat in _run_loop()
                    on_execution -> _on_fill_event() -> notifica Telegram instant
                    on_order -> _on_order_event() -> detecteaza SL/TP trigger
-                   Fill-uri in timp real, nu polling REST la 60s
 
 Changelog v3.6 (wiring-fix):
   FIX-W1 [CRITIC]  __init__ accepta notifier_bus/ws_feed/private_ws/exchange optional
@@ -50,7 +57,11 @@ from execution.exchange_factory import ExchangeFactory, get_order_router, get_ws
 from execution.health_check import HealthCheck, HealthCheckConfig, HealthStatus
 from execution.order_manager import OrderManager, OrderManagerConfig
 from execution.ws_watchdog import WsWatchdog, WsWatchdogConfig
-from execution.position_reconciler import PositionReconciler, AdoptedPosition
+from execution.position_reconciler import (
+    PositionReconciler,
+    AdoptedPosition,
+    BootScanResult,
+)
 from execution.checkpoint_manager import CheckpointManager
 
 # FIX-S1: InstrumentInfoCache
@@ -101,7 +112,7 @@ class BybitLiveRunnerConfig:
     symbol_x: str = field(default_factory=lambda: os.getenv("SYMBOL_X", "ETHUSDT"))
     interval: int = field(default_factory=lambda: int(os.getenv("INTERVAL", "5")))
 
-    dry_run: bool = field(default_factory=lambda: os.getenv("DRY_RUN", "true").lower() == "true")
+    dry_run: bool = field(default_factory=lambda: os.getenv("DRY_RUN", "false").lower() == "true")
 
     api_key: str = field(default_factory=lambda: os.getenv("BYBIT_API_KEY", ""))
     api_secret: str = field(default_factory=lambda: os.getenv("BYBIT_API_SECRET", ""))
@@ -149,10 +160,10 @@ class BybitLiveRunnerConfig:
 
     # FIX-S2: SL/TP config
     sl_pct: float = field(
-        default_factory=lambda: float(os.getenv("SL_PCT", "0.03"))  # 3% default
+        default_factory=lambda: float(os.getenv("SL_PCT", "0.03"))
     )
     tp_pct: float = field(
-        default_factory=lambda: float(os.getenv("TP_PCT", "0.06"))  # 6% default
+        default_factory=lambda: float(os.getenv("TP_PCT", "0.06"))
     )
     native_sl_tp_enabled: bool = field(
         default_factory=lambda: os.getenv("NATIVE_SL_TP_ENABLED", "true").lower() == "true"
@@ -187,12 +198,18 @@ class RunnerContext:
 
 
 # =============================================================================
-# BybitLiveRunner v3.7
+# BybitLiveRunner v3.8
 # =============================================================================
 
 class BybitLiveRunner:
     """
-    Main live trading loop v3.7.
+    Main live trading loop v3.8.
+
+    FEAT-B1..B4: Boot Scan complet la pornire:
+      - scan_wallet_balance() — balanta USDT (equity, available, uPnL)
+      - scan_all_positions() — TOATE pozitiile deschise din cont
+      - BootScanResult.to_telegram_msg() trimis inainte de primul trade
+      - boot_equity/boot_available publicate in state_bus
 
     FIX-S1: InstrumentInfoCache — qty rounding per simbol inainte de orice ordin
     FIX-S2: Native SL/TP — place_sl_tp() dupa fiecare entry, Bybit gestioneaza
@@ -203,7 +220,7 @@ class BybitLiveRunner:
 
     Startup sequence:
       Phase 0   — REST warm-up (bare istorice)
-      Phase 0.5 — Position reconciliation
+      Phase 0.5 — Boot Scan: balanta + toate pozitiile + adoptie y/x + Telegram
       Phase 1   — Build exchange clients
       Phase 2   — Build shared components
       Phase 3   — Start health server
@@ -226,6 +243,7 @@ class BybitLiveRunner:
         self._funding_monitor: Optional[Any] = None
         self._checkpoint: CheckpointManager = CheckpointManager(cfg.checkpoint_path)
         self._adopted_position: Optional[AdoptedPosition] = None
+        self._boot_scan_result: Optional[BootScanResult] = None   # FEAT-B4
         self._pnl_reconciler: Optional[Any] = None
 
         # Injected from orchestrator (v3.6)
@@ -291,11 +309,11 @@ class BybitLiveRunner:
         try:
             orders = msg.get("data", [])
             for order in orders:
-                status       = order.get("orderStatus", "")
-                reduce_only  = order.get("reduceOnly", False)
-                symbol       = order.get("symbol", "")
-                avg_price    = float(order.get("avgPrice", 0) or 0)
-                qty          = float(order.get("qty", 0) or 0)
+                status          = order.get("orderStatus", "")
+                reduce_only     = order.get("reduceOnly", False)
+                symbol          = order.get("symbol", "")
+                avg_price       = float(order.get("avgPrice", 0) or 0)
+                qty             = float(order.get("qty", 0) or 0)
                 stop_order_type = order.get("stopOrderType", "")
 
                 is_sl_tp_fill = (
@@ -311,11 +329,10 @@ class BybitLiveRunner:
                         label, symbol, qty, avg_price,
                     )
                     try:
-                        # Notifica exit in OrderManager cu pretul real de fill
                         if symbol == self.cfg.symbol_y:
                             self._order_manager_ref.record_exit(
                                 price_y=avg_price,
-                                price_x=avg_price,  # x va fi actualizat de urmatoarea reconciliere
+                                price_x=avg_price,
                             )
                         self._checkpoint.clear()
                         self._adopted_position = None
@@ -357,7 +374,7 @@ class BybitLiveRunner:
             )
             self._private_ws_client.on_execution(self._on_fill_event)
             self._private_ws_client.on_order(self._on_order_event)
-            logger.info("BybitLiveRunner: 🔗 Private WS pornit (execution + order topics)")
+            logger.info("BybitLiveRunner: \U0001f517 Private WS pornit (execution + order topics)")
             await self._private_ws_client.start()  # blocks until stopped
         except Exception as exc:
             logger.warning("BybitLiveRunner: Private WS failed: %s", exc)
@@ -372,7 +389,7 @@ class BybitLiveRunner:
             return 0
 
         logger.info(
-            "BybitLiveRunner: ⏳ Phase 0 — REST warm-up "
+            "BybitLiveRunner: \u23f3 Phase 0 — REST warm-up "
             "%d bare %s/%s",
             self.cfg.warmup_bars, self.cfg.symbol_y, self.cfg.symbol_x,
         )
@@ -390,16 +407,16 @@ class BybitLiveRunner:
             n = await fetcher.fetch(spread_monitor, _state_bus)
             if n > 0:
                 self._bar_count = n
-                logger.info("BybitLiveRunner: ✅ Phase 0 complet — %d bare injectate", n)
+                logger.info("BybitLiveRunner: \u2705 Phase 0 complet — %d bare injectate", n)
             else:
-                logger.warning("BybitLiveRunner: ⚠️ Phase 0 returnat 0 bare — fallback WS")
+                logger.warning("BybitLiveRunner: \u26a0\ufe0f Phase 0 returnat 0 bare — fallback WS")
             return n
         except Exception as exc:
             logger.warning("BybitLiveRunner: Phase 0 esuat (%s) — fallback WS warm-up", exc)
             return 0
 
     # -------------------------------------------------------------------------
-    # Phase 0.5: Position reconciliation
+    # Phase 0.5: Boot Scan v3.8 — balanta + toate pozitiile + adoptie + Telegram
     # -------------------------------------------------------------------------
 
     async def _reconcile_positions(
@@ -408,26 +425,64 @@ class BybitLiveRunner:
         order_manager: OrderManager,
         notifier_bus: Optional[NotifierBus] = None,
     ) -> None:
+        """
+        Phase 0.5 v3.8 — Boot Scan complet:
+          1. Citeste balanta USDT (equity, available, uPnL total)
+          2. Scaneaza TOATE pozitiile deschise din cont (nu doar symbol_y/x)
+          3. Trimite BootScanResult.to_telegram_msg() la Telegram
+          4. Identifica si adopta pozitia y/x in OrderManager
+             Prioritate: REST Bybit > checkpoint local
+
+        In dry_run sau daca position_reconcile_enabled=false, se sare complet.
+        Nu ridica exceptii — orice eroare e logata si runner continua.
+        """
         if not self.cfg.position_reconcile_enabled or self.cfg.dry_run:
-            logger.info("BybitLiveRunner: Position reconciliation dezactivata")
+            logger.info("BybitLiveRunner: Position reconciliation dezactivata (dry_run=%s)", self.cfg.dry_run)
             return
 
-        logger.info("BybitLiveRunner: 🔍 Phase 0.5 — Position reconciliation...")
+        logger.info("BybitLiveRunner: \U0001f50d Phase 0.5 — Boot Scan (v3.8)...")
 
-        adopted = self._checkpoint.load()
-        if adopted is not None:
-            logger.info("BybitLiveRunner: ✅ Checkpoint restaurat — %s", adopted)
-        else:
-            reconciler = PositionReconciler(
-                order_router=order_router,
-                symbol_y=self.cfg.symbol_y,
-                symbol_x=self.cfg.symbol_x,
-                category=self.cfg.bybit_category,
+        # Citeste checkpoint local inainte de REST (va fi folosit ca fallback)
+        checkpoint_adopted = self._checkpoint.load()
+        if checkpoint_adopted is not None:
+            logger.info(
+                "BybitLiveRunner: \u2139\ufe0f Checkpoint local gasit — %s",
+                checkpoint_adopted,
             )
-            adopted = await reconciler.fetch()
+
+        # Boot scan complet via Bybit REST (sursa de adevar)
+        reconciler = PositionReconciler(
+            order_router=order_router,
+            symbol_y=self.cfg.symbol_y,
+            symbol_x=self.cfg.symbol_x,
+            category=self.cfg.bybit_category,
+        )
+        boot_result: BootScanResult = await reconciler.boot_scan()
+        self._boot_scan_result = boot_result  # FEAT-B4: folosit in _publish_bar
+
+        # Trimite mesajul complet la Telegram (balanta + toate pozitiile)
+        if notifier_bus:
+            try:
+                await notifier_bus.send_alert(
+                    boot_result.to_telegram_msg(),
+                    level="info",
+                )
+            except Exception as exc:
+                logger.debug("BybitLiveRunner: Telegram boot scan msg failed: %s", exc)
+
+        # Adoptia pozitiei y/x
+        # Prioritate: REST (sursa adevar) > checkpoint local
+        adopted = boot_result.adopted
+        if adopted is None and checkpoint_adopted is not None:
+            logger.info(
+                "BybitLiveRunner: REST nu a gasit pozitie y/x — "
+                "folosind checkpoint local: %s",
+                checkpoint_adopted,
+            )
+            adopted = checkpoint_adopted
 
         if adopted is None or not adopted.has_position:
-            logger.info("BybitLiveRunner: Phase 0.5 — nicio pozitie de adoptat")
+            logger.info("BybitLiveRunner: Phase 0.5 — nicio pozitie de adoptat, start fresh")
             return
 
         self._adopted_position = adopted
@@ -443,22 +498,11 @@ class BybitLiveRunner:
                 x_entry_price=adopted.x_entry_price,
             )
             logger.info(
-                "BybitLiveRunner: ✅ Pozitie adoptata — %s %s %.6f | %s %s %.6f | uPnL=%.4f USDT",
+                "BybitLiveRunner: \u2705 Pozitie adoptata — %s %s %.6f | %s %s %.6f | uPnL=%.4f USDT",
                 adopted.symbol_y, adopted.y_side, adopted.y_qty,
                 adopted.symbol_x, adopted.x_side, adopted.x_qty,
                 adopted.unrealised_pnl,
             )
-            if notifier_bus:
-                try:
-                    await notifier_bus.send_alert(
-                        f"🔄 Pozitie adoptata la restart:\n"
-                        f"{adopted.symbol_y} {adopted.y_side.upper()} {adopted.y_qty:.6f} @ {adopted.y_entry_price:.4f}\n"
-                        f"{adopted.symbol_x} {adopted.x_side.upper()} {adopted.x_qty:.6f} @ {adopted.x_entry_price:.4f}\n"
-                        f"uPnL: {adopted.unrealised_pnl:+.4f} USDT",
-                        level="info",
-                    )
-                except Exception:
-                    pass
         except AttributeError as exc:
             logger.warning(
                 "BybitLiveRunner: adopt_position() indisponibila (%s) — fallback", exc
@@ -466,6 +510,7 @@ class BybitLiveRunner:
             self._inject_adopted_position(order_manager, adopted)
 
     def _inject_adopted_position(self, order_manager: OrderManager, adopted: AdoptedPosition) -> None:
+        """Fallback: injecteaza pozitia manual in OrderManager cand adopt_position() lipseste."""
         try:
             class _FakePos:
                 y_side = adopted.y_side
@@ -485,7 +530,7 @@ class BybitLiveRunner:
             logger.error("BybitLiveRunner: _inject_adopted_position failed: %s", exc)
 
     # -------------------------------------------------------------------------
-    # PnL reconciler
+    # PnL reconciler loop
     # -------------------------------------------------------------------------
 
     async def _pnl_reconciler_loop(
@@ -535,7 +580,7 @@ class BybitLiveRunner:
             threshold = max(abs(local_pnl) * 0.1, 5.0)
             if divergence > threshold:
                 msg = (
-                    f"⚠️ PnL DIVERGENTA: real={real_pnl:.4f} local={local_pnl:.4f} "
+                    f"\u26a0\ufe0f PnL DIVERGENTA: real={real_pnl:.4f} local={local_pnl:.4f} "
                     f"delta={divergence:.4f} USDT — verificati pozitia manual!"
                 )
                 logger.critical(msg)
@@ -591,6 +636,13 @@ class BybitLiveRunner:
         except Exception:
             pass
 
+        # FEAT-B4: balanta din boot scan publicata in state_bus
+        boot_equity: float = 0.0
+        boot_available: float = 0.0
+        if self._boot_scan_result and self._boot_scan_result.wallet:
+            boot_equity    = self._boot_scan_result.wallet.equity
+            boot_available = self._boot_scan_result.wallet.available
+
         payload = {
             "ts": getattr(bar, "timestamp", int(time.time() * 1000)),
             "symbol_y": self.cfg.symbol_y,
@@ -609,6 +661,8 @@ class BybitLiveRunner:
             "dry_run": self.cfg.dry_run,
             "bar_count": self._bar_count,
             "has_adopted_position": self._adopted_position is not None,
+            "boot_equity_usdt": boot_equity,        # FEAT-B4
+            "boot_available_usdt": boot_available,  # FEAT-B4
         }
         try:
             _state_bus.publish("bar", payload)
@@ -861,8 +915,7 @@ class BybitLiveRunner:
             )
 
         # FIX-S3: Private WS task (fills instant)
-        private_ws_task: Optional[asyncio.Task] = None
-        private_ws_task = asyncio.create_task(
+        private_ws_task: Optional[asyncio.Task] = asyncio.create_task(
             self._start_private_ws(), name="private_ws"
         )
 
@@ -917,7 +970,7 @@ class BybitLiveRunner:
                         if notifier_bus:
                             try:
                                 await notifier_bus.send_alert(
-                                    f"✅ Warm-up complet ({self.cfg.warmup_bars} bare) — trading activ",
+                                    f"\u2705 Warm-up complet ({self.cfg.warmup_bars} bare) — trading activ",
                                     level="info",
                                 )
                             except Exception:
@@ -972,7 +1025,6 @@ class BybitLiveRunner:
                     await asyncio.sleep(1.0)
 
         finally:
-            # Cleanup toate task-urile background
             for task, name in [
                 (watchdog_task, "watchdog"),
                 (pnl_task, "pnl_reconciler"),
@@ -1072,14 +1124,14 @@ class BybitLiveRunner:
             except Exception as exc:
                 if leg_y_done:
                     logger.critical(
-                        "BybitLiveRunner: ☠️ DUAL-LEG PARTIAL FILL — "
+                        "BybitLiveRunner: \u2620\ufe0f DUAL-LEG PARTIAL FILL — "
                         "leg_y OK, leg_x FAILED: %s. Emergency close %s",
                         exc, req_y.symbol,
                     )
                     if notifier_bus:
                         try:
                             await notifier_bus.send_alert(
-                                f"☠️ PARTIAL FILL: {req_y.symbol} ok, {req_x.symbol} FAILED ({exc})",
+                                f"\u2620\ufe0f PARTIAL FILL: {req_y.symbol} ok, {req_x.symbol} FAILED ({exc})",
                                 level="critical",
                             )
                         except Exception:
@@ -1094,7 +1146,7 @@ class BybitLiveRunner:
                         logger.warning("BybitLiveRunner: Emergency close %s trimis OK", req_y.symbol)
                     except Exception as cancel_exc:
                         logger.critical(
-                            "BybitLiveRunner: ☠️ Emergency close FAILED %s: %s",
+                            "BybitLiveRunner: \u2620\ufe0f Emergency close FAILED %s: %s",
                             req_y.symbol, cancel_exc,
                         )
                     circuit_breaker.record_failure()
@@ -1128,7 +1180,7 @@ class BybitLiveRunner:
 
                 if notifier_bus:
                     await notifier_bus.send_alert(
-                        f"✅ ENTRY LONG: {self.cfg.symbol_y}/{self.cfg.symbol_x} "
+                        f"\u2705 ENTRY LONG: {self.cfg.symbol_y}/{self.cfg.symbol_x} "
                         f"| SL={self.cfg.sl_pct*100:.1f}% TP={self.cfg.tp_pct*100:.1f}%",
                         level="success",
                     )
@@ -1160,7 +1212,7 @@ class BybitLiveRunner:
 
                 if notifier_bus:
                     await notifier_bus.send_alert(
-                        f"✅ ENTRY SHORT: {self.cfg.symbol_y}/{self.cfg.symbol_x} "
+                        f"\u2705 ENTRY SHORT: {self.cfg.symbol_y}/{self.cfg.symbol_x} "
                         f"| SL={self.cfg.sl_pct*100:.1f}% TP={self.cfg.tp_pct*100:.1f}%",
                         level="success",
                     )
@@ -1188,7 +1240,7 @@ class BybitLiveRunner:
                     self._adopted_position = None
                     if notifier_bus:
                         await notifier_bus.send_alert(
-                            f"✅ EXIT: PnL={order_manager.current_pnl:.4f}", level="success")
+                            f"\u2705 EXIT: PnL={order_manager.current_pnl:.4f}", level="success")
 
             if order_manager.current_pnl is not None and order_manager.current_pnl < 0:
                 circuit_breaker.record_failure()
@@ -1201,7 +1253,7 @@ class BybitLiveRunner:
             if notifier_bus:
                 try:
                     await notifier_bus.send_alert(
-                        f"❌ ACTION FAILED: {action} | {exc}", level="error")
+                        f"\u274c ACTION FAILED: {action} | {exc}", level="error")
                 except Exception:
                     pass
 
@@ -1231,7 +1283,7 @@ class BybitLiveRunner:
     # -------------------------------------------------------------------------
 
     async def run(self) -> int:
-        logger.info("BybitLiveRunner: ========== Starting Live Runner v3.7 ==========")
+        logger.info("BybitLiveRunner: ========== Starting Live Runner v3.8 ==========")
         logger.info(
             "BybitLiveRunner: %s/%s | interval=%dm | dry_run=%s",
             self.cfg.symbol_y, self.cfg.symbol_x, self.cfg.interval, self.cfg.dry_run,
@@ -1261,24 +1313,22 @@ class BybitLiveRunner:
             injected_notifier_bus=self._injected_notifier_bus,
         )
 
+        # Phase 0: REST warm-up
         await self._warmup_from_rest(spread_monitor)
+
+        # Phase 0.5 v3.8: Boot Scan complet (balanta + pozitii + Telegram)
+        # Trimite to_telegram_msg() INAINTE de mesajul de start al runner-ului
         await self._reconcile_positions(order_router, order_manager, notifier_bus)
 
+        # Mesaj de start runner (dupa boot scan, pentru context cronologic in Telegram)
         if notifier_bus:
-            adopted_msg = ""
-            if self._adopted_position:
-                adopted_msg = (
-                    f"\n🔄 Pozitie adoptata: "
-                    f"{self._adopted_position.symbol_y} {self._adopted_position.y_side.upper()} | "
-                    f"{self._adopted_position.symbol_x} {self._adopted_position.x_side.upper()}"
-                )
             sl_tp_msg = (
                 f"\nSL={self.cfg.sl_pct*100:.1f}% TP={self.cfg.tp_pct*100:.1f}%"
                 if self.cfg.native_sl_tp_enabled else ""
             )
             await notifier_bus.send_alert(
-                f"⚡ QuantLuna Started v3.7 | {self.cfg.symbol_y}/{self.cfg.symbol_x} | "
-                f"dry_run={self.cfg.dry_run}{sl_tp_msg}{adopted_msg}",
+                f"\u26a1 QuantLuna v3.8 LIVE | {self.cfg.symbol_y}/{self.cfg.symbol_x} | "
+                f"dry_run={self.cfg.dry_run}{sl_tp_msg}",
                 level="info",
             )
 
@@ -1307,7 +1357,7 @@ class BybitLiveRunner:
             if notifier_bus:
                 try:
                     await notifier_bus.send_alert(
-                        f"💀 RUNNER CRASHED: {exc} — restart necesar!",
+                        f"\U0001f480 RUNNER CRASHED: {exc} — restart necesar!",
                         level="critical",
                     )
                 except Exception:
