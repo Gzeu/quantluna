@@ -18,6 +18,11 @@ Logica de selectie per bar:
   4. max score; daca sub min_score_threshold -> EXIT
   5. Switch: reset starea veche + switch_cooldown_bars
 
+Fix #2: generate_batch() accepta coint_pvalue_series in loc de valoare
+        hardcodata 0.05 — wired in MarketContext per bar.
+Fix #3: switch cooldown nu mai forteaza EXIT prematur — continua cu
+        strategia activa pe toata durata cooldown-ului.
+
 Usage:
   >>> from strategy.kalman_pairs_trading import KalmanPairsTrading
   >>> selector = AutoStrategySelector(strategies=[
@@ -161,7 +166,14 @@ class AutoStrategySelector:
         half_life_col: str = "half_life_hours",
         regime_col: Optional[str] = None,
         vol_rank_col: Optional[str] = None,
+        coint_pvalue_series: Optional[pd.Series] = None,
     ) -> pd.DataFrame:
+        """
+        Fix #2: added coint_pvalue_series parameter.
+        Previously coint_pvalue was hardcoded to 0.05 in the MarketContext
+        construction, making score() always use the wrong p-value in backtests.
+        Now extracted as a numpy array and wired per bar.
+        """
         df = df.copy()
         df["signal"] = int(Signal.EXIT)
         df["confidence"] = 0.0
@@ -170,23 +182,36 @@ class AutoStrategySelector:
         df["active_strategy"] = ""
         self.reset()
 
-        for i in range(len(df)):
-            row  = df.iloc[i]
-            z    = float(row.get(zscore_col, 0.0)) if zscore_col in df.columns else 0.0
-            sp   = float(row.get(spread_col, 0.0)) if spread_col in df.columns else 0.0
-            hl   = float(row.get(half_life_col, 24.0)) if half_life_col in df.columns else 24.0
-            fund = float(funding_annual.iloc[i]) if funding_annual is not None else 0.0
-            reg  = float(regime_multiplier.iloc[i]) if regime_multiplier is not None else 1.0
+        n = len(df)
+        # Fix #2: extract coint_pvalue as array instead of hardcoded 0.05
+        coint_p_arr = (
+            coint_pvalue_series.to_numpy(dtype=float)
+            if coint_pvalue_series is not None
+            else np.full(n, 0.05, dtype=float)
+        )
+        fund_arr = funding_annual.to_numpy(dtype=float) if funding_annual is not None else np.zeros(n, dtype=float)
+        reg_arr  = regime_multiplier.to_numpy(dtype=float) if regime_multiplier is not None else np.ones(n, dtype=float)
+        coint_arr = coint_valid_series.to_numpy(dtype=bool) if coint_valid_series is not None else np.ones(n, dtype=bool)
+
+        for i in range(n):
+            row = df.iloc[i]
+            z       = float(row.get(zscore_col, 0.0)) if zscore_col in df.columns else 0.0
+            sp      = float(row.get(spread_col, 0.0)) if spread_col in df.columns else 0.0
+            hl      = float(row.get(half_life_col, 24.0)) if half_life_col in df.columns else 24.0
+            fund    = float(fund_arr[i])
+            reg     = float(reg_arr[i])
             reg_str = str(row.get(regime_col, "ranging")) if regime_col else "ranging"
-            vr   = float(row.get(vol_rank_col, 0.5)) if vol_rank_col else 0.5
-            cok  = bool(coint_valid_series.iloc[i]) if coint_valid_series is not None else True
+            vr      = float(row.get(vol_rank_col, 0.5)) if vol_rank_col else 0.5
+            cok     = bool(coint_arr[i])
+            cp      = float(coint_p_arr[i])   # Fix #2: real per-bar coint p-value
 
             if sp != 0.0:
                 self._spread_buf.append(sp)
 
             context = MarketContext(
                 zscore=z, half_life_hours=hl, vol_rank=vr,
-                regime=reg_str, funding_annual=fund, coint_pvalue=0.05,
+                regime=reg_str, funding_annual=fund,
+                coint_pvalue=cp,                         # Fix #2
                 spread_autocorr=self._compute_autocorr(),
                 recent_win_rate=self._recent_win_rate(),
             )
@@ -242,11 +267,23 @@ class AutoStrategySelector:
     def _select(
         self, context: MarketContext
     ) -> Tuple[Optional[BaseStrategy], Dict[str, float]]:
+        """
+        Fix #3: during switch cooldown, always continue with the active strategy
+        (regardless of its current score) instead of forcing a premature EXIT.
+
+        Previously, if the active strategy's score dropped below min_score_threshold
+        during the cooldown window, _select() returned (None, scores) which caused
+        generate_live/batch to emit Signal.EXIT — closing positions incorrectly in
+        the first few bars after a strategy switch.
+
+        Now: the active strategy is returned unconditionally during cooldown so
+        that any in-progress trade is managed by the strategy that opened it.
+        """
         if self._switch_cooldown_remaining > 0:
             scores = {s.name: s.score(context) for s in self.strategies}
+            # Fix #3: return active strategy unconditionally during cooldown
             if self._active_strategy is not None:
-                if scores.get(self._active_name, 0.0) >= self.min_score_threshold:
-                    return self._active_strategy, scores
+                return self._active_strategy, scores
             return None, scores
 
         scores: Dict[str, float] = {}
