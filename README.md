@@ -37,12 +37,13 @@
 │  WsWatchdog         Checkpoint                              │
 │  AutoRebalancer     CorrelationFilter                       │
 │  DrawdownController KellyPositionSizer                      │
+│  DynamicStop        MultiPairAllocator                      │
 │                                                             │
 │  Backtest / Optimizer                                       │
 │  ────────────────────                                       │
 │  WalkForwardEngine   KalmanScoringWeights SearchSpace       │
-│  coint_pvalue_series (rolling ADF, per-bar)                 │
-│  Optuna TPE optimizer (16 ks_* params)                      │
+│  MonteCarlo          coint_pvalue_series (rolling ADF)      │
+│  Analytics           Optuna TPE optimizer (16 ks_* params)  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -83,15 +84,22 @@ quantluna/
 │   ├── kalman_pairs_trading.py   # KalmanPairsTrading BaseStrategy wrapper (v4.2)
 │   ├── auto_selector.py          # AutoStrategySelector — scorer + switcher
 │   ├── optimizer.py              # Optuna optimizer + KalmanScoringWeights SearchSpace
+│   ├── multi_strategy_engine.py  # Engine multi-strategie paralel
 │   ├── multi_timeframe.py        # Confirmare MTF (LTF + HTF)
 │   ├── regime_filter.py          # Gate unificat regim
 │   ├── regime_detector.py        # Detectie trend vs mean-reversion
 │   ├── pair_selector.py          # Selectie perechi cointegrate
 │   ├── live_pair_scanner.py      # Scanner live perechi
+│   ├── entry_filter.py           # Filtru intrare semnal
+│   ├── signal_adapter.py         # Adaptor semnale legacy → BaseStrategy
+│   ├── signal_combiner.py        # Combinator semnale multi-strategie
 │   ├── bb_mean_reversion.py      # Bollinger Bands mean reversion
 │   ├── zscore_momentum.py        # Z-score momentum strategy
 │   ├── funding_arb.py            # Funding rate arbitrage
-│   └── signal_combiner.py        # Combinator semnale multi-strategie
+│   ├── stat_arb.py               # Statistical arbitrage clasic
+│   ├── mean_reversion.py         # Mean reversion standalone
+│   ├── momentum.py               # Momentum standalone
+│   └── cointegration/            # Sub-modul cointegration dedicat
 │
 ├── execution/
 │   ├── order_manager.py          # Lifecycle comenzi multi-exchange
@@ -122,16 +130,19 @@ quantluna/
 │
 ├── risk/
 │   ├── circuit_breaker.py        # Circuit breaker auto-reset
-│   ├── kelly.py                  # Kelly criterion sizer
+│   ├── kelly.py                  # Kelly criterion (full)
+│   ├── kelly_sizer.py            # Kelly sizer wrapper
+│   ├── dynamic_stop.py           # Stop dinamic ATR/vol-based
 │   ├── portfolio_risk.py         # Risk management portofoliu
+│   ├── position_sizer.py         # Position sizer generic
+│   ├── position_sizer_factory.py # Factory position sizers
 │   ├── auto_rebalancer.py        # Auto-rebalancer pozitii
 │   ├── bybit_position_sizer.py   # Position sizer Bybit-specific
 │   ├── correlation_filter.py     # Filtru corelatie
 │   ├── correlation_matrix.py     # Matrice corelatie portofoliu
 │   ├── dashboard_engine.py       # Engine risk dashboard
 │   ├── drawdown_controller.py    # Controller drawdown
-│   ├── multi_pair_allocator.py   # Alocator multi-perechi
-│   └── position_sizer_factory.py # Factory position sizers
+│   └── multi_pair_allocator.py   # Alocator multi-perechi
 │
 ├── notifications/
 │   ├── notifier_bus.py           # Fan-out bus notificari
@@ -141,6 +152,10 @@ quantluna/
 │
 ├── backtest/
 │   ├── engine.py                 # WalkForwardEngine + coint_pvalue_series (FIX-BT-7)
+│   ├── engine_adapter.py         # Adaptor engine pentru strategii multiple
+│   ├── auto_selector_runner.py   # Runner AutoSelector in backtest
+│   ├── analytics.py              # Metrici performanta backtest
+│   ├── monte_carlo.py            # Simulari Monte Carlo
 │   ├── walk_forward.py           # Walk-forward validation
 │   ├── walk_forward_optimizer.py # Optimizare Optuna walk-forward
 │   └── report_builder.py         # Rapoarte HTML/JSON backtest
@@ -191,6 +206,7 @@ fastapi >= 0.111
 loguru >= 0.7
 pytest >= 8.0
 pytest-asyncio >= 0.23
+plotly >= 5.0
 ```
 
 ---
@@ -385,18 +401,18 @@ if not cb.is_open:
 
 ## Roadmap
 
-| Sprint | Status | Continut |
+| Sprint | Status | Conținut |
 |--------|--------|----------|
-| S1–S8  | ✅ Done | Core Kalman, Spread, Signal, Data fetching |
-| S9–S11 | ✅ Done | Cointegration (EG + Johansen), half-life |
-| S12–S15| ✅ Done | Backtest engine, Walk-forward, Report builder |
-| S14    | ✅ Done | Optuna optimizer |
-| S16    | ✅ Done | OKX router, Multi-timeframe, Vol regime, Dashboard API |
-| S17    | ✅ Done | OrderManager, CircuitBreaker, Slack, AdoptionEngine, ProfitOptimizer |
-| S18    | ✅ Done | SpreadMonitor, RegimeFilter, NotifierBus, `__init__` completat |
-| S19    | ✅ Done | KalmanScoringWeights SearchSpace, coint_pvalue_series rolling ADF, FIX-BT-7, Gap #1–#3 |
-| S20    | 🔲 Next | Prometheus metrics endpoint, alerting rules |
-| S21    | 🔲 Next | Web UI React dashboard (replace FastAPI Jinja) |
+| S1–S8  | ✅ Done | Core Kalman filter, Spread calculator, SignalGenerator, Data fetchers (Bybit/Binance/OKX) |
+| S9–S11 | ✅ Done | Cointegration (Engle-Granger + Johansen), Ornstein-Uhlenbeck half-life, `strategy/cointegration/` |
+| S12–S15| ✅ Done | Backtest engine, Walk-forward validation, Optuna optimizer, Report builder HTML/JSON, Analytics, Monte Carlo |
+| S16    | ✅ Done | OKX router, Multi-timeframe confirmare, VolatilityRegime, Dashboard API (FastAPI) |
+| S17    | ✅ Done | OrderManager multi-exchange, CircuitBreaker auto-reset, Slack notifier, AdoptionEngine, ProfitOptimizer, Kelly sizer, DynamicStop |
+| S18    | ✅ Done | SpreadMonitor real-time, RegimeFilter gatekeeper, NotifierBus fan-out, toate `__init__.py` completate |
+| S19    | ✅ Done | AutoStrategySelector + scoring, KalmanScoringWeights SearchSpace (16 params Optuna), coint_pvalue_series rolling ADF (FIX-BT-7), MultiStrategyEngine, SignalAdapter/Combiner, EntryFilter, Gap #1–#3 |
+| S20    | 🔲 Next | Prometheus `/metrics` endpoint, Grafana alerting rules, integrare FastAPI middleware |
+| S21    | 🔲 Next | Web UI React dashboard — live PnL charts, strategy scores vizuale, replace FastAPI Jinja |
+| S22    | 🔲 Next | End-to-end integration test suite, paper run automatizat 48h CI, smoke test live order flow (dry-run) |
 
 ---
 
