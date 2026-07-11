@@ -1,6 +1,7 @@
 """
 QuantLuna — BybitOrderRouter
 Sprint 27 + July 2026 improvements
+v3.5-compat: create_order / connect / place_market_order wrappers adaugate
 
 Execută ordine pe Bybit V5 Unified Account via pybit.
 API identic cu BinanceOrderRouter — plug-and-play prin ExchangeFactory.
@@ -15,6 +16,13 @@ Improvements (July 2026):
     instead of random.uniform (much more realistic paper simulation)
   - _instrument_cache extended to store minOrderQty + tickSize
   - cancel_all_orders() helper
+
+v3.5-compat (2026-07-11):
+  - connect()            — no-op async, necesar pentru order_router.connect() din runner
+  - create_order(req)    — dispatcher: accepta OrderRequest din order_manager.py
+  - place_market_order() — alias la market_order() cu interfata runner-compatibila
+  - place_limit_order()  — alias la limit_order() cu interfata runner-compatibila
+  - get_positions()      — alias la get_open_positions() pentru PositionReconciler
 
 Features:
   - Market + Limit orders pe Spot / Linear (USDT Perpetual)
@@ -41,7 +49,7 @@ import math
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +71,18 @@ class OrderReceipt:
     exchange: str = "bybit"
     reduce_only: bool = False
 
+    # ---- dict-like access pentru OrderManager.submit() care face resp.get(...) ----
+    def get(self, key: str, default: Any = None) -> Any:
+        mapping = {
+            "id":        self.order_id,
+            "orderId":   self.order_id,
+            "average":   self.avg_price,
+            "price":     self.avg_price,
+            "filled":    self.filled_qty,
+            "status":    self.status,
+        }
+        return mapping.get(key, default)
+
 
 @dataclass
 class _InstrumentInfo:
@@ -72,11 +92,13 @@ class _InstrumentInfo:
 
 
 class BybitOrderRouter:
+    """
     Bybit V5 order router cu retry, qty + price rounding, reduce-only support.
     Mode este controlat de EXCHANGE_MODE env var:
       paper  - simulare locala
       dry    - loguri fara ordin real
       live   - ordin real pe Bybit
+    """
 
     def __init__(
         self,
@@ -94,15 +116,131 @@ class BybitOrderRouter:
         self._client = None
         self._instrument_cache: dict[str, _InstrumentInfo] = {}
 
-    def _get_client(self):
-        if self._client is None:
-            from pybit.unified_trading import HTTP
-            self._client = HTTP(
-                testnet=self.testnet,
-                api_key=self.api_key,
-                api_secret=self.api_secret,
+    # -------------------------------------------------------------------------
+    # v3.5-compat: connect() — apelat din bybit_live_runner.run() inainte de
+    # reconciliere REST. pybit HTTP e sync/stateless, deci e no-op.
+    # -------------------------------------------------------------------------
+
+    async def connect(self) -> None:
+        """No-op: pybit HTTP session e lazy-initialized la primul request."""
+        logger.info(
+            f"BybitOrderRouter: connect() — mode={self.mode} "
+            f"testnet={self.testnet} category={self.category}"
+        )
+        # Pre-warm client so first order has no extra latency
+        if self.mode == "live":
+            try:
+                _ = self._get_client()
+                logger.info("BybitOrderRouter: pybit HTTP client initialized")
+            except Exception as exc:
+                logger.warning(f"BybitOrderRouter: connect() pre-warm failed: {exc}")
+
+    # -------------------------------------------------------------------------
+    # v3.5-compat: create_order(req) — interfata unica pentru runner
+    # Accepta un obiect cu atributele: symbol, side, order_type, qty, price
+    # -------------------------------------------------------------------------
+
+    async def create_order(self, req: Any) -> OrderReceipt:
+        """
+        Dispatcher universal — accepta OrderRequest din order_manager.py sau
+        orice obiect cu atributele: symbol, side, order_type, qty, price.
+
+        Apelat din bybit_live_runner._execute_action().
+        """
+        symbol     = getattr(req, "symbol", None)
+        side       = getattr(req, "side", "Buy")
+        order_type = getattr(req, "order_type", "market")
+        qty        = float(getattr(req, "qty", 0.0))
+        price      = getattr(req, "price", None)
+        reduce_only = bool(getattr(req, "reduce_only", False))
+        post_only   = bool(getattr(req, "post_only", False))
+
+        if symbol is None:
+            raise ValueError("create_order: req.symbol este None")
+
+        # Normalizeaza side: OrderSide enum / string → 'Buy' | 'Sell'
+        side_str = str(side.value if hasattr(side, "value") else side).lower()
+        bybit_side = "Buy" if side_str in ("buy", "long") else "Sell"
+
+        # Normalizeaza order_type
+        otype_str = str(
+            order_type.value if hasattr(order_type, "value") else order_type
+        ).lower()
+
+        if otype_str == "limit" and price is not None and float(price) > 0:
+            return await self.limit_order(
+                symbol=symbol,
+                side=bybit_side,
+                qty=qty,
+                price=float(price),
+                reduce_only=reduce_only,
+                post_only=post_only,
             )
-        return self._client
+        else:
+            return await self.market_order(
+                symbol=symbol,
+                side=bybit_side,
+                qty=qty,
+                reduce_only=reduce_only,
+            )
+
+    # -------------------------------------------------------------------------
+    # v3.5-compat: place_market_order / place_limit_order
+    # Interfata folosita de OrderManager.submit() intern
+    # -------------------------------------------------------------------------
+
+    async def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        reduce_only: bool = False,
+        client_order_id: Optional[str] = None,
+    ) -> OrderReceipt:
+        """Alias la market_order() — interfata OrderManager-compatibila."""
+        return await self.market_order(symbol, side, qty, reduce_only=reduce_only)
+
+    async def place_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        price: float,
+        reduce_only: bool = False,
+        post_only: bool = False,
+        client_order_id: Optional[str] = None,
+    ) -> OrderReceipt:
+        """Alias la limit_order() — interfata OrderManager-compatibila."""
+        return await self.limit_order(
+            symbol, side, qty, price,
+            reduce_only=reduce_only, post_only=post_only,
+        )
+
+    # -------------------------------------------------------------------------
+    # v3.5-compat: get_positions() — alias pentru PositionReconciler
+    # PositionReconciler face: router.get_positions(symbol)
+    # -------------------------------------------------------------------------
+
+    async def get_positions(self, symbol: Optional[str] = None) -> dict:
+        """
+        Alias folosit de PositionReconciler._get_position().
+        Returneaza dict cu structura: {"result": {"list": [...]}}
+        """
+        positions = await self.get_open_positions(symbol)
+        return {"result": {"list": [
+            {
+                "symbol":        p.get("symbol"),
+                "side":          p.get("side"),
+                "size":          str(p.get("size", 0)),
+                "avgPrice":      str(p.get("entryPrice", 0)),
+                "unrealisedPnl": str(p.get("unrealisedPnl", 0)),
+            }
+            for p in positions
+        ]}}
+
+    # -------------------------------------------------------------------------
+    # Core order methods
+    # -------------------------------------------------------------------------
 
     async def market_order(
         self,
@@ -178,12 +316,12 @@ class BybitOrderRouter:
             positions = resp.get("result", {}).get("list", [])
             return [
                 {
-                    "symbol": p.get("symbol"),
-                    "side": p.get("side"),
-                    "size": float(p.get("size", 0)),
-                    "entryPrice": float(p.get("avgPrice") or p.get("entryPrice", 0)),
+                    "symbol":        p.get("symbol"),
+                    "side":          p.get("side"),
+                    "size":          float(p.get("size", 0)),
+                    "entryPrice":    float(p.get("avgPrice") or p.get("entryPrice", 0)),
                     "unrealisedPnl": float(p.get("unrealisedPnl", 0)),
-                    "leverage": float(p.get("leverage", 1)),
+                    "leverage":      float(p.get("leverage", 1)),
                 }
                 for p in positions
                 if float(p.get("size", 0)) > 0
@@ -197,7 +335,13 @@ class BybitOrderRouter:
             return await self.get_open_positions(None)
         if isinstance(symbol, list):
             all_positions = await self.get_open_positions(None)
-            return [p for p in all_positions if p.get("symbol") in [s.upper().replace("/USDT:USDT", "USDT").replace("/", "") for s in symbol]]
+            return [
+                p for p in all_positions
+                if p.get("symbol") in [
+                    s.upper().replace("/USDT:USDT", "USDT").replace("/", "")
+                    for s in symbol
+                ]
+            ]
         return await self.get_open_positions(symbol)
 
     async def fetch_funding_rate(self, symbol: str) -> Optional[dict]:
@@ -218,6 +362,20 @@ class BybitOrderRouter:
         except Exception as e:
             logger.error(f"fetch_funding_rate failed for {symbol}: {e}")
             return None
+
+    # -------------------------------------------------------------------------
+    # Internal
+    # -------------------------------------------------------------------------
+
+    def _get_client(self):
+        if self._client is None:
+            from pybit.unified_trading import HTTP
+            self._client = HTTP(
+                testnet=self.testnet,
+                api_key=self.api_key,
+                api_secret=self.api_secret,
+            )
+        return self._client
 
     async def _place(
         self,
