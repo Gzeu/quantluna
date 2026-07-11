@@ -1,5 +1,14 @@
 """
-execution/workflow_orchestrator.py  -  QuantLuna Startup Workflow Orchestrator v3
+execution/workflow_orchestrator.py  -  QuantLuna Startup Workflow Orchestrator v3.1
+
+Sprint 28 -> v3.1 (2026-07-11):
+  FIX-O1 [CRITIC] _build_runner() — eliminat parametrul exchange= invalid
+                  BybitLiveRunner.__init__ nu accepta exchange= (isi construieste
+                  order_router intern in _build_exchange_via_factory())
+                  Inlocuit cu notifier_bus=, ws_feed=, private_ws= care sunt
+                  acceptati de v3.6 __init__
+  FIX-O2 [MEDIU]  start_runner() — log explicit cand runner-ul e injectat extern
+                  vs construit de orchestrator
 
 Sprint 28 -> v3 (2026-07-11):
   Orchestratorul complet care leaga TOATE modulele existente:
@@ -10,7 +19,7 @@ Sprint 28 -> v3 (2026-07-11):
   FAZA 3: Adoptie pozitii orfane       <- adoption_engine.AdoptionEngine
   FAZA 4: Initializare ProfitOptimizer <- profit_optimizer.ProfitOptimizer
   FAZA 5: Pornire BybitLiveRunner      <- bybit_live_runner.BybitLiveRunner
-  FAZA 6: Dashboard health ping        <- Next.js :3000 + FastAPI :8000  [NOU v3]
+  FAZA 6: Dashboard health ping        <- Next.js :3000 + FastAPI :8000
 
   Subsisteme integrate:
   - ExchangeFactory  : instanta CCXT shared pentru toate fazele
@@ -18,7 +27,7 @@ Sprint 28 -> v3 (2026-07-11):
   - EmergencyStop    : apelat la halt (FAZA 0 sau FAZA 2)
   - NotifierBus      : inlocuieste live_trader._send_alert
   - StateBus         : bot publica RiskDashboardEngine -> API il citeste
-  - Dashboard        : ping Next.js + FastAPI la startup [NOU v3]
+  - Dashboard        : ping Next.js + FastAPI la startup
 
 Usage (din main.py)::
 
@@ -37,7 +46,6 @@ from typing import Awaitable, Callable, List, Optional
 
 from loguru import logger
 
-# Timeout / retry config pentru ping dashboard in FAZA 6
 _DASHBOARD_PING_RETRIES = 3
 _DASHBOARD_PING_DELAY_S = 2.0
 _DASHBOARD_PING_TIMEOUT_S = 5.0
@@ -56,13 +64,11 @@ class StartupContext:
     should_halt: bool = False
     halt_reason: str = ""
 
-    # FAZA 6 - rezultate ping dashboard [v3]
     dashboard_api_ok: bool = False
     dashboard_frontend_ok: bool = False
 
     @property
     def has_adopted_positions(self) -> bool:
-        """True if any position was adopted or placed under monitoring."""
         try:
             from execution.adoption_engine import AdoptionDecision
             return any(
@@ -74,7 +80,6 @@ class StartupContext:
 
     @property
     def adopted_count(self) -> int:
-        """Number of adopted/monitored positions."""
         try:
             from execution.adoption_engine import AdoptionDecision
             return sum(
@@ -88,7 +93,6 @@ class StartupContext:
 
     @property
     def closed_count(self) -> int:
-        """Number of positions closed during adoption phase."""
         try:
             from execution.adoption_engine import AdoptionDecision
             return sum(
@@ -101,13 +105,9 @@ class StartupContext:
 
 class WorkflowOrchestrator:
     """
-    Orchestrator complet Sprint 28 -> v3.
+    Orchestrator complet Sprint 28 -> v3.1.
 
     Preferred constructor: ``WorkflowOrchestrator.from_runner_cfg(cfg, bus)``
-
-    Manual constructor for tests::
-
-        WorkflowOrchestrator(exchange=..., ...)
     """
 
     def __init__(
@@ -125,7 +125,6 @@ class WorkflowOrchestrator:
         dashboard_api_url: str = "",
         dashboard_frontend_url: str = "",
     ) -> None:
-        """Initialise orchestrator. Prefer from_runner_cfg() over direct init."""
         self._exchange = exchange
         self._checkpoint_path = checkpoint_path
         self._bus = notifier_bus
@@ -136,7 +135,6 @@ class WorkflowOrchestrator:
         self._private_ws = private_ws
         self._ws_feed = ws_feed
         self._skip_health = skip_health_check
-        # URL-uri dashboard - citite din env daca nu sunt furnizate explicit
         self._dashboard_api_url = (
             dashboard_api_url
             or os.getenv("DASHBOARD_API_URL", "http://localhost:8000")
@@ -157,24 +155,6 @@ class WorkflowOrchestrator:
         dashboard_api_url: str = "",
         dashboard_frontend_url: str = "",
     ) -> "WorkflowOrchestrator":
-        """
-        Build orchestrator from a BybitLiveRunnerConfig.
-
-        Exchange is built lazily via ExchangeFactory inside
-        run_startup_workflow so that any auth errors surface there with
-        full context instead of at import time.
-
-        Args:
-            cfg: BybitLiveRunnerConfig instance.
-            notifier_bus: NotifierBus instance (optional).
-            ws_feed: WebSocket feed (optional).
-            private_ws: Private WebSocket (optional).
-            skip_health_check: Skip FAZA 0 pre-flight checks.
-            dashboard_api_url: Override URL FastAPI dashboard
-                (default: $DASHBOARD_API_URL sau http://localhost:8000).
-            dashboard_frontend_url: Override URL Next.js frontend
-                (default: $DASHBOARD_FRONTEND_URL sau http://localhost:3000).
-        """
         return cls(
             exchange=None,
             checkpoint_path=cfg.checkpoint_path,
@@ -188,21 +168,13 @@ class WorkflowOrchestrator:
         )
 
     async def run_startup_workflow(self) -> StartupContext:
-        """
-        Execute all startup phases and return a StartupContext.
-
-        If ``should_halt`` is True on return, EmergencyStop has already
-        been called and the caller should exit immediately.
-        """
         ctx = StartupContext()
         sep = "=" * 60
 
         logger.info(sep)
         logger.info("[Orchestrator] QuantLuna startup workflow START")
 
-        # ----------------------------------------------------------------
         # FAZA 0: HealthCheck
-        # ----------------------------------------------------------------
         if not self._skip_health:
             logger.info("[Orchestrator] FAZA 0: HealthCheck pre-flight")
             ctx.health_report = await self._run_health_check()
@@ -223,9 +195,7 @@ class WorkflowOrchestrator:
         if self._exchange is None:
             self._exchange = await self._build_shared_exchange()
 
-        # ----------------------------------------------------------------
         # FAZA 1: Scan pozitii
-        # ----------------------------------------------------------------
         logger.info("[Orchestrator] FAZA 1: Scan pozitii exchange")
         try:
             from execution.position_scanner import PositionScanner
@@ -237,9 +207,7 @@ class WorkflowOrchestrator:
         except Exception as exc:
             logger.error("[Orchestrator] Scan failed: {} - skip", exc)
 
-        # ----------------------------------------------------------------
         # FAZA 2: Reconciliere checkpoint
-        # ----------------------------------------------------------------
         logger.info("[Orchestrator] FAZA 2: Reconciliere checkpoint")
         try:
             from execution.resume_manager import ResumeManager
@@ -263,9 +231,7 @@ class WorkflowOrchestrator:
         except Exception as exc:
             logger.error("[Orchestrator] Reconciliere failed: {} - continuam", exc)
 
-        # ----------------------------------------------------------------
         # FAZA 3: Adoptie pozitii orfane
-        # ----------------------------------------------------------------
         has_orphans = (
             ctx.scan_report is not None
             and getattr(ctx.scan_report, "has_orphans", False)
@@ -299,9 +265,7 @@ class WorkflowOrchestrator:
         else:
             logger.info("[Orchestrator] FAZA 3: Nicio pozitie orfana - skip")
 
-        # ----------------------------------------------------------------
         # FAZA 4: ProfitOptimizer
-        # ----------------------------------------------------------------
         if ctx.has_adopted_positions:
             logger.info(
                 "[Orchestrator] FAZA 4: ProfitOptimizer ({} pozitii)",
@@ -332,14 +296,10 @@ class WorkflowOrchestrator:
                 )
         else:
             logger.info(
-                "[Orchestrator] FAZA 4: Nicio pozitie adoptata - optimizer idle"
+                "[Orchestrator] FAZA 4: Nicio pozitie adoptata — optimizer idle"
             )
 
-        # ----------------------------------------------------------------
-        # FAZA 6: Dashboard health ping - Next.js :3000 + FastAPI :8000
-        # Non-blocking: runner porneste chiar daca dashboard-ul nu e UP.
-        # Util pentru dev local fara docker-compose --profile dashboard.
-        # ----------------------------------------------------------------
+        # FAZA 6: Dashboard health ping
         logger.info("[Orchestrator] FAZA 6: Dashboard health ping")
         ctx.dashboard_api_ok = await self._ping_url(
             f"{self._dashboard_api_url}/api/health",
@@ -352,7 +312,7 @@ class WorkflowOrchestrator:
 
         if ctx.dashboard_api_ok and ctx.dashboard_frontend_ok:
             logger.info(
-                "[Orchestrator] FAZA 6: Dashboard FULL UP - API={} UI={}",
+                "[Orchestrator] FAZA 6: Dashboard FULL UP — API={} UI={}",
                 self._dashboard_api_url,
                 self._dashboard_frontend_url,
             )
@@ -370,13 +330,11 @@ class WorkflowOrchestrator:
             )
         else:
             logger.info(
-                "[Orchestrator] FAZA 6: Dashboard offline - runner porneste fara UI. "
+                "[Orchestrator] FAZA 6: Dashboard offline — runner porneste fara UI. "
                 "Porneste cu: docker compose --profile dashboard up"
             )
 
-        # ----------------------------------------------------------------
         # Startup complet
-        # ----------------------------------------------------------------
         dashboard_status = (
             f"UI: {self._dashboard_frontend_url}" if ctx.dashboard_frontend_ok
             else "UI offline"
@@ -386,7 +344,7 @@ class WorkflowOrchestrator:
             else "API offline"
         )
         logger.info(
-            "[Orchestrator] Startup workflow COMPLET - runner poate porni | {} | {}",
+            "[Orchestrator] Startup workflow COMPLET | {} | {}",
             dashboard_status, api_status,
         )
         logger.info(sep)
@@ -405,15 +363,9 @@ class WorkflowOrchestrator:
         ctx: StartupContext,
         price_feed_callback: Optional[Callable[[], Awaitable[dict]]] = None,
     ) -> None:
-        """
-        FAZA 5: Porneste BybitLiveRunner si (optional) optimizer loop.
-
-        ``price_feed_callback`` - ``async () -> Dict[symbol, price]``.
-        If None and adopted positions exist, a simple CCXT poller is used.
-        """
         if ctx.should_halt:
             logger.error(
-                "[Orchestrator] start_runner: context HALT - nu pornesc runner"
+                "[Orchestrator] start_runner: context HALT — nu pornesc runner"
             )
             return
 
@@ -421,7 +373,11 @@ class WorkflowOrchestrator:
 
         runner = self._runner
         if runner is None:
+            # FIX-O1: _build_runner() foloseste acum parametrii corecti
             runner = self._build_runner()
+            logger.info("[Orchestrator] Runner construit intern de orchestrator")
+        else:
+            logger.info("[Orchestrator] Runner injectat extern — folosit direct")
 
         tasks = [
             asyncio.create_task(runner.start(), name="bybit_live_runner")
@@ -440,7 +396,7 @@ class WorkflowOrchestrator:
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
-            logger.info("[Orchestrator] Tasks cancelled - stopping runner")
+            logger.info("[Orchestrator] Tasks cancelled — stopping runner")
             await runner.stop()
         except Exception as exc:
             logger.error("[Orchestrator] Runner error: {}", exc)
@@ -453,7 +409,6 @@ class WorkflowOrchestrator:
         price_feed_callback: Callable[[], Awaitable[dict]],
         poll_interval_s: float = 1.0,
     ) -> None:
-        """Background loop that ticks the ProfitOptimizer on every price update."""
         if not ctx.optimizer or ctx.optimizer.active_count == 0:
             logger.info(
                 "[Orchestrator] Optimizer loop: nicio pozitie de monitorizat"
@@ -498,12 +453,6 @@ class WorkflowOrchestrator:
         delay_s: float = _DASHBOARD_PING_DELAY_S,
         timeout_s: float = _DASHBOARD_PING_TIMEOUT_S,
     ) -> bool:
-        """
-        Ping un URL HTTP cu retry. Returneaza True daca raspunde cu status < 500.
-
-        Non-blocking fata de startup - esecul nu opreste runner-ul.
-        Folosit in FAZA 6 pentru a verifica daca dashboard-ul e UP.
-        """
         import urllib.request
         import urllib.error
 
@@ -530,10 +479,9 @@ class WorkflowOrchestrator:
         return False
 
     async def _run_health_check(self):
-        """Run HealthCheck against current runner config."""
         cfg = self._runner_cfg
         if cfg is None:
-            logger.warning("[Orchestrator] No runner_cfg - skipping HealthCheck")
+            logger.warning("[Orchestrator] No runner_cfg — skipping HealthCheck")
             return None
         try:
             from execution.health_check import HealthCheck, HealthConfig
@@ -554,7 +502,6 @@ class WorkflowOrchestrator:
             return None
 
     async def _build_shared_exchange(self):
-        """Build a shared CCXT router via ExchangeFactory."""
         try:
             from execution.exchange_factory import get_order_router
             return get_order_router(
@@ -573,20 +520,25 @@ class WorkflowOrchestrator:
             return None
 
     def _build_runner(self):
-        """Instantiate BybitLiveRunner from stored runner_cfg."""
+        """
+        FIX-O1: Instanta BybitLiveRunner v3.6 cu parametrii corecti.
+
+        BybitLiveRunner.__init__(cfg, notifier_bus=, ws_feed=, private_ws=)
+        NB: exchange= NU e un parametru valid — runner-ul isi construieste
+        intern order_router via _build_exchange_via_factory().
+        """
         from execution.bybit_live_runner import BybitLiveRunner
         return BybitLiveRunner(
             cfg=self._runner_cfg,
-            exchange=self._exchange,
-            private_ws=self._private_ws,
-            ws_feed=self._ws_feed,
-            notifier_bus=self._bus,
+            notifier_bus=self._bus,        # FIX-O1: injectat corect
+            ws_feed=self._ws_feed,         # FIX-O1: injectat corect
+            private_ws=self._private_ws,   # FIX-O1: injectat corect
+            # exchange= eliminat — parametru inexistent in BybitLiveRunner
         )
 
     def _make_price_callback(
         self, symbols: list
     ) -> Callable[[], Awaitable[dict]]:
-        """Fallback CCXT ticker poller used when no feed callback is supplied."""
         exchange = self._exchange
 
         async def _poll() -> dict:
@@ -604,7 +556,6 @@ class WorkflowOrchestrator:
         return _poll
 
     async def _alert(self, message: str) -> None:
-        """Send alert via NotifierBus, silently ignore failures."""
         if not self._bus:
             return
         try:
@@ -613,7 +564,6 @@ class WorkflowOrchestrator:
             logger.warning("[Orchestrator] alert failed: {}", exc)
 
     async def _emergency_stop(self, reason: str) -> None:
-        """Trigger EmergencyStop, silently ignore failures."""
         try:
             from execution.emergency_stop import EmergencyStop
             es = EmergencyStop(

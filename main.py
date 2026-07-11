@@ -23,6 +23,7 @@ Env vars (all optional, have defaults):
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SLACK_WEBHOOK_URL
     HEALTH_PORT, FUNDING_GATE_ENABLED, PNL_RECONCILER_ENABLED
     MARKET_TRADE_ENABLED, CHECKPOINT_PATH, INITIAL_CAPITAL
+    DASHBOARD_API_URL, DASHBOARD_FRONTEND_URL
     See BybitLiveRunnerConfig.from_env() for full list.
 
 Flow:
@@ -31,14 +32,22 @@ Flow:
     3. Build NotifierBus (Telegram + Slack)
     4. Build BybitWsFeed
     5. Wire RiskDashboardEngine into StateBus + api/risk singleton
-    6. WorkflowOrchestrator.run_startup_workflow()
+    6. WorkflowOrchestrator.from_runner_cfg(cfg, notifier_bus, ws_feed)
        Faza 0: HealthCheck -> halt on critical failure
        Faza 1: PositionScanner
        Faza 2: ResumeManager
        Faza 3: AdoptionEngine
        Faza 4: ProfitOptimizer
+       Faza 6: Dashboard health ping
     7. WorkflowOrchestrator.start_runner() -> blocks
-       Faza 5: BybitLiveRunner + optimizer loop in background
+       Faza 5: BybitLiveRunner v3.6 (notifier_bus + ws_feed injectate)
+               + optimizer loop in background
+
+FIX (2026-07-11):
+    main.py transmite acum notifier_bus si ws_feed la from_runner_cfg()
+    astfel incat orchestratorul le injecteaza in BybitLiveRunner prin
+    _build_runner() -> BybitLiveRunner(cfg=, notifier_bus=, ws_feed=)
+    Evita reconstructia duplicata de NotifierBus si WsFeed in runner.
 """
 from __future__ import annotations
 
@@ -116,15 +125,6 @@ def _configure_logging(level: str) -> None:
 
 
 def _wire_dashboard_engine(cfg, state_bus) -> None:
-    """
-    Create a RiskDashboardEngine and inject it into both:
-      - core.state_bus.bus  (so api/risk.py reads live data)
-      - api.risk singleton  (direct ref for MultiPairManager / tests)
-
-    Called once after config is loaded, before the orchestrator starts.
-    The engine starts empty; BybitLiveRunner populates it via
-    bus.risk_engine.record_trade() as trades close.
-    """
     try:
         from risk.dashboard_engine import RiskDashboardEngine
         initial_capital = float(
@@ -133,12 +133,11 @@ def _wire_dashboard_engine(cfg, state_bus) -> None:
         )
         engine = RiskDashboardEngine(initial_capital=initial_capital)
         state_bus.set_risk_engine(engine)
-        # Also inject into api/risk module-level singleton
         try:
             from api.risk import set_risk_engine
             set_risk_engine(engine)
         except Exception:
-            pass  # api not imported in this process — ok
+            pass
         logger.info(
             "main: RiskDashboardEngine wired (capital={:.0f} USDT)",
             initial_capital,
@@ -200,17 +199,6 @@ def _install_signal_handlers(
     loop: asyncio.AbstractEventLoop,
     shutdown_event: asyncio.Event,
 ) -> None:
-    """
-    Install SIGTERM and SIGINT handlers on the asyncio event loop.
-
-    Why this matters for Docker/systemd:
-      - ``docker stop`` sends SIGTERM. Without a handler, Python ignores it
-        and Docker escalates to SIGKILL after 10s, skipping graceful cleanup
-        (open positions, flush logs, checkpointing).
-      - systemd ``systemctl stop`` also sends SIGTERM first.
-      - We set the shutdown_event so the main coroutine can detect it and
-        trigger an orderly teardown (close positions, flush state, notify).
-    """
     def _handle_signal(sig: signal.Signals) -> None:
         logger.warning("main: received {} — initiating graceful shutdown", sig.name)
         shutdown_event.set()
@@ -219,27 +207,20 @@ def _install_signal_handlers(
         try:
             loop.add_signal_handler(sig, _handle_signal, sig)
         except (NotImplementedError, RuntimeError):
-            # Windows does not support add_signal_handler on the event loop.
             signal.signal(sig, lambda s, _: _handle_signal(signal.Signals(s)))
 
 
 async def main() -> int:
     args = _parse_args()
 
-    # FIX: create logs/ BEFORE _configure_logging() to avoid a race condition
-    # where loguru attempts to open logs/quantluna_YYYY-MM-DD.log before the
-    # directory exists on the very first boot (e.g. fresh Docker container).
     os.makedirs("logs", exist_ok=True)
-    os.makedirs("state", exist_ok=True)   # checkpoint dir likewise
+    os.makedirs("state", exist_ok=True)
     _configure_logging(args.log_level)
 
-    # ------------------------------------------------------------------
-    # 1. Load config from env
-    # ------------------------------------------------------------------
+    # 1. Load config
     from execution.bybit_live_runner import BybitLiveRunnerConfig
     cfg = BybitLiveRunnerConfig.from_env()
 
-    # CLI overrides
     if args.dry_run:
         cfg.dry_run = True
     if args.pair:
@@ -260,40 +241,33 @@ async def main() -> int:
         cfg.symbol_y, cfg.symbol_x, cfg.interval, cfg.dry_run,
     )
 
-    # ------------------------------------------------------------------
-    # 2. SIGTERM / SIGINT graceful shutdown
-    # ------------------------------------------------------------------
+    # 2. SIGTERM / SIGINT
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
     _install_signal_handlers(loop, shutdown_event)
 
-    # ------------------------------------------------------------------
-    # 3. Build shared components
-    # ------------------------------------------------------------------
+    # 3. Build shared components — construite O SINGURA DATA si injectate
     notifier_bus = await _build_notifier_bus(cfg)
     ws_feed      = await _build_ws_feed(cfg)
 
-    # ------------------------------------------------------------------
-    # 4. Wire RiskDashboardEngine into StateBus + api/risk
-    #    Must happen BEFORE start_runner so the first trade tick is captured.
-    # ------------------------------------------------------------------
+    # 4. Wire RiskDashboardEngine
     from core.state_bus import bus as state_bus
     _wire_dashboard_engine(cfg, state_bus)
 
-    # ------------------------------------------------------------------
-    # 5. Build orchestrator
-    # ------------------------------------------------------------------
+    # 5. Build orchestrator — transmite notifier_bus si ws_feed
+    #    Orchestratorul le va injecta in BybitLiveRunner via _build_runner()
+    #    Evita constructia duplicata in runner._build_components()
     from execution.workflow_orchestrator import WorkflowOrchestrator
     orch = WorkflowOrchestrator.from_runner_cfg(
         cfg=cfg,
         notifier_bus=notifier_bus,
         ws_feed=ws_feed,
         skip_health_check=args.skip_health or cfg.dry_run,
+        dashboard_api_url=os.getenv("DASHBOARD_API_URL", ""),
+        dashboard_frontend_url=os.getenv("DASHBOARD_FRONTEND_URL", ""),
     )
 
-    # ------------------------------------------------------------------
-    # 6. Run startup workflow (Faza 0-4)
-    # ------------------------------------------------------------------
+    # 6. Run startup workflow (Faze 0-4 + 6)
     ctx = await orch.run_startup_workflow()
 
     if ctx.should_halt:
@@ -308,9 +282,7 @@ async def main() -> int:
                 pass
         return 1
 
-    # ------------------------------------------------------------------
     # 7. Start runner (Faza 5) — blocks until stop or shutdown signal
-    # ------------------------------------------------------------------
     runner_task = asyncio.create_task(orch.start_runner(ctx))
     await asyncio.wait(
         [runner_task, asyncio.create_task(shutdown_event.wait())],
