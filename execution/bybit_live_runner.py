@@ -1,7 +1,16 @@
 """
-execution/bybit_live_runner.py — QuantLuna Bybit Live Runner v3.4
+execution/bybit_live_runner.py — QuantLuna Bybit Live Runner v3.5
 Sprint S20 — review fixes 2026-07-11
 Sprint S21 — position reconciliation + full automation 2026-07-11
+Sprint S21 review-fix — 6 issues rezolvate 2026-07-11
+
+Changelog v3.5 (review-fixes):
+  FIX-R1 [CRITIC]  OrderManagerConfig: eliminat base_qty/entry_zscore/exit_zscore invalide
+  FIX-R2 [CRITIC]  adopt_position() acum exista in OrderManager — reconciliere functionala
+  FIX-R3 [MEDIU]   order_router.connect() apelat explicit inainte de reconciliere
+  FIX-R4 [MEDIU]   PnlReconciler instantiat o singura data (nu la fiecare 60s)
+  FIX-R5 [MEDIU]   run() cu try/except/finally crash handler + alerta Telegram
+  FIX-R6 [MINOR]   import _dc nefolosit eliminat din _inject_adopted_position()
 
 Changelog v3.4 (position-reconciliation):
   FEAT-1  Phase 0.5: PositionReconciler.fetch() — detectare pozitii existente pe Bybit
@@ -135,11 +144,9 @@ class BybitLiveRunnerConfig:
     rest_warmup_enabled: bool = field(default_factory=lambda: os.getenv("REST_WARMUP_ENABLED", "true").lower() == "true")
     bybit_category: str = field(default_factory=lambda: os.getenv("BYBIT_CATEGORY", "linear"))
 
-    # FEAT-1: toggle reconciliere pozitii la startup (default ON)
     position_reconcile_enabled: bool = field(
         default_factory=lambda: os.getenv("POSITION_RECONCILE_ENABLED", "true").lower() == "true"
     )
-    # FEAT-4: interval (secunde) pentru PnL reconciler background loop
     pnl_reconciler_interval_s: int = field(
         default_factory=lambda: int(os.getenv("PNL_RECONCILER_INTERVAL_S", "60"))
     )
@@ -169,7 +176,7 @@ class RunnerContext:
 
 class BybitLiveRunner:
     """
-    Main live trading loop v3.4.
+    Main live trading loop v3.5.
 
     Startup sequence:
       Phase 0   — REST warm-up (bare istorice)
@@ -182,6 +189,7 @@ class BybitLiveRunner:
 
     FIX-1..7: v3.3 review fixes
     FEAT-1..5: v3.4 position reconciliation
+    FIX-R1..R6: v3.5 review fixes
     """
 
     def __init__(self, cfg: BybitLiveRunnerConfig) -> None:
@@ -196,6 +204,8 @@ class BybitLiveRunner:
         self._checkpoint: CheckpointManager = CheckpointManager(cfg.checkpoint_path)
         # Pozitia adoptata la startup (None = fara pozitie existenta)
         self._adopted_position: Optional[AdoptedPosition] = None
+        # FIX-R4: PnlReconciler singleton (nu re-instantiat la fiecare 60s)
+        self._pnl_reconciler: Optional[Any] = None
 
     @classmethod
     def from_config(cls, cfg: BybitLiveRunnerConfig) -> "BybitLiveRunner":
@@ -284,7 +294,7 @@ class BybitLiveRunner:
             logger.info("BybitLiveRunner: Phase 0.5 — nicio pozitie de adoptat, start curat")
             return
 
-        # FEAT-3: injecteaza pozitia in OrderManager
+        # FEAT-3: injecteaza pozitia in OrderManager (FIX-R2: metoda exista acum)
         self._adopted_position = adopted
         try:
             order_manager.adopt_position(
@@ -314,10 +324,10 @@ class BybitLiveRunner:
                     )
                 except Exception:
                     pass
-        except AttributeError:
-            # OrderManager vechi nu are adopt_position — fallback manual
+        except AttributeError as exc:
+            # Fallback pentru versiuni foarte vechi de OrderManager
             logger.warning(
-                "BybitLiveRunner: OrderManager.adopt_position() lipseste — "
+                f"BybitLiveRunner: OrderManager.adopt_position() indisponibila ({exc}) — "
                 "injectare manuala via _inject_adopted_position()"
             )
             self._inject_adopted_position(order_manager, adopted)
@@ -325,11 +335,10 @@ class BybitLiveRunner:
     def _inject_adopted_position(self, order_manager: OrderManager, adopted: AdoptedPosition) -> None:
         """
         Fallback: injecteaza pozitia direct in structura interna a OrderManager
-        daca metoda adopt_position() nu exista (versiune veche).
+        daca metoda adopt_position() nu exista (versiune foarte veche).
+        FIX-R6: eliminat import _dc nefolosit.
         """
         try:
-            from dataclasses import dataclass as _dc
-
             class _FakePos:
                 y_side = adopted.y_side
                 x_side = adopted.x_side
@@ -339,7 +348,6 @@ class BybitLiveRunner:
                 x_entry = adopted.x_entry_price
                 pnl = adopted.unrealised_pnl
 
-            # Seteaza atributele direct daca exista
             if hasattr(order_manager, "current_position"):
                 object.__setattr__(order_manager, "current_position", _FakePos())
             if hasattr(order_manager, "_has_position"):
@@ -366,15 +374,22 @@ class BybitLiveRunner:
         if not self.cfg.pnl_reconciler_enabled:
             return
 
-        logger.info(
-            f"BybitLiveRunner: PnL reconciler pornit "
-            f"(interval={self.cfg.pnl_reconciler_interval_s}s)"
-        )
+        # FIX-R4: initializeaza PnlReconciler o singura data
+        try:
+            from execution.pnl_reconciler import PnlReconciler
+            self._pnl_reconciler = PnlReconciler(order_router)
+            logger.info(
+                f"BybitLiveRunner: PnL reconciler pornit "
+                f"(interval={self.cfg.pnl_reconciler_interval_s}s)"
+            )
+        except ImportError:
+            logger.debug("PnL reconciler: PnlReconciler nu e disponibil — dezactivat")
+            return
 
         while not self._stop_event.is_set():
             await asyncio.sleep(self.cfg.pnl_reconciler_interval_s)
             try:
-                await self._check_pnl_divergence(order_router, order_manager, notifier_bus)
+                await self._check_pnl_divergence(order_manager, notifier_bus)
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -382,15 +397,14 @@ class BybitLiveRunner:
 
     async def _check_pnl_divergence(
         self,
-        order_router: Any,
         order_manager: OrderManager,
         notifier_bus: Optional[NotifierBus],
     ) -> None:
-        """Verifica divergenta PnL real vs. local."""
+        """Verifica divergenta PnL real vs. local. FIX-R4: reutilizeaza self._pnl_reconciler."""
+        if self._pnl_reconciler is None:
+            return
         try:
-            from execution.pnl_reconciler import PnlReconciler
-            reconciler = PnlReconciler(order_router)
-            real_pnl = await reconciler.get_unrealised_pnl(
+            real_pnl = await self._pnl_reconciler.get_unrealised_pnl(
                 self.cfg.symbol_y, self.cfg.symbol_x
             )
             local_pnl = float(getattr(order_manager, "current_pnl", 0.0) or 0.0)
@@ -417,8 +431,6 @@ class BybitLiveRunner:
                     f"PnL reconciler OK: real={real_pnl:.4f} local={local_pnl:.4f} "
                     f"delta={divergence:.4f}"
                 )
-        except ImportError:
-            pass  # PnlReconciler nu e disponibil in acest env
         except Exception as exc:
             logger.debug(f"_check_pnl_divergence: {exc}")
 
@@ -613,12 +625,9 @@ class BybitLiveRunner:
             name="trading",
         )
 
-        om_cfg = OrderManagerConfig(
-            base_qty=self.cfg.base_qty,
-            entry_zscore=self.cfg.entry_zscore,
-            exit_zscore=self.cfg.exit_zscore,
-            dry_run=self.cfg.dry_run,
-        )
+        # FIX-R1: OrderManagerConfig nu accepta base_qty/entry_zscore/exit_zscore
+        # Parametrii base_qty, entry_zscore, exit_zscore sunt in self.cfg (BybitLiveRunnerConfig)
+        om_cfg = OrderManagerConfig(dry_run=self.cfg.dry_run)
         order_manager = OrderManager(om_cfg)
 
         wd_cfg = WsWatchdogConfig(
@@ -883,6 +892,7 @@ class BybitLiveRunner:
             return None
         if abs(zscore) >= self.cfg.entry_zscore:
             return "entry_short" if zscore > 0 else "entry_long"
+        # FIX-R2: has_position() ora returneaza True si pentru pozitii adoptate
         if abs(zscore) <= self.cfg.exit_zscore and order_manager.has_position():
             return "exit"
         return None
@@ -1047,13 +1057,21 @@ class BybitLiveRunner:
 
     async def run(self) -> int:
         """Full run: Phase 0 REST → Phase 0.5 Reconcile → Build → Start → Trade."""
-        logger.info("BybitLiveRunner: ========== Starting Live Runner v3.4 ==========")
+        logger.info("BybitLiveRunner: ========== Starting Live Runner v3.5 ==========")
         logger.info(
             f"BybitLiveRunner: {self.cfg.symbol_y}/{self.cfg.symbol_x} | "
             f"interval={self.cfg.interval}m | dry_run={self.cfg.dry_run}"
         )
 
         order_router, ws_feed = await self._build_exchange_via_factory()
+
+        # FIX-R3: conecteaza order_router inainte de reconciliere REST
+        if hasattr(order_router, "connect"):
+            try:
+                await order_router.connect()
+                logger.info("BybitLiveRunner: order_router.connect() OK")
+            except Exception as exc:
+                logger.warning(f"BybitLiveRunner: order_router.connect() failed ({exc}) — continuam")
 
         (
             spread_monitor, circuit_breaker, order_manager, watchdog, notifier_bus,
@@ -1073,7 +1091,7 @@ class BybitLiveRunner:
                     f"{self._adopted_position.symbol_x} {self._adopted_position.x_side.upper()}"
                 )
             await notifier_bus.send_alert(
-                f"⚡ QuantLuna Started v3.4 | {self.cfg.symbol_y}/{self.cfg.symbol_x} | "
+                f"⚡ QuantLuna Started v3.5 | {self.cfg.symbol_y}/{self.cfg.symbol_x} | "
                 f"dry_run={self.cfg.dry_run}{adopted_msg}",
                 level="info",
             )
@@ -1087,18 +1105,32 @@ class BybitLiveRunner:
         }
         health = await self._start_health_server(components_for_health)
 
-        await self._run_loop(
-            order_router=order_router,
-            ws_feed=ws_feed,
-            spread_monitor=spread_monitor,
-            circuit_breaker=circuit_breaker,
-            order_manager=order_manager,
-            watchdog=watchdog,
-            health=health,
-            notifier_bus=notifier_bus,
-        )
+        # FIX-R5: try/except/finally crash handler in jurul _run_loop()
+        try:
+            await self._run_loop(
+                order_router=order_router,
+                ws_feed=ws_feed,
+                spread_monitor=spread_monitor,
+                circuit_breaker=circuit_breaker,
+                order_manager=order_manager,
+                watchdog=watchdog,
+                health=health,
+                notifier_bus=notifier_bus,
+            )
+        except Exception as exc:
+            logger.critical(f"BybitLiveRunner: run() crashed unexpectedly: {exc}")
+            if notifier_bus:
+                try:
+                    await notifier_bus.send_alert(
+                        f"💀 RUNNER CRASHED: {exc} — restart necesar!",
+                        level="critical",
+                    )
+                except Exception:
+                    pass
+            raise
+        finally:
+            logger.info("BybitLiveRunner: Runner stopped")
 
-        logger.info("BybitLiveRunner: Runner stopped")
         return 0
 
     start = run

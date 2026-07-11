@@ -1,5 +1,5 @@
 """
-QuantLuna — Order Manager (Sprint 17 + Sprint 28)
+QuantLuna — Order Manager (Sprint 17 + Sprint 28 + Sprint 21)
 
 Centralised order lifecycle management across all venues (Bybit, Binance, OKX).
 Abstracts over individual routers — callers use OrderManager instead of
@@ -12,6 +12,7 @@ Responsibilities:
   - Emit events via StateBus on fill / cancel / error
   - Thread-safe for use from async tasks
   - [Sprint 28] on_fill / on_close callback hooks for cycle restart
+  - [Sprint 21] adopt_position() — injecteaza pozitie externa detectata la startup
 
 Usage:
     mgr = OrderManager(config)
@@ -22,6 +23,11 @@ Usage:
     # Register restart callback
     mgr.register_on_fill(my_callback)   # called when FILLED
     mgr.register_on_close(my_callback)  # called when CANCELLED / TIMED_OUT / FAILED
+
+    # Sprint 21: adopt pozitie existenta la restart
+    mgr.adopt_position(symbol_y="BTCUSDT", symbol_x="ETHUSDT", y_side="long",
+                       x_side="short", y_qty=0.01, x_qty=0.15,
+                       y_entry_price=65000.0, x_entry_price=3400.0)
 """
 from __future__ import annotations
 
@@ -139,6 +145,13 @@ class OrderManager:
     register_on_fill(cb)  — cb(record) called every time an order reaches FILLED status
     register_on_close(cb) — cb(record) called when order reaches CANCELLED/FAILED/TIMED_OUT
     These are useful for triggering a new trade cycle after a position closes.
+
+    Sprint 21 additions
+    -------------------
+    adopt_position()  — injecteaza o pozitie externa (detectata la startup via
+                        PositionReconciler sau CheckpointManager) in state.
+                        Dupa adoptare, has_position() returneaza True si _decide()
+                        poate genera semnal de exit.
     """
 
     def __init__(
@@ -155,6 +168,80 @@ class OrderManager:
         # Sprint 28: lifecycle callbacks
         self._on_fill_callbacks:  List[_AsyncCallback] = []
         self._on_close_callbacks: List[_AsyncCallback] = []
+
+        # Sprint 21: pozitie adoptata la startup
+        self._adopted_record: Optional[Any] = None  # AdoptedPosition
+        self._adopted: bool = False
+
+        # Pozitia curenta (set de _execute_action din runner)
+        self.current_position: Optional[Any] = None
+        self.current_pnl: Optional[float] = None
+
+    # ------------------------------------------------------------------
+    # Sprint 21: Position adoption (FEAT-3)
+    # ------------------------------------------------------------------
+
+    def adopt_position(
+        self,
+        symbol_y: str,
+        symbol_x: str,
+        y_side: str,
+        x_side: str,
+        y_qty: float,
+        x_qty: float,
+        y_entry_price: float,
+        x_entry_price: float,
+    ) -> None:
+        """
+        Sprint 21: Adopta o pozitie externa detectata la startup.
+
+        Apelata de bybit_live_runner._reconcile_positions() dupa ce
+        PositionReconciler sau CheckpointManager detecteaza o pozitie deschisa.
+        Dupa apel, has_position() returneaza True si _decide() poate genera
+        semnal de exit cand zscore revine la zero.
+
+        Parametri
+        ---------
+        symbol_y, symbol_x : simbolurile perechii tranzactionate
+        y_side, x_side     : 'long' | 'short' | 'none'
+        y_qty, x_qty       : cantitate absoluta per leg
+        y_entry_price,
+        x_entry_price      : pretul mediu de intrare per leg
+        """
+
+        class _AdoptedPos:
+            """Structura minima compatibila cu current_position din runner."""
+            pass
+
+        pos = _AdoptedPos()
+        pos.y_side = y_side
+        pos.x_side = x_side
+        pos.y_qty  = y_qty
+        pos.x_qty  = x_qty
+        pos.y_entry = y_entry_price
+        pos.x_entry = x_entry_price
+        pos.pnl     = 0.0
+
+        self.current_position = pos
+        self._adopted = True
+        self._adopted_record = pos
+
+        logger.info(
+            f"OrderManager: pozitie adoptata — "
+            f"{symbol_y} {y_side} {y_qty:.6f} @ {y_entry_price:.4f} | "
+            f"{symbol_x} {x_side} {x_qty:.6f} @ {x_entry_price:.4f}"
+        )
+
+    def release_adopted_position(self) -> None:
+        """
+        Sprint 21: Elibereaza pozitia adoptata dupa exit complet.
+        Apelata de runner dupa record_exit() reusit.
+        """
+        self._adopted = False
+        self._adopted_record = None
+        self.current_position = None
+        self.current_pnl = None
+        logger.info("OrderManager: pozitie adoptata eliberata dupa exit")
 
     # ------------------------------------------------------------------
     # Sprint 28: Callback registration
@@ -217,8 +304,97 @@ class OrderManager:
             logger.info("OrderManager: monitor task stopped")
 
     # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
+
+    def has_position(self) -> bool:
+        """
+        Sprint 21: Returneaza True daca exista o pozitie activa — fie adoptata
+        la startup (self._adopted), fie deschisa in sesiunea curenta
+        (self.current_position setat de record_entry_long/short).
+        """
+        if self._adopted and self._adopted_record is not None:
+            return True
+        if self.current_position is not None:
+            return True
+        return bool(self.open_orders())
+
+    def record_entry_long(
+        self, qty: float, price_y: float, price_x: float
+    ) -> None:
+        """Inregistreaza intrarea intr-o pozitie long in state local."""
+        class _Pos:
+            pass
+        pos = _Pos()
+        pos.y_side = "long"
+        pos.x_side = "short"
+        pos.y_qty  = qty
+        pos.x_qty  = qty
+        pos.y_entry = price_y
+        pos.x_entry = price_x
+        self.current_position = pos
+        self._adopted = False  # pozitie proprie, nu adoptata
+        logger.info(f"OrderManager: record_entry_long qty={qty} y@{price_y} x@{price_x}")
+
+    def record_entry_short(
+        self, qty: float, price_y: float, price_x: float
+    ) -> None:
+        """Inregistreaza intrarea intr-o pozitie short in state local."""
+        class _Pos:
+            pass
+        pos = _Pos()
+        pos.y_side = "short"
+        pos.x_side = "long"
+        pos.y_qty  = qty
+        pos.x_qty  = qty
+        pos.y_entry = price_y
+        pos.x_entry = price_x
+        self.current_position = pos
+        self._adopted = False
+        logger.info(f"OrderManager: record_entry_short qty={qty} y@{price_y} x@{price_x}")
+
+    def record_exit(self, price_y: float, price_x: float) -> None:
+        """Inregistreaza iesirea din pozitie si calculeaza PnL."""
+        if self.current_position is None:
+            logger.warning("OrderManager: record_exit apelat fara pozitie activa")
+            return
+        pos = self.current_position
+        if pos.y_side == "long":
+            pnl = (price_y - pos.y_entry) * pos.y_qty - (price_x - pos.x_entry) * pos.x_qty
+        else:
+            pnl = (pos.y_entry - price_y) * pos.y_qty + (price_x - pos.x_entry) * pos.x_qty
+        self.current_pnl = pnl
+        self.current_position = None
+        self._adopted = False
+        self._adopted_record = None
+        logger.info(f"OrderManager: record_exit PnL={pnl:.4f} USDT")
+
+    # ------------------------------------------------------------------
     # Order submission
     # ------------------------------------------------------------------
+
+    def get_status(self, local_id: str) -> Optional[OrderStatus]:
+        rec = self._orders.get(local_id)
+        return rec.status if rec else None
+
+    def get_record(self, local_id: str) -> Optional[OrderRecord]:
+        return self._orders.get(local_id)
+
+    def open_orders(self) -> List[OrderRecord]:
+        """Return all orders in SUBMITTED or PARTIALLY state."""
+        return [
+            r for r in self._orders.values()
+            if r.status in (OrderStatus.SUBMITTED, OrderStatus.PARTIALLY)
+        ]
+
+    def all_records(self) -> List[OrderRecord]:
+        return list(self._orders.values())
+
+    def summary(self) -> Dict:
+        counts: Dict[str, int] = {}
+        for r in self._orders.values():
+            counts[r.status.value] = counts.get(r.status.value, 0) + 1
+        return {"total": len(self._orders), "by_status": counts}
 
     async def submit(self, req: OrderRequest) -> str:
         """
@@ -330,33 +506,6 @@ class OrderManager:
         except Exception as exc:
             logger.error(f"OrderManager: cancel failed local_id={local_id} err={exc}")
             return False
-
-    # ------------------------------------------------------------------
-    # Queries
-    # ------------------------------------------------------------------
-
-    def get_status(self, local_id: str) -> Optional[OrderStatus]:
-        rec = self._orders.get(local_id)
-        return rec.status if rec else None
-
-    def get_record(self, local_id: str) -> Optional[OrderRecord]:
-        return self._orders.get(local_id)
-
-    def open_orders(self) -> List[OrderRecord]:
-        """Return all orders in SUBMITTED or PARTIALLY state."""
-        return [
-            r for r in self._orders.values()
-            if r.status in (OrderStatus.SUBMITTED, OrderStatus.PARTIALLY)
-        ]
-
-    def all_records(self) -> List[OrderRecord]:
-        return list(self._orders.values())
-
-    def summary(self) -> Dict:
-        counts: Dict[str, int] = {}
-        for r in self._orders.values():
-            counts[r.status.value] = counts.get(r.status.value, 0) + 1
-        return {"total": len(self._orders), "by_status": counts}
 
     # ------------------------------------------------------------------
     # Sprint 28: Internal callback dispatchers
