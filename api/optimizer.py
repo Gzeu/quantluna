@@ -1,18 +1,9 @@
 """
-api/optimizer.py  -  QuantLuna Optimizer API v1.0
+api/optimizer.py  -  QuantLuna Optimizer API v1.1
 
-Sprint S39-S40 (2026-07-12):
-  Endpoint-uri FastAPI pentru control grid optimizer + auto-reoptimizer:
-
-    POST /api/optimizer/run           - trigger manual grid search imediat
-    GET  /api/optimizer/status        - status curent (running/idle + ultima rulare)
-    GET  /api/optimizer/results       - ultimele rezultate per pereche
-    GET  /api/optimizer/history       - istoricul tuturor reoptimizarilor
-    POST /api/optimizer/reoptimize    - trigger re-optimizare manuala
-    GET  /api/optimizer/pair/{pair}   - detalii + config curenta per pereche
-
-  Integrat in api/main.py cu:
-    app.include_router(optimizer_router, prefix="/api/optimizer")
+Sprint S43 (2026-07-12): adauga endpoint heatmap pentru iframe dashboard
+  GET /api/optimizer/heatmap/{pair}  - serveste HTML heatmap per pereche
+  (toate celelalte endpoint-uri raman identice cu v1.0)
 """
 from __future__ import annotations
 
@@ -24,6 +15,7 @@ from typing import Any, Dict, List, Optional
 
 try:
     from fastapi import APIRouter, HTTPException, BackgroundTasks
+    from fastapi.responses import HTMLResponse
     from pydantic import BaseModel
 except ImportError:
     raise RuntimeError("fastapi si pydantic necesare")
@@ -38,7 +30,6 @@ _HISTORY_PATH = Path(os.getenv(
 _CONFIG_DIR = Path(os.getenv("PAIRS_CONFIG_DIR", "config/pairs"))
 _REPORTS_DIR = Path(os.getenv("REPORTS_DIR", "backtest/reports"))
 
-# Stare globala a optimizatorului (injectata din main.py)
 _optimizer_state: Dict[str, Any] = {
     "running": False,
     "last_run": None,
@@ -48,36 +39,24 @@ _optimizer_state: Dict[str, Any] = {
 
 
 def set_optimizer_state(state: Dict[str, Any]) -> None:
-    """Injecteaza starea din main.py."""
     _optimizer_state.update(state)
 
-
-# ---------------------------------------------------------------------------
-# Request models
-# ---------------------------------------------------------------------------
 
 class RunGridRequest(BaseModel):
     pairs: Optional[List[str]] = None
     days: int = 180
-    objective: str = "sharpe"    # sharpe | calmar | pnl | profit_factor
-    grid_type: str = "coarse"   # coarse | fine
+    objective: str = "sharpe"
+    grid_type: str = "coarse"
     dry_run: bool = False
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-
 @optimizer_router.get("/status")
 async def get_optimizer_status() -> Dict[str, Any]:
-    """Starea curenta a optimizatorului."""
     reopt = _optimizer_state.get("auto_reoptimizer")
     return {
         "running": _optimizer_state["running"],
         "last_run": _optimizer_state["last_run"],
-        "pairs_count": len(
-            _optimizer_state.get("pairs", [])
-        ),
+        "pairs_count": len(_optimizer_state.get("pairs", [])),
         "auto_reoptimizer_active": reopt is not None,
         "auto_schedule": {
             "weekday": getattr(reopt, "_weekday", 6),
@@ -89,7 +68,6 @@ async def get_optimizer_status() -> Dict[str, Any]:
 
 @optimizer_router.get("/results")
 async def get_last_results() -> Dict[str, Any]:
-    """Ultimele rezultate grid search per pereche."""
     return {
         "results": _optimizer_state.get("last_results", {}),
         "last_run": _optimizer_state.get("last_run"),
@@ -98,23 +76,18 @@ async def get_last_results() -> Dict[str, Any]:
 
 @optimizer_router.get("/history")
 async def get_history(limit: int = 20) -> Dict[str, Any]:
-    """Istoricul tuturor re-optimizarilor."""
     if not _HISTORY_PATH.exists():
         return {"history": [], "total": 0}
     try:
         with open(_HISTORY_PATH) as f:
             history = json.load(f)
-        return {
-            "history": history[-limit:],
-            "total": len(history),
-        }
+        return {"history": history[-limit:], "total": len(history)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 @optimizer_router.get("/pair/{pair}")
 async def get_pair_details(pair: str) -> Dict[str, Any]:
-    """Config curenta + ultimele rezultate pentru o pereche."""
     config_path = _CONFIG_DIR / f"{pair}.json"
     config = {}
     if config_path.exists():
@@ -123,22 +96,44 @@ async def get_pair_details(pair: str) -> Dict[str, Any]:
                 config = json.load(f)
         except Exception:
             pass
-
-    # Cauta CSV raport
-    reports = sorted(
-        _REPORTS_DIR.glob(f"grid_{pair}_*.csv"),
-        reverse=True,
-    )
+    reports = sorted(_REPORTS_DIR.glob(f"grid_{pair}_*.csv"), reverse=True)
     last_report = str(reports[0]) if reports else None
-
     return {
         "pair": pair,
         "current_config": config,
         "last_report_csv": last_report,
-        "last_results": _optimizer_state.get(
-            "last_results", {}
-        ).get(pair),
+        "last_results": _optimizer_state.get("last_results", {}).get(pair),
     }
+
+
+@optimizer_router.get("/heatmap/{pair}", response_class=HTMLResponse)
+async def get_heatmap(pair: str) -> HTMLResponse:
+    """
+    Serveste cel mai recent heatmap HTML per pereche.
+    Folosit de iframe-ul din dashboard/pages/optimizer.tsx.
+    """
+    files = sorted(
+        _REPORTS_DIR.glob(f"heatmap_{pair}_*.html"),
+        reverse=True,
+    )
+    if not files:
+        # Placeholder HTML cand nu exista inca heatmap
+        return HTMLResponse(
+            content=f"""<!DOCTYPE html>
+<html><head><meta charset='UTF-8'></head>
+<body style='background:#0f0f1a;color:#555;
+  font-family:Inter,sans-serif;
+  display:flex;align-items:center;justify-content:center;
+  height:100vh;margin:0;flex-direction:column;gap:12px'>
+  <div style='font-size:32px'>🔍</div>
+  <div style='font-size:15px'>Niciun heatmap disponibil pentru <b style='color:#8b5cf6'>{pair}</b></div>
+  <div style='font-size:12px;color:#444'>Rulează grid search pentru a genera heatmap-ul.</div>
+</body></html>""",
+            status_code=200,
+        )
+    with open(files[0], encoding="utf-8") as f:
+        content = f.read()
+    return HTMLResponse(content=content)
 
 
 @optimizer_router.post("/run")
@@ -146,21 +141,16 @@ async def trigger_grid_run(
     req: RunGridRequest,
     background_tasks: BackgroundTasks,
 ) -> Dict[str, Any]:
-    """
-    Trigger manual grid search in background.
-    Raspunde imediat; rezultatele apar in /results cand e gata.
-    """
     if _optimizer_state["running"]:
         raise HTTPException(
             status_code=409,
             detail="Optimizer deja ruleaza. Asteapta finalizarea.",
         )
-
     reopt = _optimizer_state.get("auto_reoptimizer")
     if reopt is None:
         raise HTTPException(
             status_code=503,
-            detail="AutoReoptimizer nu e initializat. Verifica startupul.",
+            detail="AutoReoptimizer nu e initializat.",
         )
 
     async def _bg_run():
@@ -173,9 +163,7 @@ async def trigger_grid_run(
                 reopt._pairs = req.pairs
             result = await reopt.run_now(force=True)
             _optimizer_state["last_results"] = result.get("results", {})
-            _optimizer_state["last_run"] = datetime.now(
-                timezone.utc
-            ).isoformat()
+            _optimizer_state["last_run"] = datetime.now(timezone.utc).isoformat()
         finally:
             _optimizer_state["running"] = False
 
@@ -186,7 +174,7 @@ async def trigger_grid_run(
         "objective": req.objective,
         "grid_type": req.grid_type,
         "dry_run": req.dry_run,
-        "message": "Grid search pornit in background. Verifica /api/optimizer/status",
+        "message": "Grid search pornit. Verifica /api/optimizer/status",
     }
 
 
@@ -194,8 +182,4 @@ async def trigger_grid_run(
 async def trigger_reoptimize(
     background_tasks: BackgroundTasks,
 ) -> Dict[str, Any]:
-    """Trigger re-optimizare manuala cu setarile curente."""
-    return await trigger_grid_run(
-        RunGridRequest(),
-        background_tasks,
-    )
+    return await trigger_grid_run(RunGridRequest(), background_tasks)
