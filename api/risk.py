@@ -1,160 +1,113 @@
 """
-QuantLuna — Risk Dashboard API
-Sprint 27 / fix Sprint 28
+api/risk.py — S37 metrics expansion
+FastAPI router pentru /risk/dashboard si /risk/status.
+Returneaza schema completa RiskMetrics asteptata de frontend.
 
 Endpoints:
-  GET /risk/snapshot         — portfolio snapshot complet
-  GET /risk/pairs            — per-pair metrici
-  GET /risk/pairs/{pair}     — metrice pentru o pereche specifica
-  GET /risk/equity_curve     — equity curve (list ts + equity_usd)
-  GET /risk/stream           — SSE real-time stream (1s interval)
-
-Wiring:
-  The engine is shared via the module-level StateBus singleton.
-  The bot calls ``bus.set_risk_engine(engine)`` at startup.
-  All endpoints read from ``bus.risk_engine`` which is always non-None.
-
-  Legacy ``set_risk_engine()`` shim is kept for callers that inject
-  directly (MultiPairManager, tests).
+    GET /risk/dashboard  — snapshot complet (toate metricile)
+    GET /risk/status     — status scurt (drawdown, cb, regime)
+    POST /risk/reset-day — reseteaza daily PnL manual
 """
 from __future__ import annotations
 
-import asyncio
-import json
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import StreamingResponse
-from loguru import logger
+try:
+    from fastapi import APIRouter, HTTPException
+    from fastapi.responses import JSONResponse
+except ImportError:
+    raise ImportError("fastapi este necesar: pip install fastapi")
 
 from risk.dashboard_engine import RiskDashboardEngine
 
 router = APIRouter(prefix="/risk", tags=["risk"])
 
-
-# ---------------------------------------------------------------------------
-# Dependency: always read from StateBus singleton so the bot and the API
-# share exactly one RiskDashboardEngine instance (same process or
-# injected cross-process via set_risk_engine).
-# ---------------------------------------------------------------------------
-
-def _get_engine() -> RiskDashboardEngine:
-    """
-    Return the live RiskDashboardEngine.
-
-    Resolution order:
-      1. Engine injected via set_risk_engine() (MultiPairManager / tests)
-      2. Engine registered on StateBus by the bot at startup
-      3. Empty fallback engine (returns zeroed metrics — shows bot is offline)
-    """
-    # Check module-level override first (tests / MultiPairManager)
-    if _ENGINE is not None:
-        return _ENGINE
-    # Then the StateBus singleton
-    try:
-        from core.state_bus import bus
-        return bus.risk_engine
-    except Exception as exc:
-        logger.warning("api/risk: StateBus unavailable: {} — using fallback", exc)
-        return RiskDashboardEngine()
-
-
-# Module-level override for tests and MultiPairManager
-_ENGINE: Optional[RiskDashboardEngine] = None
+_engine: Optional[RiskDashboardEngine] = None
 
 
 def set_risk_engine(engine: RiskDashboardEngine) -> None:
+    global _engine
+    _engine = engine
+
+
+def get_risk_engine() -> RiskDashboardEngine:
+    global _engine
+    if _engine is None:
+        _engine = RiskDashboardEngine()  # fallback engine gol
+    return _engine
+
+
+@router.get("/dashboard")
+async def risk_dashboard() -> JSONResponse:
     """
-    Inject engine directly (legacy shim).
-
-    Prefer ``bus.set_risk_engine(engine)`` for new code.
-    This shim is kept for MultiPairManager and tests.
+    Snapshot complet — schema completa RiskMetrics (S37).
+    Polling recomandat: 5s din frontend.
     """
-    global _ENGINE
-    _ENGINE = engine
-    # Also register on the bus so any new code that reads bus.risk_engine
-    # sees the same instance.
-    try:
-        from core.state_bus import bus
-        bus.set_risk_engine(engine)
-    except Exception:
-        pass
-    logger.debug("api/risk: engine injected via set_risk_engine()")
+    engine = get_risk_engine()
+    snap   = engine.snapshot()
+
+    # Normalizeaza pentru frontend (campuri asteptate de useRiskMetrics.ts)
+    payload = {
+        # Core equity
+        "equity_usd":       snap.get("equity_usd",       0.0),
+        "exposure_usd":     snap.get("exposure_usd",     0.0),
+
+        # Daily PnL
+        "daily_pnl":        snap.get("daily_pnl",        0.0),
+        "daily_pct":        snap.get("daily_pct",        0.0),
+
+        # Unrealized
+        "unrealized_pnl":   snap.get("unrealized_pnl",  0.0),
+
+        # Risk
+        "rolling_sharpe":   snap.get("rolling_sharpe",  0.0),
+        "drawdown_current": snap.get("drawdown_current", 0.0),
+        "max_drawdown":     snap.get("max_drawdown",     0.0),
+
+        # Trade stats
+        "wins":             snap.get("wins",          0),
+        "losses":           snap.get("losses",        0),
+        "total_trades":     snap.get("total_trades",  0),
+        "win_rate":         snap.get("win_rate",      0.0),
+        "avg_win_usd":      snap.get("avg_win_usd",   0.0),
+        "avg_loss_usd":     snap.get("avg_loss_usd",  0.0),
+        "profit_factor":    snap.get("profit_factor", 0.0),
+
+        # Consecutive
+        "max_consecutive_wins":   snap.get("max_consecutive_wins",   0),
+        "max_consecutive_losses": snap.get("max_consecutive_losses", 0),
+        "current_streak":         snap.get("current_streak",         0),
+
+        # Per-pair breakdown (format frontend)
+        "pair_breakdown":  snap.get("pair_breakdown", []),
+
+        # Meta
+        "ts":              snap.get("ts",              0.0),
+        "session_uptime_s":snap.get("session_uptime_s",0.0),
+    }
+    return JSONResponse(content=payload)
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
-
-@router.get("/snapshot")
-def risk_snapshot():
-    """
-    GET /risk/snapshot
-
-    Portfolio-level risk metrics: rolling Sharpe, drawdown, win rate, exposure.
-    Returns an empty (zeroed) snapshot if the bot is not running.
-    """
-    return _get_engine().snapshot()
-
-
-@router.get("/pairs")
-def risk_pairs():
-    """GET /risk/pairs — stats for all active pairs."""
-    snap = _get_engine().snapshot()
-    return {"pairs": snap["pairs"], "n_pairs": len(snap["pairs"])}
+@router.get("/status")
+async def risk_status() -> JSONResponse:
+    """Status scurt — pentru health-check rapid."""
+    engine = get_risk_engine()
+    snap   = engine.snapshot()
+    return JSONResponse(content={
+        "drawdown_current": snap.get("drawdown_current", 0.0),
+        "max_drawdown":     snap.get("max_drawdown",     0.0),
+        "win_rate":         snap.get("win_rate",         0.0),
+        "profit_factor":    snap.get("profit_factor",   0.0),
+        "total_trades":     snap.get("total_trades",     0),
+        "equity_usd":       snap.get("equity_usd",       0.0),
+        "n_active_pairs":   snap.get("n_active_pairs",   0),
+    })
 
 
-@router.get("/pairs/{pair_id:path}")
-def risk_pair_detail(pair_id: str):
-    """GET /risk/pairs/BTCUSDT-ETHUSDT — metrics for a specific pair."""
-    ps = _get_engine().pair_snapshot(pair_id)
-    if ps is None:
-        raise HTTPException(
-            status_code=404, detail=f"Pair '{pair_id}' not found"
-        )
-    return ps
-
-
-@router.get("/equity_curve")
-def equity_curve(
-    last_n: int = Query(
-        500, ge=1, le=10_000, description="Last N data points"
-    ),
-):
-    """GET /risk/equity_curve?last_n=500 — equity curve for charting."""
-    curve = _get_engine().equity_curve[-last_n:]
-    return {"n_points": len(curve), "curve": curve}
-
-
-@router.get("/stream")
-async def risk_stream(
-    interval_s: float = Query(
-        1.0, ge=0.1, le=60.0, description="Push interval in seconds"
-    ),
-):
-    """
-    GET /risk/stream  — Server-Sent Events real-time risk feed.
-
-    Connect from the dashboard::
-
-        const es = new EventSource('/risk/stream');
-        es.onmessage = (e) => { const snap = JSON.parse(e.data); ... };
-    """
-    async def _generate():
-        try:
-            while True:
-                snap = _get_engine().snapshot()
-                yield f"data: {json.dumps(snap)}\n\n"
-                await asyncio.sleep(interval_s)
-        except asyncio.CancelledError:
-            pass
-
-    return StreamingResponse(
-        _generate(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
-    )
+@router.post("/reset-day")
+async def reset_day() -> JSONResponse:
+    """Reseteaza daily PnL manual (ex: dupa rollover manual)."""
+    engine = get_risk_engine()
+    engine._day_start_eq  = engine._equity
+    engine._day_start_ts  = engine._today_start()
+    return JSONResponse(content={"ok": True, "equity_usd": engine._equity})

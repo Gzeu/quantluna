@@ -1,33 +1,56 @@
 """
-api/__init__.py  —  QuantLuna API package
-Exporta routerele principale pentru import direct.
-"""
-from api.backtest      import router as backtest_router
-from api.data          import router as data_router
-from api.health        import router as health_router
-from api.live          import router as live_router
-from api.notifications import router as notifications_router
-from api.optimize      import router as optimize_router
-from api.optimizer     import optimizer_router
-from api.pairs         import router as pairs_router
-from api.risk          import router as risk_router
-from api.services      import services_router
-from api.sizing        import router as sizing_router
-from api.strategy      import router as strategy_router
-from api.watchdog      import watchdog_router
+api/__init__.py — S37
+Barrel router — include toate sub-routerele.
+Folosit in dashboard/server.py sau in orice app FastAPI.
 
-__all__ = [
-    "backtest_router",
-    "data_router",
-    "health_router",
-    "live_router",
-    "notifications_router",
-    "optimize_router",
-    "optimizer_router",
-    "pairs_router",
-    "risk_router",
-    "services_router",
-    "sizing_router",
-    "strategy_router",
-    "watchdog_router",
-]
+Usage:
+    from api import build_api
+    app = build_api()
+
+    # Sau manual:
+    from api.risk     import router as risk_router
+    from api.pnl      import router as pnl_router
+    from api.services import router as services_router
+    app.include_router(risk_router)
+    app.include_router(pnl_router)
+    app.include_router(services_router)
+"""
+from __future__ import annotations
+
+try:
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+except ImportError:
+    raise ImportError("fastapi este necesar: pip install fastapi uvicorn")
+
+from api.risk     import router as risk_router
+from api.pnl      import router as pnl_router
+from api.services import router as services_router
+
+
+def build_api(title: str = "QuantLuna API", version: str = "0.37.0") -> FastAPI:
+    """
+    Construieste aplicatia FastAPI cu toate routerele inregistrate.
+    CORS permisiv pentru dev (restrange in productie via env ALLOWED_ORIGINS).
+    """
+    import os
+    app = FastAPI(title=title, version=version)
+
+    origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    app.include_router(risk_router)
+    app.include_router(pnl_router)
+    app.include_router(services_router)
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok", "version": version}
+
+    return app
