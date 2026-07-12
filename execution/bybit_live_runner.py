@@ -1,892 +1,186 @@
 """
-execution/bybit_live_runner.py — QuantLuna Bybit Live Runner v3.9
-Sprint S20 — review fixes 2026-07-11
-Sprint S21 — position reconciliation + full automation 2026-07-11
-Sprint S21 review-fix — 6 issues rezolvate 2026-07-11
-Sprint S28 v3.6 — wiring fix: parametri optionali din WorkflowOrchestrator
-Sprint S28 v3.7 — 3 fixuri critice de siguranta
-Sprint S28 v3.8 — Boot Scan complet: balanta + toate pozitiile + Telegram
-Sprint S29 v3.9 — bump versiune; standalone guard pentru pozitii SOLO
+execution/bybit_live_runner.py  —  BybitLiveRunner (thin orchestrator)
 
-Changelog v3.9 (standalone-guard):
-  FIX-C1 [CRITIC]  _reconcile_positions() emite WARNING explicit daca runner-ul
-                   e pornit standalone (fara WorkflowOrchestrator) si exista
-                   pozitii SOLO in cont (ex: EGLD hedge).
-                   SingleHedgeManager NU e pornit din runner — gestionat de
-                   WorkflowOrchestrator (FAZA 3.5). Telegram primeste alerta.
-  FIX-C2 [CRITIC]  Bump versiune v3.8 → v3.9 in Telegram + log + docstring.
+Sprint 28 SRP refactor — this file is now a lean orchestrator (~140 LOC).
+All extracted modules:
 
-Changelog v3.8 (boot-scan):
-  FEAT-B1 [CRITIC]  _reconcile_positions() foloseste boot_scan() complet
-                    Scaneaza TOATE pozitiile din cont, nu doar symbol_y/x
-  FEAT-B2 [CRITIC]  scan_wallet_balance() — balanta USDT la startup
-                    equity, available, uPnL total notificate la boot via Telegram
-  FEAT-B3 [CRITIC]  BootScanResult.to_telegram_msg() trimis la pornire
-                    Telegram primeste situatia completa inainte de primul trade
-  FEAT-B4          boot_equity/boot_available publicate in state_bus payload
+  execution/runner_config.py    —  BybitLiveRunnerConfig
+  execution/runner_context.py   —  RunnerContext
+  execution/funding_gate.py     —  FundingGate
+  execution/decision_engine.py  —  DecisionEngine
+  execution/action_executor.py  —  ActionExecutor
 
-Changelog v3.7 (safety-fixes):
-  FIX-S1 [CRITIC]  InstrumentInfoCache integrat in _execute_action()
-                   round_qty() apelat pe fiecare simbol inainte de ordin
-  FIX-S2 [CRITIC]  Native SL/TP nativ Bybit dupa fiecare entry reusit
-                   place_sl_tp() apelat cu sl_pct/tp_pct din config
-  FIX-S3 [CRITIC]  BybitPrivateWS integrat in _run_loop()
-                   on_execution -> _on_fill_event() -> notifica Telegram instant
-                   on_order -> _on_order_event() -> detecteaza SL/TP trigger
+Backward-compatible re-exports so existing callers don't need changes::
 
-Changelog v3.6 (wiring-fix):
-  FIX-W1 [CRITIC]  __init__ accepta notifier_bus/ws_feed/private_ws/exchange optional
-  FIX-W2 [CRITIC]  run() foloseste notifier_bus injectat
-  FIX-W3 [CRITIC]  run() foloseste ws_feed injectat cand e furnizat
-  FIX-W4 [MINOR]   from_config() pastrat pentru compatibilitate backwards
-
-Changelog v3.5 (review-fixes):
-  FIX-R1..R6
-
-Changelog v3.4 (position-reconciliation):
-  FEAT-1..FEAT-5
+    from execution.bybit_live_runner import BybitLiveRunner, BybitLiveRunnerConfig
 """
 from __future__ import annotations
 
 import asyncio
-import os
-import time
-from dataclasses import dataclass, field
-from datetime import datetime
-from typing import TYPE_CHECKING, Any, Optional
+from typing import Any, Optional
 
 from loguru import logger
 
-if TYPE_CHECKING:
-    from execution.bybit_ws_bars import BybitWsBarsAdapter
+# Re-export for backward compatibility
+from execution.runner_config  import BybitLiveRunnerConfig  # noqa: F401
+from execution.runner_context import RunnerContext           # noqa: F401
 
-from core.spread_monitor import SpreadMonitor
-from execution.circuit_breaker import CircuitBreaker, CircuitState
-from execution.exchange_factory import ExchangeFactory, get_order_router, get_ws_feed, get_dual_ws_feed  # noqa: F401
-from execution.health_check import HealthCheck, HealthCheckConfig, HealthStatus
-from execution.order_manager import OrderManager, OrderManagerConfig
-from execution.ws_watchdog import WsWatchdog, WsWatchdogConfig
-from execution.position_reconciler import (
-    PositionReconciler,
-    AdoptedPosition,
-    BootScanResult,
-)
-from execution.checkpoint_manager import CheckpointManager
-
-# FIX-S1: InstrumentInfoCache
-from execution.instrument_info_cache import InstrumentInfoCache
-# FIX-S2: Native SL/TP
-from execution.native_sl_tp import place_sl_tp, calc_sl_price, calc_tp_price
-
+from core.spread_monitor       import SpreadMonitor
+from execution.action_executor  import ActionExecutor
+from execution.circuit_breaker  import CircuitBreaker, CircuitBreakerConfig
+from execution.decision_engine  import DecisionEngine
+from execution.exchange_factory import get_order_router, get_ws_feed
+from execution.funding_gate     import FundingGate
+from execution.health_check     import HealthCheck, HealthCheckConfig
+from execution.order_manager    import OrderManager, OrderManagerConfig
+from execution.watchdog         import WsWatchdog, WsWatchdogConfig
 from notifications.notifier_bus import NotifierBus
 
-try:
-    from core.state_bus import bus as _state_bus
-except ImportError:
-    try:
-        from state_bus import bus as _state_bus
-    except ImportError:
-        _state_bus = None
-
-try:
-    from core.metrics import (
-        spread_zscore,
-        pnl_usdt as _pnl_metric,
-        drawdown_pct as _drawdown_metric,
-    )
-    from core.metrics import registry as _metrics_registry
-    _zscore_pair = _metrics_registry.gauge(
-        "quantluna_zscore_pair", "Z-score per trading pair"
-    )
-    _circuit_open = _metrics_registry.gauge(
-        "quantluna_circuit_breaker_open", "Circuit breaker open (1) or closed (0)"
-    )
-    _warmup_bars_done = _metrics_registry.gauge(
-        "quantluna_warmup_bars_done", "Warm-up bars completed"
-    )
-    _HAS_METRICS = True
-except Exception:
-    _HAS_METRICS = False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sentinel: runner pornit standalone (fara WorkflowOrchestrator)
-# Setat din exterior de orchestrator inainte de a injecta runner-ul.
-# ─────────────────────────────────────────────────────────────────────────────
-_ORCHESTRATOR_ACTIVE = False
-
-
-def mark_orchestrator_active() -> None:
-    """Apelat de WorkflowOrchestrator inainte de start_runner() pentru a
-    semnala ca FAZA 3.5 (SingleHedgeManager) e gestionata extern."""
-    global _ORCHESTRATOR_ACTIVE
-    _ORCHESTRATOR_ACTIVE = True
-
-
-# =============================================================================
-# BybitLiveRunnerConfig
-# =============================================================================
-
-@dataclass
-class BybitLiveRunnerConfig:
-    """Complete runtime configuration — env vars citite la instantiere."""
-
-    symbol_y: str = field(default_factory=lambda: os.getenv("SYMBOL_Y", "BTCUSDT"))
-    symbol_x: str = field(default_factory=lambda: os.getenv("SYMBOL_X", "ETHUSDT"))
-    interval: int = field(default_factory=lambda: int(os.getenv("INTERVAL", "5")))
-
-    dry_run: bool = field(default_factory=lambda: os.getenv("DRY_RUN", "false").lower() == "true")
-
-    api_key: str = field(default_factory=lambda: os.getenv("BYBIT_API_KEY", ""))
-    api_secret: str = field(default_factory=lambda: os.getenv("BYBIT_API_SECRET", ""))
-    testnet: bool = field(default_factory=lambda: os.getenv("BYBIT_TESTNET", "false").lower() == "true")
-
-    entry_zscore: float = field(default_factory=lambda: float(os.getenv("ENTRY_ZSCORE", "2.0")))
-    exit_zscore: float = field(default_factory=lambda: float(os.getenv("EXIT_ZSCORE", "0.5")))
-    base_qty: float = field(default_factory=lambda: float(os.getenv("BASE_QTY", "0.01")))
-
-    warmup_bars: int = field(default_factory=lambda: int(os.getenv("WARMUP_BARS", "100")))
-    kalman_window: int = field(default_factory=lambda: int(os.getenv("KALMAN_WINDOW", "200")))
-    half_life_h: float = field(default_factory=lambda: float(os.getenv("HALF_LIFE_H", "24.0")))
-
-    max_consec_losses: int = field(default_factory=lambda: int(os.getenv("MAX_CONSEC_LOSSES", "3")))
-    max_drawdown_pct: float = field(default_factory=lambda: float(os.getenv("MAX_DRAWDOWN_PCT", "10.0")))
-    cooldown_seconds: int = field(default_factory=lambda: int(os.getenv("COOLDOWN_SECONDS", "300")))
-
-    telegram_bot_token: str = field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", ""))
-    telegram_chat_id: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", ""))
-    slack_webhook_url: str = field(default_factory=lambda: os.getenv("SLACK_WEBHOOK_URL", ""))
-
-    health_port: int = field(default_factory=lambda: int(os.getenv("HEALTH_PORT", "8081")))
-
-    funding_gate_enabled: bool = field(default_factory=lambda: os.getenv("FUNDING_GATE_ENABLED", "true").lower() == "true")
-    pnl_reconciler_enabled: bool = field(default_factory=lambda: os.getenv("PNL_RECONCILER_ENABLED", "true").lower() == "true")
-    market_trade_enabled: bool = field(default_factory=lambda: os.getenv("MARKET_TRADE_ENABLED", "true").lower() == "true")
-
-    checkpoint_path: str = field(default_factory=lambda: os.getenv("CHECKPOINT_PATH", "position_checkpoint.db"))
-    best_params_path: str = field(default_factory=lambda: os.getenv("BEST_PARAMS_PATH", "best_params.json"))
-    state_bus_publish_interval: int = field(default_factory=lambda: int(os.getenv("STATE_BUS_PUBLISH_INTERVAL", "1")))
-
-    rest_warmup_enabled: bool = field(default_factory=lambda: os.getenv("REST_WARMUP_ENABLED", "true").lower() == "true")
-    bybit_category: str = field(default_factory=lambda: os.getenv("BYBIT_CATEGORY", "linear"))
-
-    position_reconcile_enabled: bool = field(
-        default_factory=lambda: os.getenv("POSITION_RECONCILE_ENABLED", "true").lower() == "true"
-    )
-    pnl_reconciler_interval_s: int = field(
-        default_factory=lambda: int(os.getenv("PNL_RECONCILER_INTERVAL_S", "60"))
-    )
-
-    initial_capital: float = field(
-        default_factory=lambda: float(os.getenv("INITIAL_CAPITAL", "10000"))
-    )
-
-    # FIX-S2: SL/TP config
-    sl_pct: float = field(
-        default_factory=lambda: float(os.getenv("SL_PCT", "0.03"))
-    )
-    tp_pct: float = field(
-        default_factory=lambda: float(os.getenv("TP_PCT", "0.06"))
-    )
-    native_sl_tp_enabled: bool = field(
-        default_factory=lambda: os.getenv("NATIVE_SL_TP_ENABLED", "true").lower() == "true"
-    )
-
-    # FIX-S3: Private WS fills
-    private_ws_enabled: bool = field(
-        default_factory=lambda: os.getenv("PRIVATE_WS_ENABLED", "true").lower() == "true"
-    )
-
-    @classmethod
-    def from_env(cls) -> "BybitLiveRunnerConfig":
-        return cls()
-
-
-# =============================================================================
-# RunnerContext
-# =============================================================================
-
-@dataclass
-class RunnerContext:
-    """Shared context object passed between phases."""
-    should_halt: bool = False
-    halt_reason: str = ""
-    order_router: Optional[Any] = None
-    ws_feed: Optional[Any] = None
-    spread_monitor: Optional[SpreadMonitor] = None
-    circuit_breaker: Optional[CircuitBreaker] = None
-    order_manager: Optional[OrderManager] = None
-    watchdog: Optional[WsWatchdog] = None
-    notifier_bus: Optional[NotifierBus] = None
-
-
-# =============================================================================
-# BybitLiveRunner v3.9
-# =============================================================================
 
 class BybitLiveRunner:
     """
-    Main live trading loop v3.9.
+    Main live-trading orchestrator.
 
-    FIX-C1: Standalone guard — daca runner-ul e pornit fara WorkflowOrchestrator
-             si exista pozitii SOLO (ex: EGLD hedge mode), emite WARNING si
-             alerta Telegram. SingleHedgeManager nu e pornit din runner;
-             el e responsabilitatea WorkflowOrchestrator (FAZA 3.5).
-
-    FIX-C2: Bump versiune v3.8 → v3.9 in Telegram si log.
-
-    FEAT-B1..B4: Boot Scan complet la pornire:
-      - scan_wallet_balance() — balanta USDT (equity, available, uPnL)
-      - scan_all_positions() — TOATE pozitiile deschise din cont
-      - BootScanResult.to_telegram_msg() trimis inainte de primul trade
-      - boot_equity/boot_available publicate in state_bus
-
-    FIX-S1: InstrumentInfoCache — qty rounding per simbol inainte de orice ordin
-    FIX-S2: Native SL/TP — place_sl_tp() dupa fiecare entry, Bybit gestioneaza
-            inchiderea chiar daca procesul cade
-    FIX-S3: BybitPrivateWS integrat — fill-uri instant via WS, nu polling REST
-
-    FIX-W1..W4: Accepta parametri optionali din WorkflowOrchestrator.
-
-    Startup sequence:
-      Phase 0   — REST warm-up (bare istorice)
-      Phase 0.5 — Boot Scan: balanta + toate pozitiile + adoptie y/x + Telegram
-                  + FIX-C1: standalone guard pentru pozitii SOLO
-      Phase 1   — Build exchange clients
-      Phase 2   — Build shared components
-      Phase 3   — Start health server
-      Phase 4   — Main trading loop (cu PnL reconciler + private WS background)
+    Builds all subsystems, wires them together, then drives the event loop.
+    Heavy logic lives in the extracted modules listed in the module docstring.
     """
 
     def __init__(
         self,
         cfg: BybitLiveRunnerConfig,
-        notifier_bus: Optional[NotifierBus] = None,
-        ws_feed: Optional[Any] = None,
-        private_ws: Optional[Any] = None,
-        exchange: Optional[Any] = None,
+        exchange=None,
+        private_ws=None,
+        ws_feed=None,
+        notifier_bus=None,
     ) -> None:
-        self.cfg = cfg
-        self._stop_event: asyncio.Event = asyncio.Event()
-        self._state: dict[str, Any] = {}
-        self._bar_count: int = 0
-        self._active_strategy: str = "kalman"
-        self._funding_monitor: Optional[Any] = None
-        self._checkpoint: CheckpointManager = CheckpointManager(cfg.checkpoint_path)
-        self._adopted_position: Optional[AdoptedPosition] = None
-        self._boot_scan_result: Optional[BootScanResult] = None   # FEAT-B4
-        self._pnl_reconciler: Optional[Any] = None
+        self.cfg          = cfg
+        self._exchange    = exchange
+        self._private_ws  = private_ws
+        self._ws_feed_ext = ws_feed
+        self._bus_ext     = notifier_bus
+        self._stop_event  = asyncio.Event()
 
-        # Injected from orchestrator (v3.6)
-        self._injected_notifier_bus: Optional[NotifierBus] = notifier_bus
-        self._injected_ws_feed: Optional[Any] = ws_feed
-        self._injected_private_ws: Optional[Any] = private_ws
-        self._injected_exchange: Optional[Any] = exchange
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-        # FIX-S1: InstrumentInfoCache singleton
-        self._instr_cache: InstrumentInfoCache = InstrumentInfoCache(
-            testnet=cfg.testnet,
-            category=cfg.bybit_category,
-        )
+    async def start(self) -> int:
+        """Build, wire and run.  Blocks until stop() is called."""
+        logger.info("BybitLiveRunner: === START === {}/{} dry={}",
+                    self.cfg.symbol_y, self.cfg.symbol_x, self.cfg.dry_run)
 
-        # FIX-S3: private WS state
-        self._private_ws_client: Optional[Any] = None
-        self._order_manager_ref: Optional[OrderManager] = None
-        self._notifier_bus_ref: Optional[NotifierBus] = None
+        order_router, ws_feed = await self._build_exchange()
+        (
+            spread_monitor, circuit_breaker,
+            order_manager, watchdog, notifier_bus,
+        ) = await self._build_components(order_router, ws_feed)
 
-    @classmethod
-    def from_config(cls, cfg: BybitLiveRunnerConfig) -> "BybitLiveRunner":
-        return cls(cfg)
-
-    # -------------------------------------------------------------------------
-    # FIX-S3: Private WS handlers
-    # -------------------------------------------------------------------------
-
-    async def _on_fill_event(self, msg: dict) -> None:
-        """
-        Handler pentru topic 'execution' (fill-uri).
-        Notifica Telegram instant la fiecare fill real.
-        """
-        try:
-            fills = msg.get("data", [])
-            for fill in fills:
-                symbol = fill.get("symbol", "?")
-                side   = fill.get("side", "?")
-                qty    = fill.get("execQty", "?")
-                price  = fill.get("execPrice", "?")
-                fee    = fill.get("execFee", "?")
-                otype  = fill.get("execType", "?")
-                logger.info(
-                    "PrivateWS FILL: %s %s qty=%s price=%s fee=%s type=%s",
-                    symbol, side, qty, price, fee, otype,
-                )
-                if self._notifier_bus_ref:
-                    try:
-                        await self._notifier_bus_ref.send_alert(
-                            f"\U0001f7e2 FILL: {symbol} {side} qty={qty} @ {price} (fee={fee})",
-                            level="info",
-                        )
-                    except Exception:
-                        pass
-        except Exception as exc:
-            logger.debug("_on_fill_event error: %s", exc)
-
-    async def _on_order_event(self, msg: dict) -> None:
-        """
-        Handler pentru topic 'order'.
-        Detecteaza SL/TP trigger (orderStatus=Filled + reduceOnly=True)
-        si apeleaza record_exit() in OrderManager.
-        """
-        try:
-            orders = msg.get("data", [])
-            for order in orders:
-                status          = order.get("orderStatus", "")
-                reduce_only     = order.get("reduceOnly", False)
-                symbol          = order.get("symbol", "")
-                avg_price       = float(order.get("avgPrice", 0) or 0)
-                qty             = float(order.get("qty", 0) or 0)
-                stop_order_type = order.get("stopOrderType", "")
-
-                is_sl_tp_fill = (
-                    status == "Filled"
-                    and reduce_only
-                    and stop_order_type in ("StopLoss", "TakeProfit", "Stop")
-                )
-
-                if is_sl_tp_fill and self._order_manager_ref:
-                    label = "SL" if stop_order_type == "StopLoss" else "TP"
-                    logger.warning(
-                        "PrivateWS %s TRIGGERED: %s qty=%s price=%.4f",
-                        label, symbol, qty, avg_price,
-                    )
-                    try:
-                        if symbol == self.cfg.symbol_y:
-                            self._order_manager_ref.record_exit(
-                                price_y=avg_price,
-                                price_x=avg_price,
-                            )
-                        self._checkpoint.clear()
-                        self._adopted_position = None
-                    except Exception as exc:
-                        logger.warning("_on_order_event record_exit failed: %s", exc)
-
-                    if self._notifier_bus_ref:
-                        try:
-                            await self._notifier_bus_ref.send_alert(
-                                f"\u26a0\ufe0f {label} TRIGGERED: {symbol} qty={qty} @ {avg_price:.4f}",
-                                level="critical",
-                            )
-                        except Exception:
-                            pass
-        except Exception as exc:
-            logger.debug("_on_order_event error: %s", exc)
-
-    async def _start_private_ws(self) -> None:
-        """
-        FIX-S3: Porneste BybitPrivateWS si inregistreaza handlerii.
-        Ruleaza ca background task in _run_loop().
-        """
-        if not self.cfg.private_ws_enabled:
-            logger.info("BybitLiveRunner: Private WS dezactivat (PRIVATE_WS_ENABLED=false)")
-            return
-        if not self.cfg.api_key or not self.cfg.api_secret:
-            logger.warning("BybitLiveRunner: Private WS skip — API key/secret lipsa")
-            return
-        if self.cfg.dry_run:
-            logger.info("BybitLiveRunner: Private WS skip in dry_run mode")
-            return
-
-        try:
-            from execution.bybit_private_ws import BybitPrivateWS
-            self._private_ws_client = BybitPrivateWS(
-                api_key=self.cfg.api_key,
-                api_secret=self.cfg.api_secret,
-                testnet=self.cfg.testnet,
-            )
-            self._private_ws_client.on_execution(self._on_fill_event)
-            self._private_ws_client.on_order(self._on_order_event)
-            logger.info("BybitLiveRunner: \U0001f517 Private WS pornit (execution + order topics)")
-            await self._private_ws_client.start()  # blocks until stopped
-        except Exception as exc:
-            logger.warning("BybitLiveRunner: Private WS failed: %s", exc)
-
-    # -------------------------------------------------------------------------
-    # Phase 0: REST warm-up
-    # -------------------------------------------------------------------------
-
-    async def _warmup_from_rest(self, spread_monitor: SpreadMonitor) -> int:
-        if not self.cfg.rest_warmup_enabled:
-            logger.info("BybitLiveRunner: REST warm-up dezactivat")
-            return 0
-
-        logger.info(
-            "BybitLiveRunner: \u23f3 Phase 0 — REST warm-up "
-            "%d bare %s/%s",
-            self.cfg.warmup_bars, self.cfg.symbol_y, self.cfg.symbol_x,
-        )
-        try:
-            from execution.bybit_warmup_fetcher import BybitWarmupFetcher
-            fetcher = BybitWarmupFetcher(
-                symbol_y=self.cfg.symbol_y,
-                symbol_x=self.cfg.symbol_x,
-                interval=self.cfg.interval,
-                n_bars=self.cfg.warmup_bars,
-                testnet=self.cfg.testnet,
-                category=self.cfg.bybit_category,
-                request_timeout=15,
-            )
-            n = await fetcher.fetch(spread_monitor, _state_bus)
-            if n > 0:
-                self._bar_count = n
-                logger.info("BybitLiveRunner: \u2705 Phase 0 complet — %d bare injectate", n)
-            else:
-                logger.warning("BybitLiveRunner: \u26a0\ufe0f Phase 0 returnat 0 bare — fallback WS")
-            return n
-        except Exception as exc:
-            logger.warning("BybitLiveRunner: Phase 0 esuat (%s) — fallback WS warm-up", exc)
-            return 0
-
-    # -------------------------------------------------------------------------
-    # Phase 0.5: Boot Scan v3.9 — balanta + toate pozitiile + adoptie + Telegram
-    #            + FIX-C1: standalone guard pentru pozitii SOLO
-    # -------------------------------------------------------------------------
-
-    async def _reconcile_positions(
-        self,
-        order_router: Any,
-        order_manager: OrderManager,
-        notifier_bus: Optional[NotifierBus] = None,
-    ) -> None:
-        """
-        Phase 0.5 v3.9 — Boot Scan complet:
-          1. Citeste balanta USDT (equity, available, uPnL total)
-          2. Scaneaza TOATE pozitiile deschise din cont (nu doar symbol_y/x)
-          3. Trimite BootScanResult.to_telegram_msg() la Telegram
-          4. Identifica si adopta pozitia y/x in OrderManager
-             Prioritate: REST Bybit > checkpoint local
-
-          FIX-C1 v3.9:
-          5. Daca runner e STANDALONE (fara WorkflowOrchestrator) si exista
-             pozitii SOLO in cont (ex: EGLD hedge mode), emite WARNING si
-             alerta Telegram. SingleHedgeManager NU este pornit din runner —
-             este responsabilitatea WorkflowOrchestrator (FAZA 3.5).
-
-        In dry_run sau daca position_reconcile_enabled=false, se sare complet.
-        Nu ridica exceptii — orice eroare e logata si runner continua.
-        """
-        if not self.cfg.position_reconcile_enabled or self.cfg.dry_run:
-            logger.info("BybitLiveRunner: Position reconciliation dezactivata (dry_run=%s)", self.cfg.dry_run)
-            return
-
-        logger.info("BybitLiveRunner: \U0001f50d Phase 0.5 — Boot Scan (v3.9)...")
-
-        # Citeste checkpoint local inainte de REST (va fi folosit ca fallback)
-        checkpoint_adopted = self._checkpoint.load()
-        if checkpoint_adopted is not None:
-            logger.info(
-                "BybitLiveRunner: \u2139\ufe0f Checkpoint local gasit — %s",
-                checkpoint_adopted,
-            )
-
-        # Boot scan complet via Bybit REST (sursa de adevar)
-        reconciler = PositionReconciler(
-            order_router=order_router,
-            symbol_y=self.cfg.symbol_y,
-            symbol_x=self.cfg.symbol_x,
-            category=self.cfg.bybit_category,
-        )
-        boot_result: BootScanResult = await reconciler.boot_scan()
-        self._boot_scan_result = boot_result  # FEAT-B4: folosit in _publish_bar
-
-        # Trimite mesajul complet la Telegram (balanta + toate pozitiile)
         if notifier_bus:
-            try:
-                await notifier_bus.send_alert(
-                    boot_result.to_telegram_msg(),
-                    level="info",
-                )
-            except Exception as exc:
-                logger.debug("BybitLiveRunner: Telegram boot scan msg failed: %s", exc)
-
-        # ── FIX-C1 v3.9: Standalone guard ────────────────────────────────────
-        # Daca runner e pornit fara WorkflowOrchestrator si exista pozitii SOLO
-        # (simboluri in afara perechii y/x), emite WARNING si alerta Telegram.
-        # SingleHedgeManager NU e pornit din runner — responsabilitate orch.
-        if not _ORCHESTRATOR_ACTIVE and boot_result.positions:
-            pairs_symbols = {self.cfg.symbol_y, self.cfg.symbol_x}
-            solo_positions = [
-                p for p in boot_result.positions
-                if p.symbol not in pairs_symbols
-            ]
-            if solo_positions:
-                solo_symbols = [p.symbol for p in solo_positions]
-                warn_msg = (
-                    f"\u26a0\ufe0f STANDALONE MODE: Runner pornit fara WorkflowOrchestrator.\n"
-                    f"Pozitii SOLO detectate care NU sunt gestionate: "
-                    f"{', '.join(solo_symbols)}\n"
-                    f"SingleHedgeManager (trailing SL/TP) este inactiv.\n"
-                    f"Porneste prin WorkflowOrchestrator pentru gestionare completa."
-                )
-                logger.warning(
-                    "BybitLiveRunner: STANDALONE MODE — pozitii SOLO negestionate: %s",
-                    solo_symbols,
-                )
-                if notifier_bus:
-                    try:
-                        await notifier_bus.send_alert(warn_msg, level="critical")
-                    except Exception:
-                        pass
-        # ─────────────────────────────────────────────────────────────────────
-
-        # Adoptia pozitiei y/x
-        # Prioritate: REST (sursa adevar) > checkpoint local
-        adopted = boot_result.adopted
-        if adopted is None and checkpoint_adopted is not None:
-            logger.info(
-                "BybitLiveRunner: REST nu a gasit pozitie y/x — "
-                "folosind checkpoint local: %s",
-                checkpoint_adopted,
+            await notifier_bus.send_alert(
+                f"\u26a1 QuantLuna Start | {self.cfg.symbol_y}/{self.cfg.symbol_x} "
+                f"| dry={self.cfg.dry_run}",
+                level="info",
             )
-            adopted = checkpoint_adopted
 
-        if adopted is None or not adopted.has_position:
-            logger.info("BybitLiveRunner: Phase 0.5 — nicio pozitie de adoptat, start fresh")
-            return
+        health = await self._start_health_server({
+            "spread_monitor":  spread_monitor,
+            "circuit_breaker": circuit_breaker,
+            "order_manager":   order_manager,
+            "ws_feed":         ws_feed,
+            "watchdog":        watchdog,
+        })
 
-        self._adopted_position = adopted
+        funding_gate    = FundingGate(sym_y=self.cfg.symbol_y, sym_x=self.cfg.symbol_x)
+        decision_engine = DecisionEngine(
+            entry_zscore=self.cfg.entry_zscore,
+            exit_zscore=self.cfg.exit_zscore,
+            market_trade_enabled=self.cfg.market_trade_enabled,
+        )
+        executor = ActionExecutor(
+            sym_y=self.cfg.symbol_y,
+            sym_x=self.cfg.symbol_x,
+            base_qty=self.cfg.base_qty,
+            dry_run=self.cfg.dry_run,
+        )
+
+        await self._run_loop(
+            order_router, ws_feed,
+            spread_monitor, circuit_breaker, order_manager, watchdog,
+            health, notifier_bus,
+            funding_gate, decision_engine, executor,
+        )
+        logger.info("BybitLiveRunner: stopped")
+        return 0
+
+    def stop(self) -> None:
+        """Signal the run loop to exit cleanly."""
+        self._stop_event.set()
+
+    async def run(self) -> int:
+        """Alias for start() — kept for backward compatibility."""
+        return await self.start()
+
+    # ------------------------------------------------------------------
+    # Build helpers
+    # ------------------------------------------------------------------
+
+    async def _build_exchange(self):
+        """Build (or reuse injected) order-router and WS feed."""
+        if self._exchange is not None and self._ws_feed_ext is not None:
+            return self._exchange, self._ws_feed_ext
         try:
-            order_manager.adopt_position(
-                symbol_y=adopted.symbol_y,
-                symbol_x=adopted.symbol_x,
-                y_side=adopted.y_side,
-                x_side=adopted.x_side,
-                y_qty=adopted.y_qty,
-                x_qty=adopted.x_qty,
-                y_entry_price=adopted.y_entry_price,
-                x_entry_price=adopted.x_entry_price,
-            )
-            logger.info(
-                "BybitLiveRunner: \u2705 Pozitie adoptata — %s %s %.6f | %s %s %.6f | uPnL=%.4f USDT",
-                adopted.symbol_y, adopted.y_side, adopted.y_qty,
-                adopted.symbol_x, adopted.x_side, adopted.x_qty,
-                adopted.unrealised_pnl,
-            )
-        except AttributeError as exc:
-            logger.warning(
-                "BybitLiveRunner: adopt_position() indisponibila (%s) — fallback", exc
-            )
-            self._inject_adopted_position(order_manager, adopted)
-
-    def _inject_adopted_position(self, order_manager: OrderManager, adopted: AdoptedPosition) -> None:
-        """Fallback: injecteaza pozitia manual in OrderManager cand adopt_position() lipseste."""
-        try:
-            class _FakePos:
-                y_side = adopted.y_side
-                x_side = adopted.x_side
-                y_qty = adopted.y_qty
-                x_qty = adopted.x_qty
-                y_entry = adopted.y_entry_price
-                x_entry = adopted.x_entry_price
-                pnl = adopted.unrealised_pnl
-
-            if hasattr(order_manager, "current_position"):
-                object.__setattr__(order_manager, "current_position", _FakePos())
-            if hasattr(order_manager, "_has_position"):
-                object.__setattr__(order_manager, "_has_position", True)
-            logger.info("BybitLiveRunner: Pozitie injectata manual in OrderManager")
-        except Exception as exc:
-            logger.error("BybitLiveRunner: _inject_adopted_position failed: %s", exc)
-
-    # -------------------------------------------------------------------------
-    # PnL reconciler loop
-    # -------------------------------------------------------------------------
-
-    async def _pnl_reconciler_loop(
-        self,
-        order_router: Any,
-        order_manager: OrderManager,
-        notifier_bus: Optional[NotifierBus],
-    ) -> None:
-        if not self.cfg.pnl_reconciler_enabled:
-            return
-
-        try:
-            from execution.pnl_reconciler import PnlReconciler
-            self._pnl_reconciler = PnlReconciler(order_router)
-            logger.info(
-                "BybitLiveRunner: PnL reconciler pornit (interval=%ds)",
-                self.cfg.pnl_reconciler_interval_s,
-            )
-        except ImportError:
-            logger.debug("PnL reconciler indisponibil — dezactivat")
-            return
-
-        while not self._stop_event.is_set():
-            await asyncio.sleep(self.cfg.pnl_reconciler_interval_s)
-            try:
-                await self._check_pnl_divergence(order_manager, notifier_bus)
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                logger.debug("PnL reconciler: %s", exc)
-
-    async def _check_pnl_divergence(
-        self,
-        order_manager: OrderManager,
-        notifier_bus: Optional[NotifierBus],
-    ) -> None:
-        if self._pnl_reconciler is None:
-            return
-        try:
-            real_pnl = await self._pnl_reconciler.get_unrealised_pnl(
-                self.cfg.symbol_y, self.cfg.symbol_x
-            )
-            local_pnl = float(getattr(order_manager, "current_pnl", 0.0) or 0.0)
-            if real_pnl is None:
-                return
-            divergence = abs(real_pnl - local_pnl)
-            threshold = max(abs(local_pnl) * 0.1, 5.0)
-            if divergence > threshold:
-                msg = (
-                    f"\u26a0\ufe0f PnL DIVERGENTA: real={real_pnl:.4f} local={local_pnl:.4f} "
-                    f"delta={divergence:.4f} USDT — verificati pozitia manual!"
-                )
-                logger.critical(msg)
-                if notifier_bus:
-                    try:
-                        await notifier_bus.send_alert(msg, level="critical")
-                    except Exception:
-                        pass
-            else:
-                logger.debug(
-                    "PnL reconciler OK: real=%.4f local=%.4f delta=%.4f",
-                    real_pnl, local_pnl, divergence,
-                )
-        except Exception as exc:
-            logger.debug("_check_pnl_divergence: %s", exc)
-
-    # -------------------------------------------------------------------------
-    # state_bus helpers
-    # -------------------------------------------------------------------------
-
-    def _publish_bar(
-        self,
-        bar: Any,
-        spread: float,
-        zscore: float,
-        spread_monitor: SpreadMonitor,
-        circuit_breaker: CircuitBreaker,
-        order_manager: OrderManager,
-    ) -> None:
-        if _state_bus is None:
-            return
-
-        warmup_pct = 0.0
-        try:
-            warmup_pct = getattr(spread_monitor, "warmup_progress", 0.0)
-            if warmup_pct is None:
-                bars_done = getattr(spread_monitor, "bars_count", 0)
-                warmup_pct = min(1.0, bars_done / max(self.cfg.warmup_bars, 1))
-        except Exception:
-            pass
-
-        vol_regime = "UNKNOWN"
-        try:
-            vr = getattr(spread_monitor, "vol_regime", None)
-            if vr is not None:
-                vol_regime = str(vr.value if hasattr(vr, "value") else vr)
-        except Exception:
-            pass
-
-        current_pnl = 0.0
-        try:
-            current_pnl = float(order_manager.current_pnl or 0.0)
-        except Exception:
-            pass
-
-        # FEAT-B4: balanta din boot scan publicata in state_bus
-        boot_equity: float = 0.0
-        boot_available: float = 0.0
-        if self._boot_scan_result and self._boot_scan_result.wallet:
-            boot_equity    = self._boot_scan_result.wallet.equity
-            boot_available = self._boot_scan_result.wallet.available
-
-        payload = {
-            "ts": getattr(bar, "timestamp", int(time.time() * 1000)),
-            "symbol_y": self.cfg.symbol_y,
-            "symbol_x": self.cfg.symbol_x,
-            "price_y": getattr(bar, "price_y", 0.0),
-            "price_x": getattr(bar, "price_x", 0.0),
-            "spread": spread,
-            "zscore": zscore,
-            "zscore_abs": abs(zscore),
-            "vol_regime": vol_regime,
-            "warmup_pct": warmup_pct,
-            "warmup_done": warmup_pct >= 1.0,
-            "circuit_open": circuit_breaker.state == CircuitState.OPEN,
-            "active_strategy": self._active_strategy,
-            "pnl": current_pnl,
-            "dry_run": self.cfg.dry_run,
-            "bar_count": self._bar_count,
-            "has_adopted_position": self._adopted_position is not None,
-            "boot_equity_usdt": boot_equity,        # FEAT-B4
-            "boot_available_usdt": boot_available,  # FEAT-B4
-        }
-        try:
-            _state_bus.publish("bar", payload)
-        except Exception as exc:
-            logger.debug("state_bus.publish bar failed: %s", exc)
-
-        if _HAS_METRICS:
-            try:
-                spread_zscore.set(zscore)
-                _zscore_pair.set(abs(zscore))
-                _pnl_metric.set(current_pnl)
-                _circuit_open.set(1.0 if circuit_breaker.state == CircuitState.OPEN else 0.0)
-                _warmup_bars_done.set(self._bar_count)
-            except Exception:
-                pass
-
-    def _publish_warmup_status(
-        self,
-        spread_monitor: SpreadMonitor,
-        coint_pvalue: float = 1.0,
-    ) -> None:
-        if _state_bus is None:
-            return
-
-        bars_done = getattr(spread_monitor, "bars_count", self._bar_count)
-        bars_required = self.cfg.warmup_bars
-        pct = min(1.0, bars_done / max(bars_required, 1))
-
-        half_life_h = self.cfg.half_life_h
-        try:
-            hl = getattr(spread_monitor, "half_life", None)
-            if hl is not None:
-                half_life_h = float(hl)
-        except Exception:
-            pass
-
-        vol_regime = "UNKNOWN"
-        try:
-            vr = getattr(spread_monitor, "vol_regime", None)
-            if vr is not None:
-                vol_regime = str(vr.value if hasattr(vr, "value") else vr)
-        except Exception:
-            pass
-
-        try:
-            _state_bus.publish("warmup_status", {
-                "bars_done": bars_done,
-                "bars_required": bars_required,
-                "pct": round(pct, 4),
-                "coint_pvalue": round(coint_pvalue, 6),
-                "half_life_h": round(half_life_h, 2),
-                "regime": vol_regime,
-                "ready": pct >= 1.0,
-                "source": "ws",
-                "ts": int(time.time() * 1000),
-            })
-        except Exception as exc:
-            logger.debug("state_bus.publish warmup_status failed: %s", exc)
-
-    # -------------------------------------------------------------------------
-    # Phase 1: Build exchange clients
-    # -------------------------------------------------------------------------
-
-    async def _build_exchange_via_factory(self) -> tuple[Any, Any]:
-        try:
-            order_router = get_order_router(
-                api_key=self.cfg.api_key,
-                api_secret=self.cfg.api_secret,
-                testnet=self.cfg.testnet,
-                dry_run=self.cfg.dry_run,
-            )
-            ws_feed = get_dual_ws_feed(
-                symbol_y=self.cfg.symbol_y,
-                symbol_x=self.cfg.symbol_x,
-                interval=self.cfg.interval,
-                testnet=self.cfg.testnet,
-            )
-            logger.info(
-                "BybitLiveRunner: Exchange clients built [dual-feed: %s/%s]",
-                self.cfg.symbol_y, self.cfg.symbol_x,
-            )
-            return order_router, ws_feed
-
-        except Exception as exc:
-            logger.warning("BybitLiveRunner: ExchangeFactory failed (%s), fallback mock", exc)
-            try:
-                from execution.bybit_order_router import BybitOrderRouter
-                order_router = BybitOrderRouter(
+            return (
+                get_order_router(
                     api_key=self.cfg.api_key,
                     api_secret=self.cfg.api_secret,
                     testnet=self.cfg.testnet,
-                    category=self.cfg.bybit_category,
-                    mode="paper" if self.cfg.dry_run else "live",
-                )
-            except Exception as exc2:
-                logger.error("BybitLiveRunner: Fallback BybitOrderRouter failed: %s", exc2)
-                raise
-
-            from execution.bybit_ws_bars import BybitWsBarsAdapter
-            ws_feed = BybitWsBarsAdapter(
-                ws_feed=None,
-                symbol_y=self.cfg.symbol_y,
-                symbol_x=self.cfg.symbol_x,
-                interval=str(self.cfg.interval),
+                    dry_run=self.cfg.dry_run,
+                ),
+                self._ws_feed_ext or get_ws_feed(
+                    symbol=self.cfg.symbol_y,
+                    interval=self.cfg.interval,
+                    testnet=self.cfg.testnet,
+                ),
             )
-            logger.warning("BybitLiveRunner: WS feed MOCK (%s/%s)", self.cfg.symbol_y, self.cfg.symbol_x)
-            return order_router, ws_feed
+        except Exception as exc:
+            logger.warning("ExchangeFactory failed: {} — direct fallback", exc)
+            from execution.bybit_order_router import BybitOrderRouter, BybitOrderRouterConfig
+            from execution.bybit_ws_feed      import BybitWsFeed, BybitWsFeedConfig
+            return (
+                BybitOrderRouter(BybitOrderRouterConfig(
+                    api_key=self.cfg.api_key, api_secret=self.cfg.api_secret,
+                    testnet=self.cfg.testnet,  dry_run=self.cfg.dry_run,
+                )),
+                BybitWsFeed.from_config(BybitWsFeedConfig(
+                    symbol=self.cfg.symbol_y, interval=self.cfg.interval,
+                    testnet=self.cfg.testnet,
+                )),
+            )
 
-    # -------------------------------------------------------------------------
-    # Phase 2: Build shared components
-    # -------------------------------------------------------------------------
-
-    async def _build_components(
-        self,
-        order_router: Any,
-        ws_feed: Any,
-        injected_notifier_bus: Optional[NotifierBus] = None,
-    ) -> tuple[SpreadMonitor, CircuitBreaker, OrderManager, WsWatchdog, NotifierBus]:
-        spread_monitor = SpreadMonitor(
-            symbol_y=self.cfg.symbol_y,
-            symbol_x=self.cfg.symbol_x,
-            window=self.cfg.kalman_window,
-            half_life_h=self.cfg.half_life_h,
+    async def _build_components(self, order_router, ws_feed):
+        """Instantiate SpreadMonitor, CircuitBreaker, OrderManager, Watchdog, NotifierBus."""
+        spread_monitor  = SpreadMonitor(
+            symbol_y=self.cfg.symbol_y, symbol_x=self.cfg.symbol_x,
+            window=self.cfg.kalman_window, half_life_h=self.cfg.half_life_h,
             warmup_bars=self.cfg.warmup_bars,
         )
+        circuit_breaker = CircuitBreaker(CircuitBreakerConfig(
+            max_consec_losses=self.cfg.max_consec_losses,
+            max_drawdown_pct=self.cfg.max_drawdown_pct,
+            cooldown_seconds=self.cfg.cooldown_seconds,
+        ))
+        order_manager   = OrderManager(OrderManagerConfig(
+            base_qty=self.cfg.base_qty,
+            entry_zscore=self.cfg.entry_zscore,
+            exit_zscore=self.cfg.exit_zscore,
+            dry_run=self.cfg.dry_run,
+        ))
+        watchdog        = WsWatchdog(ws_feed, WsWatchdogConfig(
+            interval_seconds=30, max_missed_pings=3, reconnect_delay=5.0,
+        ))
 
-        circuit_breaker = CircuitBreaker(
-            failure_threshold=self.cfg.max_consec_losses,
-            recovery_timeout_s=float(self.cfg.cooldown_seconds),
-            name="trading",
-        )
-
-        om_cfg = OrderManagerConfig(dry_run=self.cfg.dry_run)
-        order_manager = OrderManager(om_cfg)
-
-        wd_cfg = WsWatchdogConfig(
-            interval_seconds=30,
-            max_missed_pings=3,
-            reconnect_delay=5.0,
-        )
-        watchdog = WsWatchdog(ws_feed, wd_cfg)
-
-        if self.cfg.funding_gate_enabled:
-            try:
-                from execution.funding_monitor import FundingMonitor
-                self._funding_monitor = FundingMonitor(ws_feed)
-                logger.info("BybitLiveRunner: FundingMonitor singleton creat")
-            except Exception as exc:
-                logger.warning("BybitLiveRunner: FundingMonitor init failed (%s)", exc)
-                self._funding_monitor = None
-
-        if injected_notifier_bus is not None:
-            logger.info("BybitLiveRunner: Folosind NotifierBus injectat din orchestrator")
-            notifier_bus = injected_notifier_bus
-        else:
-            notifier_bus = NotifierBus(fail_silent=True)
+        notifier_bus = self._bus_ext or NotifierBus(fail_silent=True)
+        if not self._bus_ext:
             if self.cfg.telegram_bot_token and self.cfg.telegram_chat_id:
                 try:
                     from notifications.telegram import TelegramNotifier
@@ -895,7 +189,7 @@ class BybitLiveRunner:
                         chat_id=self.cfg.telegram_chat_id,
                     ))
                 except Exception as exc:
-                    logger.warning("NotifierBus: Telegram setup failed: %s", exc)
+                    logger.warning("Telegram setup failed: {}", exc)
             if self.cfg.slack_webhook_url:
                 try:
                     from notifications.slack_notifier import SlackNotifier, SlackConfig
@@ -903,550 +197,94 @@ class BybitLiveRunner:
                         SlackConfig(webhook_url=self.cfg.slack_webhook_url)
                     ))
                 except Exception as exc:
-                    logger.warning("NotifierBus: Slack setup failed: %s", exc)
+                    logger.warning("Slack setup failed: {}", exc)
 
         return spread_monitor, circuit_breaker, order_manager, watchdog, notifier_bus
 
-    # -------------------------------------------------------------------------
-    # Phase 3: Start health server
-    # -------------------------------------------------------------------------
-
-    async def _start_health_server(self, components: dict[str, Any]) -> HealthCheck:
-        hc_cfg = HealthCheckConfig(
-            port=self.cfg.health_port,
-            check_interval=10.0,
+    async def _start_health_server(self, components: dict) -> HealthCheck:
+        """Start HealthCheck HTTP server; fall back to inline aiohttp on failure."""
+        hc = HealthCheck.from_components(
+            components, HealthCheckConfig(port=self.cfg.health_port, check_interval=10.0)
         )
-        health = HealthCheck.from_components(components, hc_cfg)
         try:
-            await health.start_http_server()
-            logger.info("BybitLiveRunner: Health server started on port %d", self.cfg.health_port)
+            await hc.start_http_server()
+            logger.info("BybitLiveRunner: health server on :{}", self.cfg.health_port)
         except Exception as exc:
-            logger.warning("BybitLiveRunner: HealthCheck.start_http_server failed (%s) — fallback", exc)
+            logger.warning("HealthCheck server failed: {} — inline fallback", exc)
             try:
                 from aiohttp import web
-                aio_app = web.Application()
-
-                async def handle_health(request):
-                    status = HealthStatus.HEALTHY
-                    for _, checker in components.items():
-                        try:
-                            if not checker.is_healthy():
-                                status = HealthStatus.DEGRADED
-                                break
-                        except Exception:
-                            status = HealthStatus.UNHEALTHY
-                            break
-                    sc = 200 if status == HealthStatus.HEALTHY else 503
-                    return web.json_response(
-                        {"status": status.value, "timestamp": datetime.utcnow().isoformat()},
-                        status=sc,
-                    )
-
-                aio_app.router.add_get("/api/health", handle_health)
-                runner_obj = web.AppRunner(aio_app)
-                await runner_obj.setup()
-                site = web.TCPSite(runner_obj, port=self.cfg.health_port)
-                await site.start()
-                logger.info("BybitLiveRunner: Fallback health server on port %d", self.cfg.health_port)
+                app = web.Application()
+                async def _h(_): return web.json_response({"status": "ok"})
+                app.router.add_get("/api/health", _h)
+                runner_ = web.AppRunner(app)
+                await runner_.setup()
+                await web.TCPSite(runner_, port=self.cfg.health_port).start()
+                logger.info("BybitLiveRunner: fallback health on :{}", self.cfg.health_port)
             except Exception as exc2:
-                logger.error("BybitLiveRunner: Health server failed completely: %s", exc2)
-        return health
+                logger.error("Health server failed completely: {}", exc2)
+        return hc
 
-    # -------------------------------------------------------------------------
-    # Phase 4: Main trading loop
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Main trading loop
+    # ------------------------------------------------------------------
 
     async def _run_loop(
         self,
-        order_router: Any,
-        ws_feed: Any,
-        spread_monitor: SpreadMonitor,
-        circuit_breaker: CircuitBreaker,
-        order_manager: OrderManager,
-        watchdog: WsWatchdog,
-        health: HealthCheck,
-        notifier_bus: NotifierBus,
+        order_router, ws_feed,
+        spread_monitor, circuit_breaker, order_manager,
+        watchdog, health, notifier_bus,
+        funding_gate: FundingGate,
+        decision_engine: DecisionEngine,
+        executor: ActionExecutor,
     ) -> None:
-        logger.info("BybitLiveRunner: Starting main trading loop...")
-
-        # FIX-S3: stocheaza referintele pentru handlerii de WS privat
-        self._order_manager_ref = order_manager
-        self._notifier_bus_ref  = notifier_bus
-
         watchdog.set_health_checker(health)
         watchdog_task = asyncio.create_task(watchdog.start())
-
-        pnl_task: Optional[asyncio.Task] = None
-        if self.cfg.pnl_reconciler_enabled:
-            pnl_task = asyncio.create_task(
-                self._pnl_reconciler_loop(order_router, order_manager, notifier_bus)
-            )
-
-        # FIX-S3: Private WS task (fills instant)
-        private_ws_task: Optional[asyncio.Task] = asyncio.create_task(
-            self._start_private_ws(), name="private_ws"
-        )
-
         first_bar = True
-        publish_counter = 0
 
-        try:
-            while not self._stop_event.is_set():
-                try:
-                    bar = await ws_feed.get_bar()
-                    if bar is None:
-                        await asyncio.sleep(0.1)
-                        continue
+        while not self._stop_event.is_set():
+            try:
+                bar = await ws_feed.get_bar()
+                if bar is None:
+                    await asyncio.sleep(0.1)
+                    continue
 
-                    if getattr(bar, "price_x", 0.0) == 0.0 or getattr(bar, "price_y", 0.0) == 0.0:
-                        logger.warning(
-                            "BybitLiveRunner: Bar ignorat — price_y=%.4f price_x=%.4f (zero)",
-                            getattr(bar, "price_y", 0.0), getattr(bar, "price_x", 0.0),
-                        )
-                        continue
+                spread_monitor.update(bar.price_y, bar.price_x)
+                zscore = spread_monitor.zscore
 
-                    self._bar_count += 1
-                    spread_monitor.update(bar.price_y, bar.price_x)
-                    zscore = spread_monitor.zscore
-                    spread = spread_monitor.spread
-
-                    if first_bar:
-                        logger.info(
-                            "BybitLiveRunner: First WS bar | %s=%.4f %s=%.4f | "
-                            "spread=%.6f | zscore=%.4f | bar_count=%d (REST pre-loaded)",
-                            self.cfg.symbol_y, bar.price_y,
-                            self.cfg.symbol_x, bar.price_x,
-                            spread, zscore, self._bar_count,
-                        )
-                        first_bar = False
-
-                    is_warmed_up = getattr(spread_monitor, "is_warmed_up", False)
-                    if not is_warmed_up:
-                        if self._bar_count % 10 == 0:
-                            self._publish_warmup_status(spread_monitor)
-                            logger.info(
-                                "[Warm-up WS] %d/%d bare (%.0f%%)",
-                                self._bar_count, self.cfg.warmup_bars,
-                                100 * self._bar_count / self.cfg.warmup_bars,
-                            )
-                        self._publish_bar(bar, spread, zscore, spread_monitor, circuit_breaker, order_manager)
-                        continue
-
-                    if self._bar_count == self.cfg.warmup_bars:
-                        self._publish_warmup_status(spread_monitor, coint_pvalue=0.0)
-                        logger.info("[Warm-up] COMPLETE — trading enabled")
-                        if notifier_bus:
-                            try:
-                                await notifier_bus.send_alert(
-                                    f"\u2705 Warm-up complet ({self.cfg.warmup_bars} bare) — trading activ",
-                                    level="info",
-                                )
-                            except Exception:
-                                pass
-
-                    if circuit_breaker.state == CircuitState.OPEN:
-                        logger.warning(
-                            "BybitLiveRunner: Circuit breaker OPEN | failures=%d",
-                            circuit_breaker.failures,
-                        )
-                        self._publish_bar(bar, spread, zscore, spread_monitor, circuit_breaker, order_manager)
-                        await asyncio.sleep(1.0)
-                        continue
-
-                    if self.cfg.funding_gate_enabled:
-                        if not self._check_funding_gate():
-                            logger.info("BybitLiveRunner: Funding gate CLOSED")
-                            self._publish_bar(bar, spread, zscore, spread_monitor, circuit_breaker, order_manager)
-                            continue
-
-                    action = self._decide(
-                        zscore=zscore,
-                        spread=spread,
-                        circuit_breaker=circuit_breaker,
-                        order_manager=order_manager,
-                        market_trade_enabled=self.cfg.market_trade_enabled,
+                if first_bar:
+                    logger.info(
+                        "BybitLiveRunner: first bar | spread={:.6f} z={:.4f}",
+                        spread_monitor.spread, zscore,
                     )
+                    first_bar = False
 
-                    if action:
-                        await self._execute_action(
-                            action=action,
-                            order_router=order_router,
-                            circuit_breaker=circuit_breaker,
-                            order_manager=order_manager,
-                            notifier_bus=notifier_bus,
-                            bar=bar,
-                        )
-
-                    publish_counter += 1
-                    if publish_counter >= self.cfg.state_bus_publish_interval:
-                        self._publish_bar(bar, spread, zscore, spread_monitor, circuit_breaker, order_manager)
-                        publish_counter = 0
-
-                except asyncio.CancelledError:
-                    logger.info("BybitLiveRunner: Loop cancelled")
-                    break
-                except KeyboardInterrupt:
-                    logger.info("BybitLiveRunner: Keyboard interrupt")
-                    break
-                except Exception as exc:
-                    logger.error("BybitLiveRunner: Loop error: %s", exc)
+                if circuit_breaker.is_open():
+                    logger.warning(
+                        "BybitLiveRunner: circuit OPEN remaining={:.1f}s",
+                        circuit_breaker.remaining_cooldown,
+                    )
                     await asyncio.sleep(1.0)
+                    continue
 
-        finally:
-            for task, name in [
-                (watchdog_task, "watchdog"),
-                (pnl_task, "pnl_reconciler"),
-                (private_ws_task, "private_ws"),
-            ]:
-                if task is not None and not task.done():
-                    task.cancel()
-                    try:
-                        await task
-                    except asyncio.CancelledError:
-                        pass
-            if self._private_ws_client is not None:
-                try:
-                    await self._private_ws_client.stop()
-                except Exception:
-                    pass
-            logger.info("BybitLiveRunner: Toate task-urile background oprite")
+                if self.cfg.funding_gate_enabled and not funding_gate.is_open(ws_feed):
+                    logger.info("BybitLiveRunner: funding gate CLOSED")
+                    continue
 
-    # -------------------------------------------------------------------------
-    # _check_funding_gate
-    # -------------------------------------------------------------------------
+                action = decision_engine.decide(zscore, circuit_breaker, order_manager)
+                if action:
+                    await executor.execute(
+                        action, order_router, order_manager, notifier_bus, bar
+                    )
 
-    def _check_funding_gate(self) -> bool:
-        if self._funding_monitor is None:
-            return True
-        try:
-            y_funding = self._funding_monitor.get_funding_rate(self.cfg.symbol_y)
-            x_funding = self._funding_monitor.get_funding_rate(self.cfg.symbol_x)
-            if y_funding is not None and x_funding is not None:
-                if y_funding < -0.01 or x_funding < -0.01:
-                    return False
-            return True
-        except Exception as exc:
-            logger.warning("BybitLiveRunner: Funding gate check failed: %s", exc)
-            return True
-
-    def _decide(
-        self,
-        zscore: float,
-        spread: float,
-        circuit_breaker: CircuitBreaker,
-        order_manager: OrderManager,
-        market_trade_enabled: bool,
-    ) -> Optional[str]:
-        if not market_trade_enabled:
-            return None
-        if circuit_breaker.state == CircuitState.OPEN:
-            return None
-        if abs(zscore) >= self.cfg.entry_zscore:
-            return "entry_short" if zscore > 0 else "entry_long"
-        if abs(zscore) <= self.cfg.exit_zscore and order_manager.has_position():
-            return "exit"
-        return None
-
-    async def _execute_action(
-        self,
-        action: str,
-        order_router: Any,
-        circuit_breaker: CircuitBreaker,
-        order_manager: OrderManager,
-        notifier_bus: NotifierBus,
-        bar: Any,
-    ) -> None:
-        from execution.bybit_order_router import OrderRequest, OrderSide, OrderType
-
-        if self.cfg.dry_run:
-            logger.info(
-                "BybitLiveRunner: [DRY RUN] %s | %s@%.4f | %s@%.4f",
-                action.upper(), self.cfg.symbol_y, bar.price_y, self.cfg.symbol_x, bar.price_x,
-            )
-            return
-
-        if bar.price_x == 0.0:
-            logger.error("BybitLiveRunner: price_x=0 in _execute_action — skip")
-            return
-
-        # FIX-S1: round qty la qtyStep per simbol
-        base_qty_y = await self._instr_cache.round_qty(self.cfg.symbol_y, self.cfg.base_qty)
-        x_qty_raw  = self.cfg.base_qty * bar.price_y / bar.price_x
-        base_qty_x = await self._instr_cache.round_qty(self.cfg.symbol_x, x_qty_raw)
-
-        if base_qty_y <= 0 or base_qty_x <= 0:
-            logger.error(
-                "BybitLiveRunner: qty dupa rounding <= 0 (qty_y=%.8f qty_x=%.8f) — skip",
-                base_qty_y, base_qty_x,
-            )
-            return
-
-        async def _send_legs(req_y, req_x, record_fn):
-            leg_y_done = False
-            try:
-                await order_router.create_order(req_y)
-                leg_y_done = True
-                await order_router.create_order(req_x)
-                record_fn()
-                return True
+            except asyncio.CancelledError:
+                logger.info("BybitLiveRunner: loop cancelled")
+                break
             except Exception as exc:
-                if leg_y_done:
-                    logger.critical(
-                        "BybitLiveRunner: \u2620\ufe0f DUAL-LEG PARTIAL FILL — "
-                        "leg_y OK, leg_x FAILED: %s. Emergency close %s",
-                        exc, req_y.symbol,
-                    )
-                    if notifier_bus:
-                        try:
-                            await notifier_bus.send_alert(
-                                f"\u2620\ufe0f PARTIAL FILL: {req_y.symbol} ok, {req_x.symbol} FAILED ({exc})",
-                                level="critical",
-                            )
-                        except Exception:
-                            pass
-                    try:
-                        cancel_side = OrderSide.SELL if req_y.side == OrderSide.BUY else OrderSide.BUY
-                        cancel_req = OrderRequest(
-                            symbol=req_y.symbol, side=cancel_side,
-                            order_type=OrderType.MARKET, qty=req_y.qty, price=0.0,
-                        )
-                        await order_router.create_order(cancel_req)
-                        logger.warning("BybitLiveRunner: Emergency close %s trimis OK", req_y.symbol)
-                    except Exception as cancel_exc:
-                        logger.critical(
-                            "BybitLiveRunner: \u2620\ufe0f Emergency close FAILED %s: %s",
-                            req_y.symbol, cancel_exc,
-                        )
-                    circuit_breaker.record_failure()
-                raise
+                logger.error("BybitLiveRunner: loop error: {}", exc)
+                await asyncio.sleep(1.0)
 
+        watchdog_task.cancel()
         try:
-            if action == "entry_long":
-                req_y = OrderRequest(symbol=self.cfg.symbol_y, side=OrderSide.BUY,
-                    order_type=OrderType.MARKET, qty=base_qty_y, price=0.0)
-                req_x = OrderRequest(symbol=self.cfg.symbol_x, side=OrderSide.SELL,
-                    order_type=OrderType.MARKET, qty=base_qty_x, price=0.0)
-                await _send_legs(req_y, req_x,
-                    lambda: order_manager.record_entry_long(base_qty_y, bar.price_y, bar.price_x))
-                logger.info("BybitLiveRunner: ENTRY LONG | %s@%.2f", self.cfg.symbol_y, bar.price_y)
-                self._save_checkpoint(order_manager)
-
-                # FIX-S2: Native SL/TP dupa entry reusit
-                if self.cfg.native_sl_tp_enabled:
-                    sl_y = calc_sl_price(bar.price_y, "long", self.cfg.sl_pct)
-                    tp_y = calc_tp_price(bar.price_y, "long", self.cfg.tp_pct)
-                    asyncio.create_task(place_sl_tp(
-                        order_router, self.cfg.symbol_y, "long",
-                        base_qty_y, sl_y, tp_y, self.cfg.bybit_category,
-                    ))
-                    sl_x = calc_sl_price(bar.price_x, "short", self.cfg.sl_pct)
-                    tp_x = calc_tp_price(bar.price_x, "short", self.cfg.tp_pct)
-                    asyncio.create_task(place_sl_tp(
-                        order_router, self.cfg.symbol_x, "short",
-                        base_qty_x, sl_x, tp_x, self.cfg.bybit_category,
-                    ))
-
-                if notifier_bus:
-                    await notifier_bus.send_alert(
-                        f"\u2705 ENTRY LONG: {self.cfg.symbol_y}/{self.cfg.symbol_x} "
-                        f"| SL={self.cfg.sl_pct*100:.1f}% TP={self.cfg.tp_pct*100:.1f}%",
-                        level="success",
-                    )
-
-            elif action == "entry_short":
-                req_y = OrderRequest(symbol=self.cfg.symbol_y, side=OrderSide.SELL,
-                    order_type=OrderType.MARKET, qty=base_qty_y, price=0.0)
-                req_x = OrderRequest(symbol=self.cfg.symbol_x, side=OrderSide.BUY,
-                    order_type=OrderType.MARKET, qty=base_qty_x, price=0.0)
-                await _send_legs(req_y, req_x,
-                    lambda: order_manager.record_entry_short(base_qty_y, bar.price_y, bar.price_x))
-                logger.info("BybitLiveRunner: ENTRY SHORT | %s@%.2f", self.cfg.symbol_y, bar.price_y)
-                self._save_checkpoint(order_manager)
-
-                # FIX-S2: Native SL/TP dupa entry reusit
-                if self.cfg.native_sl_tp_enabled:
-                    sl_y = calc_sl_price(bar.price_y, "short", self.cfg.sl_pct)
-                    tp_y = calc_tp_price(bar.price_y, "short", self.cfg.tp_pct)
-                    asyncio.create_task(place_sl_tp(
-                        order_router, self.cfg.symbol_y, "short",
-                        base_qty_y, sl_y, tp_y, self.cfg.bybit_category,
-                    ))
-                    sl_x = calc_sl_price(bar.price_x, "long", self.cfg.sl_pct)
-                    tp_x = calc_tp_price(bar.price_x, "long", self.cfg.tp_pct)
-                    asyncio.create_task(place_sl_tp(
-                        order_router, self.cfg.symbol_x, "long",
-                        base_qty_x, sl_x, tp_x, self.cfg.bybit_category,
-                    ))
-
-                if notifier_bus:
-                    await notifier_bus.send_alert(
-                        f"\u2705 ENTRY SHORT: {self.cfg.symbol_y}/{self.cfg.symbol_x} "
-                        f"| SL={self.cfg.sl_pct*100:.1f}% TP={self.cfg.tp_pct*100:.1f}%",
-                        level="success",
-                    )
-
-            elif action == "exit":
-                pos = order_manager.current_position
-                if pos:
-                    # FIX-S1: round qty la exit
-                    exit_qty_y = await self._instr_cache.round_qty(
-                        self.cfg.symbol_y, abs(getattr(pos, "y_qty", base_qty_y))
-                    )
-                    exit_qty_x = await self._instr_cache.round_qty(
-                        self.cfg.symbol_x, abs(getattr(pos, "x_qty", base_qty_x))
-                    )
-                    req_y = OrderRequest(symbol=self.cfg.symbol_y,
-                        side=OrderSide.SELL if pos.y_side == "long" else OrderSide.BUY,
-                        order_type=OrderType.MARKET, qty=exit_qty_y, price=0.0)
-                    req_x = OrderRequest(symbol=self.cfg.symbol_x,
-                        side=OrderSide.BUY if pos.x_side == "short" else OrderSide.SELL,
-                        order_type=OrderType.MARKET, qty=exit_qty_x, price=0.0)
-                    await _send_legs(req_y, req_x,
-                        lambda: order_manager.record_exit(bar.price_y, bar.price_x))
-                    logger.info("BybitLiveRunner: EXIT | PnL=%.4f", order_manager.current_pnl)
-                    self._checkpoint.clear()
-                    self._adopted_position = None
-                    if notifier_bus:
-                        await notifier_bus.send_alert(
-                            f"\u2705 EXIT: PnL={order_manager.current_pnl:.4f}", level="success")
-
-            if order_manager.current_pnl is not None and order_manager.current_pnl < 0:
-                circuit_breaker.record_failure()
-            else:
-                circuit_breaker.record_success()
-
-        except Exception as exc:
-            logger.error("BybitLiveRunner: Execute action '%s' failed: %s", action, exc)
-            circuit_breaker.record_failure()
-            if notifier_bus:
-                try:
-                    await notifier_bus.send_alert(
-                        f"\u274c ACTION FAILED: {action} | {exc}", level="error")
-                except Exception:
-                    pass
-
-    def _save_checkpoint(self, order_manager: OrderManager) -> None:
-        try:
-            pos = order_manager.current_position
-            if pos is None:
-                return
-            adopted = AdoptedPosition(
-                symbol_y=self.cfg.symbol_y,
-                symbol_x=self.cfg.symbol_x,
-                y_side=getattr(pos, "y_side", "none"),
-                x_side=getattr(pos, "x_side", "none"),
-                y_qty=float(getattr(pos, "y_qty", 0.0)),
-                x_qty=float(getattr(pos, "x_qty", 0.0)),
-                y_entry_price=float(getattr(pos, "y_entry", 0.0)),
-                x_entry_price=float(getattr(pos, "x_entry", 0.0)),
-                unrealised_pnl=float(getattr(order_manager, "current_pnl", 0.0) or 0.0),
-                source="checkpoint",
-            )
-            self._checkpoint.save(adopted)
-        except Exception as exc:
-            logger.warning("_save_checkpoint: %s", exc)
-
-    # -------------------------------------------------------------------------
-    # Public API
-    # -------------------------------------------------------------------------
-
-    async def run(self) -> int:
-        logger.info("BybitLiveRunner: ========== Starting Live Runner v3.9 ==========")
-        logger.info(
-            "BybitLiveRunner: %s/%s | interval=%dm | dry_run=%s",
-            self.cfg.symbol_y, self.cfg.symbol_x, self.cfg.interval, self.cfg.dry_run,
-        )
-        if self.cfg.native_sl_tp_enabled:
-            logger.info(
-                "BybitLiveRunner: Native SL/TP activ | SL=%.1f%% TP=%.1f%%",
-                self.cfg.sl_pct * 100, self.cfg.tp_pct * 100,
-            )
-
-        # FIX-C1: log explicit daca runner e pornit standalone
-        if not _ORCHESTRATOR_ACTIVE:
-            logger.warning(
-                "BybitLiveRunner: STANDALONE MODE — WorkflowOrchestrator inactiv. "
-                "Pozitiile SOLO (ex: EGLD hedge) NU vor fi gestionate de SingleHedgeManager."
-            )
-
-        order_router, built_ws_feed = await self._build_exchange_via_factory()
-        ws_feed = self._injected_ws_feed if self._injected_ws_feed is not None else built_ws_feed
-        if self._injected_ws_feed is not None:
-            logger.info("BybitLiveRunner: Folosind WsFeed injectat din orchestrator")
-
-        if hasattr(order_router, "connect"):
-            try:
-                await order_router.connect()
-                logger.info("BybitLiveRunner: order_router.connect() OK")
-            except Exception as exc:
-                logger.warning("BybitLiveRunner: order_router.connect() failed (%s) — continuam", exc)
-
-        (
-            spread_monitor, circuit_breaker, order_manager, watchdog, notifier_bus,
-        ) = await self._build_components(
-            order_router, ws_feed,
-            injected_notifier_bus=self._injected_notifier_bus,
-        )
-
-        # Phase 0: REST warm-up
-        await self._warmup_from_rest(spread_monitor)
-
-        # Phase 0.5 v3.9: Boot Scan complet (balanta + pozitii + Telegram + standalone guard)
-        await self._reconcile_positions(order_router, order_manager, notifier_bus)
-
-        # Mesaj de start runner (dupa boot scan, pentru context cronologic in Telegram)
-        if notifier_bus:
-            sl_tp_msg = (
-                f"\nSL={self.cfg.sl_pct*100:.1f}% TP={self.cfg.tp_pct*100:.1f}%"
-                if self.cfg.native_sl_tp_enabled else ""
-            )
-            standalone_warn = (
-                "\n\u26a0\ufe0f STANDALONE MODE — SingleHedgeManager inactiv"
-                if not _ORCHESTRATOR_ACTIVE else ""
-            )
-            await notifier_bus.send_alert(
-                f"\u26a1 QuantLuna v3.9 LIVE | {self.cfg.symbol_y}/{self.cfg.symbol_x} | "
-                f"dry_run={self.cfg.dry_run}{sl_tp_msg}{standalone_warn}",
-                level="info",
-            )
-
-        components_for_health = {
-            "spread_monitor": spread_monitor,
-            "circuit_breaker": circuit_breaker,
-            "order_manager": order_manager,
-            "ws_feed": ws_feed,
-            "watchdog": watchdog,
-        }
-        health = await self._start_health_server(components_for_health)
-
-        try:
-            await self._run_loop(
-                order_router=order_router,
-                ws_feed=ws_feed,
-                spread_monitor=spread_monitor,
-                circuit_breaker=circuit_breaker,
-                order_manager=order_manager,
-                watchdog=watchdog,
-                health=health,
-                notifier_bus=notifier_bus,
-            )
-        except Exception as exc:
-            logger.critical("BybitLiveRunner: run() crashed: %s", exc)
-            if notifier_bus:
-                try:
-                    await notifier_bus.send_alert(
-                        f"\U0001f480 RUNNER CRASHED: {exc} — restart necesar!",
-                        level="critical",
-                    )
-                except Exception:
-                    pass
-            raise
-        finally:
-            logger.info("BybitLiveRunner: Runner stopped")
-
-        return 0
-
-    start = run
-
-    def stop(self) -> None:
-        self._stop_event.set()
+            await watchdog_task
+        except asyncio.CancelledError:
+            pass
