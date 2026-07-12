@@ -18,6 +18,12 @@ Fix #6: KalmanScoringWeights dataclass — all score() numeric adjustments
 Fix #7 (Gap #3): generate_batch() now accepts coint_pvalue_series: Optional[pd.Series]
   so the real per-bar ADF p-value produced by WalkForwardEngine._build_coint_pvalue_series
   reaches score() and the meta dict, instead of being discarded.
+
+Changes (code review 2026-07-12):
+  - Patch 6: changed coint_pvalue fallback from 0.05 to 0.10.
+    0.05 sits exactly on the score() boundary between the p<0.05 bonus
+    and the p>0.10 penalty, triggering neither. 0.10 is the conservative
+    fallback that correctly triggers coint_p010_penalty in score().
 """
 from __future__ import annotations
 
@@ -152,6 +158,10 @@ class KalmanPairsTrading(BaseStrategy):
         Now: if coint_pvalue_series is provided its values are attached to every row
         in the result DataFrame under column 'coint_pvalue', making them available
         to AutoStrategySelector.generate_batch() and MarketContext construction.
+
+        Patch 6: fallback changed from 0.05 to 0.10.
+        0.05 sits exactly on the score() boundary (neither bonus nor penalty).
+        0.10 is the conservative fallback that triggers coint_p010_penalty.
         """
         result = self._generator.generate_batch(
             df=df,
@@ -161,12 +171,12 @@ class KalmanPairsTrading(BaseStrategy):
         )
         result["strategy_name"] = self.name
 
-        # Fix #7: propagate real p-value per bar so callers can wire it into MarketContext
         if coint_pvalue_series is not None:
             pv = coint_pvalue_series.reset_index(drop=True)
-            result["coint_pvalue"] = pv.reindex(result.index).fillna(0.05).to_numpy(dtype=float)
+            result["coint_pvalue"] = pv.reindex(result.index).fillna(0.10).to_numpy(dtype=float)
         else:
-            result["coint_pvalue"] = 0.05
+            # Patch 6: conservative fallback — triggers coint_p010_penalty in score()
+            result["coint_pvalue"] = 0.10
 
         return result
 
@@ -193,12 +203,13 @@ class KalmanPairsTrading(BaseStrategy):
             score += w.coint_p010_penalty
 
         hl = context.half_life_hours
-        if w.hl_optimal_low <= hl <= w.hl_optimal_high:
-            score += w.hl_optimal_bonus
-        elif hl > w.hl_long_threshold:
-            score += w.hl_long_penalty
-        elif hl < w.hl_short_threshold:
-            score += w.hl_short_penalty
+        if hl is not None and not (hl != hl):  # guard against None/NaN
+            if w.hl_optimal_low <= hl <= w.hl_optimal_high:
+                score += w.hl_optimal_bonus
+            elif hl > w.hl_long_threshold:
+                score += w.hl_long_penalty
+            elif hl < w.hl_short_threshold:
+                score += w.hl_short_penalty
 
         if context.spread_autocorr < w.autocorr_good_threshold:
             score += w.autocorr_good_bonus

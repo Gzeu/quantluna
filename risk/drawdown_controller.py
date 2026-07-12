@@ -1,77 +1,82 @@
 """
 QuantLuna — Portfolio Drawdown Controller  (Sprint 10)
 
-DD Control pe trei niveluri:
+DD Control on three levels:
 
   LEVEL 1 — Pair-level soft stop
-    Dacă un pair individual depășește max_pair_dd, îl închide forțat.
-    Logica: un pair în drawdown extins sugerează fie breakdown de
-    cointegration, fie regim shift. Nu așteptăm mean reversion care
-    nu mai vine.
+    If an individual pair exceeds max_pair_dd, force-close it.
+    Rationale: extended pair drawdown suggests cointegration breakdown
+    or regime shift — do not wait for mean reversion that may not come.
 
   LEVEL 2 — Portfolio soft limit
-    Dacă DD agregat depășește portfolio_soft_dd:
-    - Nicio poziție nouă
-    - Pozițiile existente rămân deschise (nu le forțăm la pierdere)
-    - LogWarning + alert în StateBus
+    If aggregate DD exceeds portfolio_soft_dd:
+    - No new positions
+    - Existing positions remain open (avoid forced losses)
+    - LogWarning + StateBus alert
 
   LEVEL 3 — Portfolio hard stop (circuit breaker)
-    Dacă DD agregat depășește portfolio_hard_dd:
-    - Toate pozițiile se marchează pentru închidere imediată
-    - Trading halted complet
-    - Reset manual necesar (safety gate explicit)
+    If aggregate DD exceeds portfolio_hard_dd:
+    - All positions marked for immediate close
+    - Trading halted completely
+    - Manual reset required (explicit safety gate)
 
-De ce trei niveluri, nu unul:
-  Un circuit breaker binar (on/off) este prea agresiv pe crypto:
-  volatilitatea intraday poate declanșa și opri circuitul de mai
-  multe ori pe zi. Trei niveluri cu praguri diferite dă sistemului
-  spațiu să respire la nivel pair, dar protejează capitalul total.
+Why three levels, not one:
+  A binary circuit breaker (on/off) is too aggressive on crypto:
+  intraday volatility can trigger and clear the breaker multiple times
+  per day. Three levels with distinct thresholds give the system room
+  to breathe at the pair level while protecting total capital.
 
-Tracking equity curve:
-  DDController menține propria equity curve pentru a calcula
-  drawdown față de high-water mark (HWM), nu față de capital inițial.
-  Aceasta este metrica corectă pentru prop trading.
+Equity curve tracking:
+  DDController maintains its own equity curve to calculate drawdown
+  against the high-water mark (HWM), not initial capital.
+  This is the correct metric for prop trading.
 
-Limite reale:
-  - Pair-level DD este calculat pe open PnL (mark-to-market).
-    La slippage mare la exit, pierderea reală poate depăși limitele.
-  - Hard stop declanșat în miezul nopții pe crypto poate coincide
-    cu lichiditate minimă. Adăugați un delay de execuție dacă
-    exchange-ul are spread mare în acel moment.
-  - DDController nu cunoaște cauzele drawdown-ului. Poate fi
-    cointegration breakdown sau poate fi wick temporar. Analiza
-    post-hoc este obligatorie înainte de re-activare.
+Real-world limitations:
+  - Pair-level DD is calculated on open PnL (mark-to-market).
+    At high slippage on exit, actual loss may exceed limits.
+  - Hard stop triggered at low-liquidity hours may coincide with
+    wide spreads. Consider an execution delay config for such cases.
+  - DDController does not know the cause of drawdown. It may be
+    cointegration breakdown or a temporary wick. Post-hoc analysis
+    is mandatory before re-activation.
+
+Changes (code review 2026-07-12):
+  - Patch 3: replaced unbounded List[float] equity_curve with
+    collections.deque(maxlen=1000) to prevent memory leak in
+    long-running live sessions (appended on every update() call).
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, Deque, List, Optional
 
 import numpy as np
 
 
 class DDLevel(Enum):
     NORMAL = "NORMAL"
-    SOFT_LIMIT = "SOFT_LIMIT"     # nicio poziție nouă
-    HARD_STOP = "HARD_STOP"       # toate pozițiile se închid, trading halted
+    SOFT_LIMIT = "SOFT_LIMIT"     # no new positions
+    HARD_STOP = "HARD_STOP"       # all positions closed, trading halted
 
 
 @dataclass
 class DDConfig:
-    pair_soft_dd: float = 0.05        # 5% DD pe pair → forțare exit pair individual
-    portfolio_soft_dd: float = 0.08   # 8% DD portfolio → nicio poziție nouă
-    portfolio_hard_dd: float = 0.15   # 15% DD portfolio → circuit breaker total
+    pair_soft_dd: float = 0.05        # 5% DD on pair -> force-close pair
+    portfolio_soft_dd: float = 0.08   # 8% portfolio DD -> no new positions
+    portfolio_hard_dd: float = 0.15   # 15% portfolio DD -> full circuit breaker
     capital_usd: float = 10_000.0
-    hwm_reset_on_manual_resume: bool = True  # resetare HWM la re-activare manuală
+    hwm_reset_on_manual_resume: bool = True  # reset HWM on manual re-activation
+    equity_curve_maxlen: int = 1000   # max bars retained in equity curve deque
 
 
 @dataclass
 class PairDDState:
     pair_id: str
-    entry_equity_snapshot: float     # equity la deschiderea poziției
+    entry_equity_snapshot: float     # equity at position open
     current_open_pnl: float = 0.0
-    max_open_pnl: float = 0.0        # peak open PnL pentru HWM pair-level
+    max_open_pnl: float = 0.0        # peak open PnL for pair-level HWM
     force_close: bool = False
 
 
@@ -87,10 +92,10 @@ class DDSnapshot:
 
 class DrawdownController:
     """
-    Controller de drawdown pe trei niveluri pentru portfolio multi-pair.
+    Three-level drawdown controller for multi-pair portfolios.
 
-    Integrare cu LiveTrader:
-      În loop-ul principal, apelați:
+    Integration with LiveTrader::
+
         snap = dd_ctrl.update(open_pnl_per_pair)
         if snap.level == DDLevel.HARD_STOP:
             await live_trader.close_all()
@@ -102,19 +107,25 @@ class DrawdownController:
 
     def __init__(self, cfg: Optional[DDConfig] = None) -> None:
         self.cfg = cfg or DDConfig()
-        self._equity_curve: List[float] = [self.cfg.capital_usd]
+        # Patch 3: bounded deque prevents unbounded memory growth.
+        # Only the last value is needed for equity calculation; the deque
+        # retains a window useful for debugging / dashboard display.
+        self._equity_curve: Deque[float] = deque(
+            [self.cfg.capital_usd],
+            maxlen=self.cfg.equity_curve_maxlen,
+        )
         self._hwm: float = self.cfg.capital_usd
         self._level: DDLevel = DDLevel.NORMAL
         self._pair_states: Dict[str, PairDDState] = {}
         self._hard_stop_triggered: bool = False
-        self._resume_armed: bool = False  # flag pentru re-activare manuală
+        self._resume_armed: bool = False
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def open_pair(self, pair_id: str) -> None:
-        """Înregistrează deschiderea unui pair nou."""
+        """Register a newly opened pair position."""
         equity_now = self._equity_curve[-1]
         self._pair_states[pair_id] = PairDDState(
             pair_id=pair_id,
@@ -122,21 +133,21 @@ class DrawdownController:
         )
 
     def close_pair(self, pair_id: str) -> Optional[PairDDState]:
-        """Marchează un pair ca închis și returnează starea finală."""
+        """Mark a pair as closed and return its final state."""
         return self._pair_states.pop(pair_id, None)
 
     def update(self, open_pnl_per_pair: Dict[str, float]) -> DDSnapshot:
         """
-        Actualizează starea DD cu PnL-ul curent per pair.
+        Update DD state with current per-pair PnL.
 
-        Parametri:
-          open_pnl_per_pair — dict {pair_id: open_pnl_usd}
+        Parameters
+        ----------
+        open_pnl_per_pair : dict {pair_id: open_pnl_usd}
         """
         notes: List[str] = []
         pairs_force_close: List[str] = []
         cfg = self.cfg
 
-        # Actualizare open PnL per pair
         total_open_pnl = 0.0
         for pair_id, pnl in open_pnl_per_pair.items():
             if pair_id not in self._pair_states:
@@ -152,32 +163,28 @@ class DrawdownController:
                 state.force_close = True
                 pairs_force_close.append(pair_id)
                 notes.append(
-                    f"PAIR_DD: {pair_id} DD={pair_dd:.1%} ≥ {cfg.pair_soft_dd:.1%}"
+                    f"PAIR_DD: {pair_id} DD={pair_dd:.1%} >= {cfg.pair_soft_dd:.1%}"
                 )
 
-        # Portfolio equity curentă
         equity = cfg.capital_usd + total_open_pnl
         self._equity_curve.append(equity)
 
-        # Update HWM
         if equity > self._hwm:
             self._hwm = equity
 
-        # Portfolio DD față de HWM
         portfolio_dd = max(0.0, (self._hwm - equity) / self._hwm) if self._hwm > 0 else 0.0
 
-        # Level 2: soft limit
         if portfolio_dd >= cfg.portfolio_hard_dd:
             self._level = DDLevel.HARD_STOP
             self._hard_stop_triggered = True
-            pairs_force_close = list(self._pair_states.keys())  # toate
+            pairs_force_close = list(self._pair_states.keys())
             notes.append(
-                f"HARD_STOP: portfolio DD={portfolio_dd:.1%} ≥ {cfg.portfolio_hard_dd:.1%}"
+                f"HARD_STOP: portfolio DD={portfolio_dd:.1%} >= {cfg.portfolio_hard_dd:.1%}"
             )
         elif portfolio_dd >= cfg.portfolio_soft_dd:
             self._level = DDLevel.SOFT_LIMIT
             notes.append(
-                f"SOFT_LIMIT: portfolio DD={portfolio_dd:.1%} ≥ {cfg.portfolio_soft_dd:.1%}"
+                f"SOFT_LIMIT: portfolio DD={portfolio_dd:.1%} >= {cfg.portfolio_soft_dd:.1%}"
             )
         elif not self._hard_stop_triggered:
             self._level = DDLevel.NORMAL
@@ -193,16 +200,16 @@ class DrawdownController:
 
     def manual_resume(self) -> bool:
         """
-        Re-activare manuală după HARD_STOP.
-        Necesită apel explicit — nu se auto-resetează.
-        Returns True dacă re-activarea a reușit.
+        Manual re-activation after HARD_STOP.
+        Requires explicit call — does not auto-reset.
+        Returns True if re-activation succeeded.
         """
         if not self._hard_stop_triggered:
-            return False  # nu era în hard stop
+            return False
         self._hard_stop_triggered = False
         self._level = DDLevel.NORMAL
         if self.cfg.hwm_reset_on_manual_resume:
-            self._hwm = self._equity_curve[-1]  # HWM reset la equity curentă
+            self._hwm = self._equity_curve[-1]
         return True
 
     @property
@@ -218,22 +225,20 @@ class DrawdownController:
         return self._level == DDLevel.NORMAL
 
     # ------------------------------------------------------------------
-    # Helpers private
+    # Private helpers
     # ------------------------------------------------------------------
 
     def _pair_dd(self, state: PairDDState) -> float:
         """
-        DD al unui pair față de peak open PnL.
-        Folosim peak PnL, nu zero, pentru a nu penaliza
-        traderele care niciodată n-au fost profitabile pe pair.
-        Dacă pair-ul n-a avut niciodată profit, DD față de entry.
+        Drawdown of a pair relative to its peak open PnL.
+        Uses peak PnL, not zero, to avoid penalising pairs that were
+        never profitable. If the pair has never been profitable,
+        calculates DD relative to entry capital snapshot.
         """
         if state.max_open_pnl > 0:
-            # DD față de peak profit
             dd = (state.max_open_pnl - state.current_open_pnl) / (
                 state.entry_equity_snapshot + state.max_open_pnl + 1e-9
             )
         else:
-            # DD față de capital alocat la entry
             dd = abs(state.current_open_pnl) / (state.entry_equity_snapshot + 1e-9)
         return max(0.0, float(dd))
