@@ -9,11 +9,14 @@ UVICORN      ?= uvicorn
 BOLD  = \033[1m
 GREEN = \033[32m
 YEL   = \033[33m
+CYAN  = \033[36m
+RED   = \033[31m
 RESET = \033[0m
 
 .PHONY: help install install-dev lint format typecheck test coverage pre-commit \
         paper live backtest optimize scan health dashboard daily-summary \
         docker-build docker-paper docker-live docker-dashboard \
+        prod-build prod-up prod-down prod-logs prod-restart prod-status \
         clean clean-all
 
 help:
@@ -34,7 +37,7 @@ help:
 	@echo "  make test            Pytest all (exclude live/ws)"
 	@echo "  make coverage        Pytest + coverage HTML report"
 	@echo ""
-	@echo "$(GREEN)Trading:$(RESET)"
+	@echo "$(GREEN)Trading local:$(RESET)"
 	@echo "  make paper           Paper trading BTCUSDT/ETHUSDT bybit"
 	@echo "  make live            Live trading (confirmare necesara)"
 	@echo "  make backtest        Backtest 365 zile BTCUSDT/ETHUSDT"
@@ -43,14 +46,22 @@ help:
 	@echo "  make health          Pre-flight health check"
 	@echo "  make daily-summary   Trimite raport zilnic via NotifierBus"
 	@echo ""
-	@echo "$(GREEN)Dashboard:$(RESET)"
+	@echo "$(GREEN)Dashboard local:$(RESET)"
 	@echo "  make dashboard       Start FastAPI dashboard (port 8000)"
 	@echo ""
-	@echo "$(GREEN)Docker:$(RESET)"
+	@echo "$(GREEN)Docker dev:$(RESET)"
 	@echo "  make docker-build    Build imagine Docker"
 	@echo "  make docker-paper    Paper trader in container"
 	@echo "  make docker-live     Live trader in container"
 	@echo "  make docker-dashboard Dashboard in container"
+	@echo ""
+	@echo "$(CYAN)Productie (docker-compose.prod.yml):$(RESET)"
+	@echo "  make prod-build      Build toate imaginile productie"
+	@echo "  make prod-up         Porneste stiva completa (API+trader+dashboard+nginx)"
+	@echo "  make prod-down       Opreste stiva productie"
+	@echo "  make prod-restart    Restart rapid (fara rebuild)"
+	@echo "  make prod-logs       Logs live din toate containerele"
+	@echo "  make prod-status     Status containere productie"
 	@echo ""
 	@echo "$(GREEN)Curatenie:$(RESET)"
 	@echo "  make clean           Sterge cache-uri Python"
@@ -115,8 +126,9 @@ daily-summary:
 	$(PYTHON) scripts/daily_summary.py --pair BTCUSDT ETHUSDT
 
 dashboard:
-	$(UVICORN) dashboard.server:app --reload --host 0.0.0.0 --port 8000
+	$(UVICORN) api.main:app --reload --host 0.0.0.0 --port 8000
 
+# Docker dev
 docker-build:
 	docker build --target production -t quantluna:latest .
 
@@ -128,6 +140,32 @@ docker-live:
 
 docker-dashboard:
 	docker compose --profile dashboard up --build
+
+# Productie
+prod-build:
+	@echo "$(CYAN)Building productie...$(RESET)"
+	docker compose -f docker-compose.prod.yml build --no-cache
+	@echo "$(GREEN)✓ Build complet.$(RESET)"
+
+prod-up:
+	@echo "$(CYAN)Pornire stiva productie...$(RESET)"
+	@test -f .env || (echo "$(RED)Eroare: .env nu exista! cp .env.production.example .env$(RESET)" && exit 1)
+	docker compose -f docker-compose.prod.yml up -d
+	@echo "$(GREEN)✓ Productie activa. Dashboard: http://localhost$(RESET)"
+
+prod-down:
+	@echo "$(YEL)Oprire stiva productie...$(RESET)"
+	docker compose -f docker-compose.prod.yml down
+
+prod-restart:
+	docker compose -f docker-compose.prod.yml restart
+	@echo "$(GREEN)✓ Restart complet.$(RESET)"
+
+prod-logs:
+	docker compose -f docker-compose.prod.yml logs -f --tail=100
+
+prod-status:
+	docker compose -f docker-compose.prod.yml ps
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
