@@ -1,21 +1,20 @@
 /**
- * pages/watchdog.tsx — S37 (review fix: folosește NavBar existent)
+ * pages/watchdog.tsx — S37 improved
+ * Fix: NavBar default import, eliminat activePage
  */
 import type { NextPage } from 'next';
 import Head from 'next/head';
-import { NavBar }        from '../components/NavBar';
-import { WatchdogPanel } from '../components/WatchdogPanel';
-import { MetricsBadge }  from '../components/MetricsBadge';
+import NavBar          from '../components/NavBar';
+import { MetricsBadge } from '../components/MetricsBadge';
+import { WatchdogPanel} from '../components/WatchdogPanel';
 
 const WatchdogPage: NextPage = () => (
   <>
     <Head><title>Watchdog — QuantLuna</title></Head>
-
-    <NavBar activePage="watchdog" />
-
-    <main className="min-h-screen bg-gray-950 text-white px-4 pt-20 pb-8 md:px-8">
-      <div className="mb-6"><MetricsBadge /></div>
-      <WatchdogPanel />
+    <NavBar />
+    <main className="min-h-screen bg-gray-950 text-white px-4 pt-16 pb-10 md:px-8">
+      <div className="mb-5"><MetricsBadge /></div>
+      <WatchdogPanel fullPage />
     </main>
   </>
 );
