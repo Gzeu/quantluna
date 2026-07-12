@@ -1,13 +1,13 @@
 # QuantLuna
 
-> **Stat-arb trading system** — pairs trading cu Kalman filter, cointegration analysis, multi-exchange execution, MonitoringWatchdog și AutoReoptimizer WFO.
+> **Stat-arb trading system** — pairs trading cu Kalman filter, cointegration analysis, multi-exchange execution, MonitoringWatchdog şi AutoReoptimizer WFO.
 
 [![CI](https://github.com/Gzeu/quantluna/actions/workflows/ci.yml/badge.svg)](https://github.com/Gzeu/quantluna/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/Gzeu/quantluna/branch/main/graph/badge.svg)](https://codecov.io/gh/Gzeu/quantluna)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.16.0-green.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.32.0-green.svg)](CHANGELOG.md)
 
 ---
 
@@ -15,7 +15,7 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
-│                           QuantLuna v0.16                            │
+│                        QuantLuna v0.32.0                            │
 │                                                                      │
 │  Data Layer            Strategy Layer         Execution Layer        │
 │  ───────────           ───────────────        ───────────────        │
@@ -39,13 +39,14 @@
 │                      reoptimizer.run_loop())                         │
 │                                                                      │
 │  Risk / Monitoring                                                   │
-│  ─────────────────                                                   │
+│  ─────────────────                                                    │
 │  MonitoringWatchdog  →  AlertDispatcher  →  Telegram HALT/REDUCE     │
 │  CircuitBreaker          PairThreshold        ALERT_ONLY             │
 │  HealthCheck             MetricsProvider   (Sharpe/DD/z/hl/streak)   │
 │  WsWatchdog             RiskDashboardEngine                          │
 │  AutoRebalancer          DrawdownController                          │
 │  KellyPositionSizer      MultiPairAllocator                          │
+│  SizingEngine (S34)      DecisionEngine v2.5 (S46)                   │
 │                                                                      │
 │  Backtest / Optimizer                                                │
 │  ────────────────────                                                │
@@ -81,99 +82,123 @@ python main.py --dry-run --pair BTCUSDT/ETHUSDT
 ```
 quantluna/
 ├── core/
-│   ├── multi_market_orchestrator.py  # MultiMarketOrchestrator v2.2 (Sprint 32)
-│   ├── monitoring_watchdog.py        # MonitoringWatchdog (Sprint 44)
-│   ├── kalman_filter.py              # Kalman filter dinamic hedge ratio
-│   ├── kalman_adapter.py             # Adaptor Kalman → BaseStrategy
-│   ├── spread.py                     # Spread computation + z-score
-│   ├── spread_monitor.py             # Real-time spread health monitor
-│   ├── cointegration.py              # Engle-Granger + Johansen tests
-│   ├── regime_detector.py            # Detectie trend vs mean-reversion
-│   ├── correlation_matrix.py         # Matrice corelatie portofoliu
-│   ├── funding_rate.py               # Funding rate monitor
-│   ├── live_data_bridge.py           # Bridge date live multi-exchange
-│   ├── metrics.py                    # Metrici performanta
-│   ├── performance_analytics.py      # Analytics performanta
-│   ├── config_validator.py           # Validare configurare startup
-│   └── state_bus.py                  # StateBus pub/sub intern
+│   ├── multi_market_orchestrator.py  # MultiMarketOrchestrator v2.2 (S32)
+│   ├── monitoring_watchdog.py        # MonitoringWatchdog (S29)
+│   ├── kalman_filter.py
+│   ├── kalman_adapter.py
+│   ├── spread.py
+│   ├── spread_monitor.py
+│   ├── cointegration.py
+│   ├── regime_detector.py
+│   ├── correlation_matrix.py
+│   ├── funding_rate.py
+│   ├── live_data_bridge.py
+│   ├── metrics.py
+│   ├── performance_analytics.py
+│   ├── config_validator.py
+│   └── state_bus.py
 │
 ├── strategy/
-│   ├── signal.py                     # SignalGenerator v4 — logica principala
-│   ├── kalman_pairs_trading.py       # KalmanPairsTrading BaseStrategy wrapper
-│   ├── auto_selector.py              # AutoStrategySelector — scorer + switcher
-│   ├── optimizer.py                  # Optuna optimizer + KalmanScoringWeights
-│   ├── multi_strategy_engine.py      # Engine multi-strategie paralel
-│   ├── multi_timeframe.py            # Confirmare MTF (LTF + HTF)
-│   ├── regime_filter.py              # Gate unificat regim
-│   ├── pair_selector.py              # Selectie perechi cointegrate
-│   ├── entry_filter.py               # Filtru intrare semnal
-│   ├── bb_mean_reversion.py          # Bollinger Bands mean reversion
-│   ├── zscore_momentum.py            # Z-score momentum strategy
-│   ├── funding_arb.py                # Funding rate arbitrage
-│   └── stat_arb.py                   # Statistical arbitrage clasic
+│   ├── signal.py
+│   ├── kalman_pairs_trading.py
+│   ├── auto_selector.py
+│   ├── optimizer.py
+│   ├── multi_strategy_engine.py
+│   ├── multi_timeframe.py
+│   ├── regime_filter.py
+│   ├── pair_selector.py
+│   ├── entry_filter.py
+│   ├── bb_mean_reversion.py
+│   ├── zscore_momentum.py
+│   ├── funding_arb.py
+│   └── stat_arb.py
 │
 ├── execution/
-│   ├── workflow_orchestrator.py      # WorkflowOrchestrator (startup 5 faze)
-│   ├── bybit_live_runner.py          # Runner live Bybit
-│   ├── order_manager.py              # Lifecycle comenzi multi-exchange
-│   ├── bybit_order_router.py         # Router Bybit futures
-│   ├── position_scanner.py           # Scan pozitii → MANAGED/ORPHAN
-│   ├── adoption_engine.py            # Decizie ADOPT/CLOSE_NOW/MONITOR
-│   ├── profit_optimizer.py           # TP/SL, break-even, trailing stop
-│   ├── health_check.py               # Health checks sistem
-│   ├── resume_manager.py             # Resume dupa restart
-│   ├── checkpoint.py                 # Persistenta stare
-│   ├── pnl_reconciler.py             # Reconciliere PnL
-│   ├── exchange_factory.py           # Factory exchange instances
-│   ├── bybit_ws_feed.py              # Feed WebSocket Bybit
-│   ├── bybit_private_ws.py           # WS privat Bybit (ordine/pozitii)
-│   ├── ws_watchdog.py                # Watchdog WebSocket
-│   ├── emergency_stop.py             # EmergencyStop (HALT complet)
-│   └── rate_limiter.py               # Rate limiter API
+│   ├── workflow_orchestrator.py
+│   ├── bybit_live_runner.py
+│   ├── order_manager.py
+│   ├── bybit_order_router.py
+│   ├── position_scanner.py
+│   ├── adoption_engine.py
+│   ├── profit_optimizer.py
+│   ├── health_check.py
+│   ├── resume_manager.py
+│   ├── checkpoint.py
+│   ├── pnl_reconciler.py
+│   ├── exchange_factory.py
+│   ├── bybit_ws_feed.py
+│   ├── bybit_private_ws.py
+│   ├── ws_watchdog.py
+│   ├── emergency_stop.py
+│   └── rate_limiter.py
 │
 ├── risk/
-│   ├── circuit_breaker.py            # Circuit breaker auto-reset
-│   ├── kelly.py                      # Kelly criterion (full)
-│   ├── dynamic_stop.py               # Stop dinamic ATR/vol-based
-│   ├── portfolio_risk.py             # Risk management portofoliu
-│   ├── auto_rebalancer.py            # Auto-rebalancer pozitii
-│   ├── correlation_filter.py         # Filtru corelatie
-│   ├── dashboard_engine.py           # Engine risk dashboard
-│   ├── drawdown_controller.py        # Controller drawdown
-│   └── multi_pair_allocator.py       # Alocator multi-perechi
-│
-├── backtest/
-│   ├── auto_reoptimizer.py           # AutoReoptimizer WFO saptamanal (Sprint 40)
-│   ├── param_grid_optimizer.py       # ParamGridOptimizer + GridSpace
-│   ├── backtest_engine.py            # BacktestEngine principal
-│   ├── engine_adapter.py             # Adaptor engine multi-strategie
-│   ├── analytics.py                  # Metrici performanta backtest
-│   ├── monte_carlo.py                # Simulari Monte Carlo
-│   ├── walk_forward.py               # Walk-forward validation
-│   └── report_builder.py             # Rapoarte HTML/JSON backtest
-│
-├── notifications/
-│   ├── notifier_bus.py               # Fan-out bus notificari
-│   ├── alert_dispatcher.py           # AlertDispatcher (Watchdog → Telegram)
-│   ├── telegram.py                   # Notificari Telegram
-│   ├── slack_notifier.py             # Notificari Slack
-│   └── discord.py                    # Notificari Discord
+│   ├── sizing_engine.py              # SizingEngine (S34) — set_pair_factor()
+│   ├── bybit_position_sizer.py       # Kelly+Fixed leverage-aware
+│   ├── multi_pair_allocator.py       # set_alloc_factor() (S33)
+│   ├── dashboard_engine.py           # RiskDashboardEngine (S27)
+│   ├── circuit_breaker.py
+│   ├── kelly.py
+│   ├── kelly_sizer.py
+│   ├── dynamic_stop.py
+│   ├── portfolio_risk.py
+│   ├── auto_rebalancer.py
+│   ├── correlation_filter.py
+│   ├── correlation_matrix.py
+│   ├── drawdown_controller.py
+│   ├── position_sizer.py
+│   └── position_sizer_factory.py
 │
 ├── api/
-│   ├── dashboard_api.py              # REST API dashboard (FastAPI)
-│   ├── risk.py                       # /api/risk/* (RiskDashboardEngine)
-│   ├── watchdog.py                   # /api/watchdog/* (MonitoringWatchdog status)
-│   ├── pairs.py                      # /api/pairs/* (halt_pair etc.)
-│   └── sizing.py                     # /api/sizing/* (reduce_pair_size etc.)
+│   ├── main.py                       # FastAPI app v0.32.0 — 14 routere
+│   ├── metrics.py                    # GET /metrics Prometheus (S35)
+│   ├── decision.py                   # GET /api/decision/status (S46)
+│   ├── watchdog.py                   # GET /api/watchdog/* (S41–S44)
+│   ├── optimizer.py                  # GET /api/optimizer/* (S41–S44)
+│   ├── services.py                   # GET /api/services/* (S41–S44)
+│   ├── sizing.py                     # /sizing/* + reduce hooks (S33/S34)
+│   ├── pairs.py                      # /pairs/* + halt_pair (S33)
+│   ├── risk.py                       # /risk/* + SSE stream (S27)
+│   ├── backtest.py
+│   ├── data.py
+│   ├── health.py
+│   ├── live.py
+│   ├── live_ws.py
+│   ├── notifications.py
+│   ├── optimize.py
+│   ├── paper.py
+│   ├── portfolio.py
+│   ├── rebalancer.py
+│   ├── reports.py
+│   ├── schemas.py
+│   ├── strategies.py
+│   └── strategy.py
+│
+├── backtest/
+│   ├── auto_reoptimizer.py
+│   ├── param_grid_optimizer.py
+│   ├── backtest_engine.py
+│   ├── engine_adapter.py
+│   ├── analytics.py
+│   ├── monte_carlo.py
+│   ├── walk_forward.py
+│   └── report_builder.py
+│
+├── notifications/
+│   ├── notifier_bus.py
+│   ├── alert_dispatcher.py
+│   ├── telegram.py
+│   ├── slack_notifier.py
+│   └── discord.py
 │
 ├── data/
-│   ├── fetcher.py                    # Fetcher date istorice
-│   ├── historical_fetcher.py         # Fetcher OHLCV multi-exchange
-│   └── store.py                      # Persistenta date OHLCV
+│   ├── fetcher.py
+│   ├── historical_fetcher.py
+│   └── store.py
 │
-├── tests/                            # 45+ fisiere de teste
-├── main.py                           # Entry point principal
-├── config.py                         # Configurare globala
+├── tests/                            # 55+ fisiere de teste
+├── main.py
+├── config.py
 ├── Makefile
 ├── Dockerfile
 ├── docker-compose.yml
@@ -192,7 +217,7 @@ cd quantluna
 pip install -r requirements.txt
 ```
 
-### Dependente principale
+### Dependențe principale
 
 ```
 numpy >= 1.26
@@ -227,11 +252,11 @@ OKX_API_SECRET=...
 OKX_PASSPHRASE=...
 
 # Perechi (multi-market)
-PAIRS=BTCUSDT-ETHUSDT,SOLUSDT-AVAXUSDT    # lista perechi active
-SYMBOL_Y=BTCUSDT                           # fallback single-pair
+PAIRS=BTCUSDT-ETHUSDT,SOLUSDT-AVAXUSDT
+SYMBOL_Y=BTCUSDT
 SYMBOL_X=ETHUSDT
 
-# Notificari
+# Notificări
 SLACK_WEBHOOK_URL=...
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
@@ -239,17 +264,17 @@ DISCORD_WEBHOOK_URL=...
 
 # MonitoringWatchdog
 WATCHDOG_ENABLED=true
-WATCHDOG_CHECK_INTERVAL=60     # secunde intre verificari
-WATCHDOG_SHARPE_MIN=0.3        # Sharpe rolling 24h minim
-WATCHDOG_MAX_DD=0.10           # Drawdown maxim (fractie)
-WATCHDOG_Z_MAX=4.0             # |z-score| maxim
-WATCHDOG_HL_MAX=96             # Half-life maxim (ore)
+WATCHDOG_CHECK_INTERVAL=60
+WATCHDOG_SHARPE_MIN=0.3
+WATCHDOG_MAX_DD=0.10
+WATCHDOG_Z_MAX=4.0
+WATCHDOG_HL_MAX=96
 
 # AutoReoptimizer
 OPTIMIZER_ENABLED=true
-REOPT_SCHEDULE_DAY=6           # 0=Luni, 6=Duminica
-REOPT_SCHEDULE_HOUR=2          # 02:00 UTC
-REOPT_GRID_TYPE=coarse         # coarse | fine
+REOPT_SCHEDULE_DAY=6
+REOPT_SCHEDULE_HOUR=2
+REOPT_GRID_TYPE=coarse
 REOPT_DRY_RUN=false
 REOPT_MIN_SHARPE=0.5
 REOPT_WFO_MIN_SCORE=0.5
@@ -260,84 +285,85 @@ DRY_RUN=true
 
 ---
 
-## Utilizare
+## API Endpoints
 
-### Paper trading
+| Prefix | Descriere |
+|--------|-----------|
+| `GET /metrics` | Prometheus scrape endpoint (S35) |
+| `GET /risk/*` | Risk dashboard: Sharpe, DD, win rate, equity curve, SSE stream |
+| `GET /api/decision/status` | DecisionEngine v2.5 live status (S46) |
+| `GET /api/watchdog/*` | MonitoringWatchdog: thresholds, alerts, silence (S41–S44) |
+| `GET /api/optimizer/*` | Grid Search WFO: run/status/results/history/heatmap |
+| `GET /api/services/*` | Control Panel: start/stop/restart + WebSocket live |
+| `GET /sizing/live_status` | SizingEngine v2.5 live status (S34) |
+| `POST /sizing/reduce/{pair}` | Reduce sizing per pereche (S33) |
+| `GET /sizing/reduce/history` | Audit log REDUCE events |
+| `POST /pairs/halt/{pair}` | Halt pereche (S33) |
+| `GET /pairs/status` | Status toate perechile active |
+| `GET /backtest/*` | Backtest jobs REST |
+| `GET /data/*` | OHLCV fetch Bybit/Binance |
+| `GET /health` | Uptime, versiune, system status |
+| `GET /docs` | Swagger UI |
 
-```bash
-python main.py --dry-run --pair BTCUSDT/ETHUSDT
-# sau
-make paper
+---
+
+## Prometheus `/metrics`
+
+Configureaza scraping în `prometheus.yml`:
+
+```yaml
+scrape_configs:
+  - job_name: quantluna
+    static_configs:
+      - targets: ['localhost:8000']
 ```
 
-### Live trading
+Metrici expuse:
 
-```bash
-python main.py --pair BTCUSDT/ETHUSDT
-# sau
-make live
-```
-
-### Backtest
-
-```bash
-python main.py backtest --pair BTCUSDT ETHUSDT --days 90
-# sau
-make backtest
-```
-
-### Dashboard
-
-```bash
-uvicorn dashboard.server:app --reload --port 8000
-# http://localhost:8000/docs
-```
+| Metric | Tip | Descriere |
+|--------|-----|-----------|
+| `quantluna_equity_usd` | gauge | Equity curentă USD |
+| `quantluna_rolling_sharpe` | gauge | Sharpe ratio rolling window 30 |
+| `quantluna_drawdown_current` | gauge | Drawdown curent (fractie) |
+| `quantluna_drawdown_max` | gauge | Drawdown maxim sesiune |
+| `quantluna_win_rate` | gauge | Win rate global |
+| `quantluna_total_trades` | counter | Total trade-uri închise |
+| `quantluna_exposure_usd` | gauge | Expunere totală USD |
+| `quantluna_net_pnl_usd` | gauge | PnL net USD sesiune |
+| `quantluna_pair_factor{pair}` | gauge | Factor sizing per pereche [0,1] |
+| `quantluna_n_reduced_pairs` | gauge | Perechi cu factor < 1.0 |
+| `quantluna_sizing_capital_usd` | gauge | Capital configurată SizingEngine |
+| `quantluna_watchdog_enabled` | gauge | 1 dacă watchdog rulează |
+| `quantluna_watchdog_alerts_total` | counter | Total alerte emise |
+| `quantluna_watchdog_halted_pairs` | gauge | Perechi în stare HALT |
+| `quantluna_decision_in_position` | gauge | 1 dacă există poziție deschisă |
+| `quantluna_decision_streak` | gauge | Streak curent win/loss |
+| `quantluna_decision_drawdown` | gauge | Drawdown curent DecisionEngine |
 
 ---
 
 ## MultiMarketOrchestrator
 
-Din `v0.16.0`, `core/multi_market_orchestrator.py` gestionează execuția simultană a tuturor subsistemelor runtime:
-
 ```python
 from core.multi_market_orchestrator import MultiMarketOrchestrator
 
-# Din env vars (PAIRS, WATCHDOG_ENABLED, OPTIMIZER_ENABLED etc.)
 orch = MultiMarketOrchestrator.from_env(
     dispatcher=alert_dispatcher,
     runner=bybit_runner,
     notifier_bus=notifier_bus,
 )
 ctx = await orch.build_context()
-await orch.start_runner(ctx)   # blocheaza pana la stop()
-
-# Cu config explicit + watchdog per-pereche
-orch = MultiMarketOrchestrator(
-    pairs=["BTCUSDT-ETHUSDT", "SOLUSDT-AVAXUSDT"],
-    runner=bybit_runner,
-    notifier_bus=bus,
-    dispatcher=alert_dispatcher,
-    per_pair_watchdog_cfg={
-        "BTCUSDT-ETHUSDT": {"sharpe_min": 0.5, "action": "HALT"},
-        "SOLUSDT-AVAXUSDT": {"max_drawdown": 0.08, "action": "REDUCE_SIZE"},
-    },
-)
+await orch.start_runner(ctx)
 ```
 
 Flux intern:
 ```
 asyncio.gather(
-    runner.start(),            ← BybitLiveRunner (trading loop)
-    watchdog.run_loop(),       ← MonitoringWatchdog (60s: Sharpe/DD/z/hl/streak)
-    reoptimizer.run_loop(),    ← AutoReoptimizer (duminica 02:00 UTC)
+    runner.start(),            ← BybitLiveRunner
+    watchdog.run_loop(),       ← MonitoringWatchdog (60s)
+    reoptimizer.run_loop(),    ← AutoReoptimizer (duminică 02:00 UTC)
 )
 ```
-
-Metrics provider este rezolvat automat în cascadă:
-1. `runner.get_pair_metrics(pair)` — RiskManager nativ
-2. `runner.risk_manager.get_metrics(pair)` — RiskManager separat
-3. `runner.pnl_tracker.get_metrics(pair)` — PnLTracker fallback
-4. stub safe `{sharpe:99, drawdown:0, z_score:0, ...}` — niciodată crash
 
 ---
 
@@ -351,45 +377,14 @@ Metrics provider este rezolvat automat în cascadă:
 | `half_life` | > 96 ore | `ALERT_ONLY` |
 | `loss_streak` | ≥ 5 | `ALERT_ONLY` / `HALT` |
 
-Acțiunile disponibile: `ALERT_ONLY` → `REDUCE_SIZE` (sizing 50%) → `HALT` (oprire completă).
-
----
-
-## AutoReoptimizer — WFO Săptămânal
-
-```python
-from backtest.auto_reoptimizer import AutoReoptimizer
-
-scheduler = AutoReoptimizer.from_env(
-    engine=backtest_engine,
-    pairs=["BTCUSDT-ETHUSDT", "SOLUSDT-AVAXUSDT"],
-    notifier_bus=bus,
-)
-await scheduler.run_loop()  # pornit automat de MultiMarketOrchestrator
-
-# Trigger manual:
-await scheduler.run_now(force=True)
+Lanț complet watchdog → sizing:
 ```
-
-Logică: dacă `oos_sharpe >= 0.5` **și** `wfo_score >= 0.5`, parametrii noi sunt aplicați în `config/pairs/PAIR.json` și raportați pe Telegram. Altfel, parametrii actuali sunt păstrați și se emite alertă de degradare.
-
----
-
-## AutoStrategySelector + KalmanScoringWeights
-
-```python
-from strategy.auto_selector import AutoStrategySelector
-from strategy.kalman_pairs_trading import KalmanPairsTrading, KalmanScoringWeights
-
-weights = KalmanScoringWeights(baseline=0.65, regime_ranging_bonus=0.18)
-kalman = KalmanPairsTrading(spread_engine=engine, scoring_weights=weights)
-
-selector = AutoStrategySelector(strategies=[kalman, bb, zscore_mom, funding_arb])
-signals = selector.generate_batch(
-    df=spread_df,
-    coint_pvalue_series=coint_pvalue_series,
-    coint_valid_series=coint_valid_series,
-)
+MonitoringWatchdog
+  → reduce_callback(pair, factor)
+  → api.sizing.reduce_pair_size()
+  → [Cale 1] SizingEngine.set_pair_factor()   ✅ S34
+  → [Cale 2] MultiPairManager.set_alloc_factor() ✅ S33
+  → [Fallback] WARNING log
 ```
 
 ---
@@ -397,13 +392,8 @@ signals = selector.generate_batch(
 ## Teste
 
 ```bash
-# Toate testele
-make test
-
-# Cu coverage HTML
-make coverage
-
-# Pytest direct
+make test          # toate testele
+make coverage      # cu coverage HTML
 pytest tests/ -v
 ```
 
@@ -422,11 +412,14 @@ pytest tests/ -v
 | S19 | ✅ Done | AutoStrategySelector, KalmanScoringWeights SearchSpace (16 params), coint_pvalue_series rolling ADF |
 | S20–S28 | ✅ Done | WorkflowOrchestrator (5 faze startup), PositionScanner, ResumeManager, EmergencyStop, HealthCheck, RiskDashboardEngine, StateBus, ConfigValidator, LiveDataBridge |
 | S29–S31 | ✅ Done | MonitoringWatchdog (Sharpe/DD/z/hl/streak → HALT/REDUCE/ALERT), AlertDispatcher, AutoReoptimizer WFO + ParamGridOptimizer |
-| **S32** | ✅ **Done** | **MultiMarketOrchestrator v2.2** — asyncio.gather(runner+watchdog+reoptimizer), from_env(), build_context(), stop_runner() graceful, metrics_provider cascadat 4 nivele |
-| S33 | 🔲 Next | `api/pairs.py` + `api/sizing.py` — endpoint-uri REST halt_pair / reduce_pair_size (necesare de halt_callback / reduce_callback) |
-| S34 | 🔲 Next | Prometheus `/metrics` endpoint + Grafana alerting rules |
-| S35 | 🔲 Next | Web UI React dashboard — live PnL charts, strategy scores, watchdog status |
+| S32 | ✅ Done | MultiMarketOrchestrator v2.2 — asyncio.gather(runner+watchdog+reoptimizer), from_env(), build_context(), metrics_provider cascadat 4 nivele |
+| S33 | ✅ Done | `api/pairs.py` halt_pair + `api/sizing.py` reduce_pair_size — REST hooks pentru watchdog callbacks |
+| S34 | ✅ Done | `SizingEngine` — wrapper stateful cu set_pair_factor(), cale 1 reduce completă |
+| **S35** | ✅ **Done** | **Prometheus `/metrics`** (Risk+Sizing+Watchdog+Decision) + **teste S33/S34/S46** + **README v0.32.0** |
+| S41–S44 | ✅ Done | Services Control Panel, Grid Search WFO optimizer, MonitoringWatchdog API router |
+| S46 | ✅ Done | `DecisionEngine v2.5` — `/api/decision/status` dashboard unificat |
 | S36 | 🔲 Next | End-to-end integration test suite, paper run automatizat 48h CI |
+| S37 | 🔲 Next | Web UI React dashboard — live PnL charts, strategy scores, watchdog status |
 
 ---
 
@@ -444,11 +437,11 @@ make docker-live
 ## Contributing
 
 ```bash
-make install-dev    # install + pre-commit hooks
-make lint           # ruff check
-make format         # ruff format
-make typecheck      # mypy
-make test           # pytest
+make install-dev
+make lint
+make format
+make typecheck
+make test
 ```
 
 ---
