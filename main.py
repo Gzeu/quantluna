@@ -18,30 +18,31 @@ Env vars (all optional, have defaults):
     BYBIT_API_KEY, BYBIT_API_SECRET, BYBIT_TESTNET
     SYMBOL_Y, SYMBOL_X, INTERVAL
     DRY_RUN, ENTRY_ZSCORE, EXIT_ZSCORE, BASE_QTY
-    WARMUP_BARS, KALMAN_WINDOW
+    WARMUP_BARS, KALMAN_WINDOW, HALF_LIFE_H
     MAX_CONSEC_LOSSES, MAX_DRAWDOWN_PCT, COOLDOWN_SECONDS
+    INITIAL_CAPITAL
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SLACK_WEBHOOK_URL
     HEALTH_PORT, FUNDING_GATE_ENABLED, PNL_RECONCILER_ENABLED
-    MARKET_TRADE_ENABLED, CHECKPOINT_PATH, INITIAL_CAPITAL
+    MARKET_TRADE_ENABLED, CHECKPOINT_PATH
+    OPTIMIZER_ENABLED, WATCHDOG_ENABLED, ENABLE_SPOT, ENABLE_MARGIN
     LOG_DIR  (default: logs)   — directory for rotating log files
     STATE_DIR (default: state) — directory for checkpoint/state files
     RUNNER_TIMEOUT_SECONDS (default: 7200) — hard timeout before force-cancel
-    See BybitLiveRunnerConfig.from_env() for full list.
+    See execution/runner_config.py BybitLiveRunnerConfig for full list.
 
-Flow:
+Flow (core/WorkflowOrchestrator v2.2):
     1. Parse CLI args
-    2. Load BybitLiveRunnerConfig from env (+ CLI overrides)
+    2. Load BybitLiveRunnerConfig from env (+ CLI overrides) — validated
+       immediately in __post_init__ (fix #23)
     3. Build NotifierBus (Telegram + Slack)
-    4. Build BybitWsFeed
-    5. Wire RiskDashboardEngine into StateBus + api/risk singleton
-    6. WorkflowOrchestrator.run_startup_workflow()
-       Faza 0: HealthCheck -> halt on critical failure
-       Faza 1: PositionScanner
-       Faza 2: ResumeManager
-       Faza 3: AdoptionEngine
-       Faza 4: ProfitOptimizer
-    7. WorkflowOrchestrator.start_runner() -> blocks
-       Faza 5: BybitLiveRunner + optimizer loop in background
+    4. Wire RiskDashboardEngine into StateBus + api/risk singleton
+    5. WorkflowOrchestrator(runner_cfg, notifier_bus, state_bus)
+    6. orch.start_runner()  — blocks; internally runs:
+         asyncio.gather(
+             BybitLiveRunner.start(),     # trading loop
+             AutoReoptimizer.run_loop(),  # WFO weekly
+             MonitoringWatchdog.run_loop(),# monitoring 60s
+         )
 """
 from __future__ import annotations
 
@@ -56,7 +57,7 @@ from loguru import logger
 # ---------------------------------------------------------------------------
 # Directory constants — overridable via env for Docker / custom mounts
 # ---------------------------------------------------------------------------
-LOG_DIR = os.getenv("LOG_DIR", "logs")
+LOG_DIR   = os.getenv("LOG_DIR",   "logs")
 STATE_DIR = os.getenv("STATE_DIR", "state")
 
 # Hard timeout (seconds) for the runner task before force-cancel.
@@ -69,9 +70,9 @@ def _parse_args() -> argparse.Namespace:
         description="QuantLuna — Pair Trading Bot",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--dry-run", action="store_true", default=None)
-    parser.add_argument("--pair", type=str, default=None, metavar="Y/X")
-    parser.add_argument("--interval", type=str, default=None, metavar="MIN")
+    parser.add_argument("--dry-run",   action="store_true", default=None)
+    parser.add_argument("--pair",      type=str, default=None, metavar="Y/X")
+    parser.add_argument("--interval",  type=str, default=None, metavar="MIN")
     parser.add_argument(
         "--skip-health",
         action="store_true",
@@ -116,11 +117,7 @@ def _wire_dashboard_engine(cfg, state_bus) -> None:
     """
     try:
         from risk.dashboard_engine import RiskDashboardEngine
-        initial_capital = float(
-            getattr(cfg, "initial_capital", None)
-            or os.getenv("INITIAL_CAPITAL", "10000")
-        )
-        engine = RiskDashboardEngine(initial_capital=initial_capital)
+        engine = RiskDashboardEngine(initial_capital=cfg.initial_capital)
         state_bus.set_risk_engine(engine)
         try:
             from api.risk import set_risk_engine
@@ -132,7 +129,7 @@ def _wire_dashboard_engine(cfg, state_bus) -> None:
             )
         logger.info(
             "main: RiskDashboardEngine wired (capital={:.0f} USDT)",
-            initial_capital,
+            cfg.initial_capital,
         )
     except Exception as exc:
         logger.warning(
@@ -170,29 +167,8 @@ async def _build_notifier_bus(cfg):
                 logger.warning("main: Slack notifier registration failed: {}", exc)
         return bus
     except Exception as exc:
-        logger.warning("main: NotifierBus unavailable — running without notifications: {}", exc)
-        return None
-
-
-async def _build_ws_feed(cfg):
-    """Build BybitWsFeed. Failure is WARNING-logged; runner may fall back to REST polling."""
-    try:
-        from execution.bybit_ws_feed import BybitWsFeed, BybitWsFeedConfig
-        feed_cfg = BybitWsFeedConfig(
-            symbol_y=cfg.symbol_y,
-            symbol_x=cfg.symbol_x,
-            interval=cfg.interval,
-            testnet=os.getenv("BYBIT_TESTNET", "false").lower() == "true",
-        )
-        feed = BybitWsFeed(feed_cfg)
-        logger.info(
-            "main: BybitWsFeed built ({}/{} {}m)",
-            cfg.symbol_y, cfg.symbol_x, cfg.interval,
-        )
-        return feed
-    except Exception as exc:
         logger.warning(
-            "main: BybitWsFeed build failed — runner will use REST fallback: {}", exc
+            "main: NotifierBus unavailable — running without notifications: {}", exc
         )
         return None
 
@@ -210,13 +186,19 @@ def _install_signal_handlers(loop, shutdown_event) -> None:
 
 async def main() -> int:
     args = _parse_args()
-    os.makedirs(LOG_DIR, exist_ok=True)    # fix #21: use env-overridable LOG_DIR
-    os.makedirs(STATE_DIR, exist_ok=True)  # fix #21: use env-overridable STATE_DIR
+    os.makedirs(LOG_DIR,   exist_ok=True)  # fix #21: env-overridable LOG_DIR
+    os.makedirs(STATE_DIR, exist_ok=True)  # fix #21: env-overridable STATE_DIR
     _configure_logging(args.log_level)
 
-    from execution.bybit_live_runner import BybitLiveRunnerConfig
+    # ------------------------------------------------------------------
+    # [1] Load config — validation happens immediately in __post_init__
+    #     (fix #23: invalid env vars raise ValueError before touching exchange)
+    # ------------------------------------------------------------------
+    from execution.runner_config import BybitLiveRunnerConfig
     cfg = BybitLiveRunnerConfig.from_env()
 
+    # CLI overrides (applied after env load; re-validate not needed for
+    # these fields since they don't affect z-score or model params)
     if args.dry_run:
         cfg.dry_run = True
     if args.pair:
@@ -227,49 +209,57 @@ async def main() -> int:
             logger.error("Invalid --pair format: {!r} (expected Y/X)", args.pair)
             return 1
     if args.interval:
-        cfg.interval = args.interval
+        try:
+            cfg.interval = int(args.interval)
+        except ValueError:
+            logger.error("Invalid --interval: {!r} (must be integer)", args.interval)
+            return 1
+    # --skip-health wires into cfg so WorkflowOrchestrator can read it
+    # fix #18: dry_run alone no longer skips health check
+    if args.skip_health:
+        cfg.skip_health_check = True  # noqa: read by core/WFOrch if present
 
     logger.info(
-        "QuantLuna starting — {}/{} interval={}m dry_run={} log_dir={} state_dir={}",
-        cfg.symbol_y, cfg.symbol_x, cfg.interval, cfg.dry_run, LOG_DIR, STATE_DIR,
+        "QuantLuna starting — {} dry_run={} log_dir={} state_dir={}",
+        cfg.summary(), cfg.dry_run, LOG_DIR, STATE_DIR,
     )
 
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
     _install_signal_handlers(loop, shutdown_event)
 
+    # ------------------------------------------------------------------
+    # [3] Build NotifierBus
+    # ------------------------------------------------------------------
     notifier_bus = await _build_notifier_bus(cfg)
-    ws_feed      = await _build_ws_feed(cfg)
 
+    # ------------------------------------------------------------------
+    # [4] Wire RiskDashboardEngine → StateBus + api/risk singleton
+    # ------------------------------------------------------------------
     from core.state_bus import bus as state_bus
     _wire_dashboard_engine(cfg, state_bus)
 
-    from execution.workflow_orchestrator import WorkflowOrchestrator
-    orch = WorkflowOrchestrator.from_runner_cfg(
-        cfg=cfg,
+    # ------------------------------------------------------------------
+    # [5] Build WorkflowOrchestrator (core/ v2.2 API)
+    #
+    #   core/WorkflowOrchestrator.__init__(runner_cfg, notifier_bus, state_bus)
+    #   No from_runner_cfg(), no ws_feed injection, no skip_health param.
+    #   WsFeed is built internally by BybitLiveRunner.from_env(cfg).
+    # ------------------------------------------------------------------
+    from core.workflow_orchestrator import WorkflowOrchestrator
+    orch = WorkflowOrchestrator(
+        runner_cfg=cfg,
         notifier_bus=notifier_bus,
-        ws_feed=ws_feed,
-        # fix #18: dry_run alone no longer skips health check.
-        # Only the explicit --skip-health flag bypasses it.
-        skip_health_check=args.skip_health,
+        state_bus=state_bus,
     )
 
-    ctx = await orch.run_startup_workflow()
-
-    if ctx.should_halt:
-        logger.error("Startup HALT: {}", ctx.halt_reason)
-        if notifier_bus:
-            try:
-                await notifier_bus.send_alert(
-                    f"\u274c QuantLuna HALT: {ctx.halt_reason}",
-                    level="error",
-                )
-            except Exception as exc:
-                logger.warning("main: failed to send HALT notification: {}", exc)
-        return 1
-
-    runner_task = asyncio.create_task(orch.start_runner(ctx))
-    shutdown_task = asyncio.create_task(shutdown_event.wait())
+    # ------------------------------------------------------------------
+    # [6] start_runner() — no ctx parameter, no run_startup_workflow().
+    #   Internally builds context, registers services, runs gather():
+    #     BybitLiveRunner.start() + AutoReoptimizer + MonitoringWatchdog
+    # ------------------------------------------------------------------
+    runner_task   = asyncio.create_task(orch.start_runner(),   name="orchestrator")
+    shutdown_task = asyncio.create_task(shutdown_event.wait(), name="shutdown_sentinel")
 
     # fix #20: asyncio.wait with hard timeout to prevent infinite hang.
     # RUNNER_TIMEOUT_SECONDS=0 disables the timeout (infinite — not recommended).
@@ -281,7 +271,6 @@ async def main() -> int:
     )
 
     if not done:
-        # Timeout expired — neither runner nor shutdown signal fired.
         logger.error(
             "main: runner hard timeout reached ({:.0f}s) — forcing shutdown. "
             "Check for deadlocks or increase RUNNER_TIMEOUT_SECONDS.",
@@ -293,12 +282,17 @@ async def main() -> int:
         shutdown_task.cancel()
 
     if not runner_task.done():
-        logger.info("main: cancelling runner task...")
+        logger.info("main: cancelling orchestrator task...")
         runner_task.cancel()
         try:
             await runner_task
         except asyncio.CancelledError:
-            logger.info("main: runner cancelled cleanly")
+            logger.info("main: orchestrator cancelled cleanly")
+        # Graceful stop — notifies Telegram/Slack
+        try:
+            await orch.stop_runner()
+        except Exception as exc:
+            logger.warning("main: stop_runner error (non-fatal): {}", exc)
 
     return 0
 
