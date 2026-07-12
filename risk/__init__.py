@@ -1,20 +1,20 @@
 """
-risk package — public exports
+QuantLuna — Risk Module
+
+Exporturi principale:
+  BybitPositionSizer  — calcul sizing Kelly / Fixed (S28)
+  SizingEngine        — wrapper stateful cu set_pair_factor() (S34)
+  DrawdownController  — drawdown monitor per pereche
+  CorrelationFilter   — filtru corr inainte de deschidere pozitie
+  CircuitBreaker      — breaker global DD / Sharpe
+  RiskDashboardEngine — metrici live agregate
 """
-from risk.circuit_breaker import CircuitBreaker, CircuitBreakerConfig, TripReason, TripEvent
-
-try:
-    from risk.kelly import KellySizer  # type: ignore[attr-defined]
-except Exception:
-    KellySizer = None  # type: ignore[assignment]
-
-try:
-    from risk.portfolio_risk import PortfolioRisk  # type: ignore[attr-defined]
-except Exception:
-    PortfolioRisk = None  # type: ignore[assignment]
+from risk.bybit_position_sizer import BybitPositionSizer, SizingParams, SizingResult
+from risk.sizing_engine import SizingEngine
 
 __all__ = [
-    "CircuitBreaker", "CircuitBreakerConfig", "TripReason", "TripEvent",
-    "KellySizer",
-    "PortfolioRisk",
+    "BybitPositionSizer",
+    "SizingParams",
+    "SizingResult",
+    "SizingEngine",
 ]
