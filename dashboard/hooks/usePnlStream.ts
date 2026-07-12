@@ -1,15 +1,11 @@
 /**
- * usePnlStream.ts — S37
- * Hook SSE pentru /risk/stream
- * Reconnect automat la disconnect cu backoff exponential
+ * usePnlStream.ts — S37 (review fix: importă PnlPoint din types/)
+ * Hook SSE pentru /risk/stream cu reconnect exponential backoff.
  */
 import { useEffect, useRef, useState } from 'react';
+import type { PnlPoint } from '../types/dashboard';
 
-export interface PnlPoint {
-  ts:     number;   // epoch ms
-  equity: number;
-  net_pnl?: number;
-}
+export type { PnlPoint };
 
 interface State {
   data:      PnlPoint[];
@@ -42,7 +38,7 @@ export function usePnlStream(maxPoints = 200) {
         try {
           const payload = JSON.parse(e.data);
           const point: PnlPoint = {
-            ts:      payload.ts ?? Date.now(),
+            ts:      payload.ts      ?? Date.now(),
             equity:  payload.equity_usd ?? payload.equity ?? 0,
             net_pnl: payload.net_pnl_usd ?? payload.net_pnl,
           };
@@ -51,7 +47,7 @@ export function usePnlStream(maxPoints = 200) {
             data: [...s.data.slice(-(maxPoints - 1)), point],
           }));
         } catch {
-          // malformed frame — skip
+          // frame malformat — skip
         }
       };
 

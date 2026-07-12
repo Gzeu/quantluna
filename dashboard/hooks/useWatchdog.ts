@@ -1,24 +1,13 @@
 /**
- * useWatchdog.ts — S37
- * Hook polling /api/watchdog/status + /api/watchdog/alerts (interval 8s)
+ * useWatchdog.ts — S37 (review fix: importă din types/)
+ * Polling paralel /api/watchdog/status + /api/watchdog/alerts (8s).
  */
 import { useEffect, useState, useCallback } from 'react';
+import type { WatchdogStatus, WatchdogAlert } from '../types/dashboard';
+
+export type { WatchdogStatus, WatchdogAlert };
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
-
-export interface WatchdogStatus {
-  enabled:      boolean;
-  alerts_total: number;
-  halted_pairs: string[];
-  [k: string]: unknown;
-}
-
-export interface WatchdogAlert {
-  ts?:      string;
-  level?:   string;
-  message?: string;
-  [k: string]: unknown;
-}
 
 export function useWatchdog(intervalMs = 8_000) {
   const [status,  setStatus]  = useState<WatchdogStatus | null>(null);
@@ -35,10 +24,10 @@ export function useWatchdog(intervalMs = 8_000) {
       if (sRes.ok) setStatus(await sRes.json());
       if (aRes.ok) {
         const a = await aRes.json();
-        setAlerts(Array.isArray(a) ? a : a.alerts ?? []);
+        setAlerts(Array.isArray(a) ? a : (a.alerts ?? []));
       }
       setError(null);
-    } catch (e) {
+    } catch {
       setError('Watchdog unavailable');
     } finally {
       setLoading(false);

@@ -1,30 +1,19 @@
 /**
- * pages/watchdog.tsx — S37
- * Pagina dedicata Watchdog Panel (full-width)
+ * pages/watchdog.tsx — S37 (review fix: folosește NavBar existent)
  */
 import type { NextPage } from 'next';
 import Head from 'next/head';
-import Link from 'next/link';
+import { NavBar }        from '../components/NavBar';
 import { WatchdogPanel } from '../components/WatchdogPanel';
 import { MetricsBadge }  from '../components/MetricsBadge';
 
 const WatchdogPage: NextPage = () => (
   <>
-    <Head>
-      <title>Watchdog — QuantLuna</title>
-    </Head>
-    <main className="min-h-screen bg-gray-950 text-white px-4 py-6 md:px-8">
-      <div className="flex items-center justify-between mb-8">
-        <h1 className="text-2xl font-bold">
-          Quant<span className="text-cyan-400">Luna</span>
-          <span className="text-gray-400 font-normal text-lg ml-3">/ Watchdog</span>
-        </h1>
-        <nav className="flex gap-4 text-sm">
-          <Link href="/"         className="text-gray-400 hover:text-white transition-colors">Dashboard</Link>
-          <Link href="/watchdog" className="text-cyan-400 font-medium">Watchdog</Link>
-          <Link href="/strategy" className="text-gray-400 hover:text-white transition-colors">Strategy</Link>
-        </nav>
-      </div>
+    <Head><title>Watchdog — QuantLuna</title></Head>
+
+    <NavBar activePage="watchdog" />
+
+    <main className="min-h-screen bg-gray-950 text-white px-4 pt-20 pb-8 md:px-8">
       <div className="mb-6"><MetricsBadge /></div>
       <WatchdogPanel />
     </main>

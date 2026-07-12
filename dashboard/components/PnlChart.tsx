@@ -1,7 +1,10 @@
 /**
- * PnlChart.tsx — S37
+ * PnlChart.tsx — S37 (review fix: dedup — înlocuiește versiunea veche)
+ * ATENȚIE: PnLChart.tsx (uppercase L) existent folosește lightweight-charts.
+ * Acesta (lowercase l) folosește Recharts + SSE hook — pentru pagina live.
+ * Dacă vrei un singur chart, șterge manual PnLChart.tsx și redenumește importurile.
+ *
  * Live PnL equity curve via SSE /risk/stream
- * Recharts AreaChart cu gradient + tooltips
  */
 'use client';
 import React from 'react';
@@ -25,7 +28,7 @@ export function PnlChart({ maxPoints = 200 }: Props) {
         <span className={`text-xs px-2 py-1 rounded-full font-medium ${
           connected ? 'bg-green-800 text-green-300' : 'bg-red-800 text-red-300'
         }`}>
-          {connected ? '● LIVE' : error ? '✕ ERROR' : '○ Connecting…'}
+          {connected ? '◉ LIVE' : error ? '✕ ERROR' : '○ Connecting…'}
         </span>
       </div>
 
@@ -51,16 +54,16 @@ export function PnlChart({ maxPoints = 200 }: Props) {
             />
             <YAxis
               tick={{ fill: '#9ca3af', fontSize: 11 }}
-              tickFormatter={v => `$${v.toLocaleString()}`}
-              width={72}
+              tickFormatter={v => `$${(v as number).toLocaleString()}`}
+              width={76}
             />
             <Tooltip
               contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 8 }}
               labelStyle={{ color: '#9ca3af', fontSize: 11 }}
               formatter={(v: number) => [`$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`, 'Equity']}
-              labelFormatter={v => new Date(v).toLocaleTimeString()}
+              labelFormatter={(v: number) => new Date(v).toLocaleTimeString()}
             />
-            <ReferenceLine y={data[0]?.equity} stroke="#374151" strokeDasharray="4 2" />
+            {data[0] && <ReferenceLine y={data[0].equity} stroke="#374151" strokeDasharray="4 2" />}
             <Area
               type="monotone"
               dataKey="equity"

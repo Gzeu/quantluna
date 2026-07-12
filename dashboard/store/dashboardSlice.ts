@@ -1,22 +1,18 @@
 /**
- * dashboardSlice.ts — S37
- * Zustand store slice pentru:
- *   - PnL history (equity curve points)
- *   - Watchdog state cache
- *   - UI preferences (dark mode, sidebar collapsed)
+ * dashboardSlice.ts — S37 (review fix: importă din types/ → elimina coupling circular)
+ * Zustand persist slice: PnL history, watchdog cache, UI prefs.
  */
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
-import type { PnlPoint } from '../hooks/usePnlStream';
-import type { WatchdogStatus, WatchdogAlert } from '../hooks/useWatchdog';
+import type { PnlPoint, WatchdogStatus, WatchdogAlert } from '../types/dashboard';
 
 const MAX_PNL_HISTORY = 500;
 
 interface DashboardState {
   // PnL
-  pnlHistory:    PnlPoint[];
-  appendPnl:     (point: PnlPoint) => void;
-  clearPnl:      () => void;
+  pnlHistory: PnlPoint[];
+  appendPnl:  (point: PnlPoint) => void;
+  clearPnl:   () => void;
 
   // Watchdog cache
   watchdogStatus: WatchdogStatus | null;
@@ -33,20 +29,15 @@ interface DashboardState {
 export const useDashboardStore = create<DashboardState>()(
   persist(
     (set) => ({
-      // PnL
       pnlHistory: [],
       appendPnl: (point) =>
-        set((s) => ({
-          pnlHistory: [...s.pnlHistory.slice(-(MAX_PNL_HISTORY - 1)), point],
-        })),
+        set((s) => ({ pnlHistory: [...s.pnlHistory.slice(-(MAX_PNL_HISTORY - 1)), point] })),
       clearPnl: () => set({ pnlHistory: [] }),
 
-      // Watchdog
       watchdogStatus: null,
       watchdogAlerts: [],
       setWatchdog: (status, alerts) => set({ watchdogStatus: status, watchdogAlerts: alerts }),
 
-      // UI
       darkMode:         true,
       sidebarCollapsed: false,
       toggleDark:    () => set((s) => ({ darkMode:         !s.darkMode })),

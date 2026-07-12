@@ -1,29 +1,21 @@
 /**
- * useStrategyScores.ts — S37
- * Hook polling /api/optimizer/results (interval 10s)
- * Normalizeaza raspunsul in array PairScore[]
+ * useStrategyScores.ts — S37 (review fix: importă din types/)
+ * Polling /api/optimizer/results (10s), normalizare format răspuns.
  */
 import { useEffect, useState, useCallback } from 'react';
+import type { PairScore } from '../types/dashboard';
+
+export type { PairScore };
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
-
-export interface PairScore {
-  pair:         string;
-  strategy:     string;
-  score:        number;
-  sharpe:       number;
-  win_rate:     number;
-  total_trades: number;
-  active:       boolean;
-}
 
 function normalize(raw: unknown): PairScore[] {
   if (Array.isArray(raw)) return raw as PairScore[];
   if (raw && typeof raw === 'object') {
     const r = raw as Record<string, unknown>;
-    if (Array.isArray(r.results))  return r.results  as PairScore[];
-    if (Array.isArray(r.scores))   return r.scores   as PairScore[];
-    if (Array.isArray(r.pairs))    return r.pairs     as PairScore[];
+    if (Array.isArray(r.results)) return r.results as PairScore[];
+    if (Array.isArray(r.scores))  return r.scores  as PairScore[];
+    if (Array.isArray(r.pairs))   return r.pairs   as PairScore[];
   }
   return [];
 }
