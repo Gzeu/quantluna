@@ -23,7 +23,6 @@ Env vars (all optional, have defaults):
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SLACK_WEBHOOK_URL
     HEALTH_PORT, FUNDING_GATE_ENABLED, PNL_RECONCILER_ENABLED
     MARKET_TRADE_ENABLED, CHECKPOINT_PATH, INITIAL_CAPITAL
-    DASHBOARD_API_URL, DASHBOARD_FRONTEND_URL
     See BybitLiveRunnerConfig.from_env() for full list.
 
 Flow:
@@ -32,22 +31,14 @@ Flow:
     3. Build NotifierBus (Telegram + Slack)
     4. Build BybitWsFeed
     5. Wire RiskDashboardEngine into StateBus + api/risk singleton
-    6. WorkflowOrchestrator.from_runner_cfg(cfg, notifier_bus, ws_feed)
+    6. WorkflowOrchestrator.run_startup_workflow()
        Faza 0: HealthCheck -> halt on critical failure
        Faza 1: PositionScanner
        Faza 2: ResumeManager
        Faza 3: AdoptionEngine
        Faza 4: ProfitOptimizer
-       Faza 6: Dashboard health ping
     7. WorkflowOrchestrator.start_runner() -> blocks
-       Faza 5: BybitLiveRunner v3.6 (notifier_bus + ws_feed injectate)
-               + optimizer loop in background
-
-FIX (2026-07-11):
-    main.py transmite acum notifier_bus si ws_feed la from_runner_cfg()
-    astfel incat orchestratorul le injecteaza in BybitLiveRunner prin
-    _build_runner() -> BybitLiveRunner(cfg=, notifier_bus=, ws_feed=)
-    Evita reconstructia duplicata de NotifierBus si WsFeed in runner.
+       Faza 5: BybitLiveRunner + optimizer loop in background
 """
 from __future__ import annotations
 
@@ -65,38 +56,13 @@ def _parse_args() -> argparse.Namespace:
         description="QuantLuna — Pair Trading Bot",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument("--dry-run", action="store_true", default=None)
+    parser.add_argument("--pair", type=str, default=None, metavar="Y/X")
+    parser.add_argument("--interval", type=str, default=None, metavar="MIN")
+    parser.add_argument("--skip-health", action="store_true", default=False)
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        default=None,
-        help="Force dry-run mode (no real orders). Overrides DRY_RUN env var.",
-    )
-    parser.add_argument(
-        "--pair",
-        type=str,
-        default=None,
-        metavar="Y/X",
-        help="Symbol pair, e.g. BTCUSDT/ETHUSDT",
-    )
-    parser.add_argument(
-        "--interval",
-        type=str,
-        default=None,
-        metavar="MIN",
-        help="Bar interval in minutes, e.g. 5",
-    )
-    parser.add_argument(
-        "--skip-health",
-        action="store_true",
-        default=False,
-        help="Skip pre-flight HealthCheck (useful in dry/CI mode)",
-    )
-    parser.add_argument(
-        "--log-level",
-        type=str,
-        default="INFO",
+        "--log-level", type=str, default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Log level",
     )
     return parser.parse_args()
 
@@ -195,14 +161,10 @@ async def _build_ws_feed(cfg):
         return None
 
 
-def _install_signal_handlers(
-    loop: asyncio.AbstractEventLoop,
-    shutdown_event: asyncio.Event,
-) -> None:
-    def _handle_signal(sig: signal.Signals) -> None:
+def _install_signal_handlers(loop, shutdown_event) -> None:
+    def _handle_signal(sig) -> None:
         logger.warning("main: received {} — initiating graceful shutdown", sig.name)
         shutdown_event.set()
-
     for sig in (signal.SIGTERM, signal.SIGINT):
         try:
             loop.add_signal_handler(sig, _handle_signal, sig)
@@ -212,12 +174,10 @@ def _install_signal_handlers(
 
 async def main() -> int:
     args = _parse_args()
-
     os.makedirs("logs", exist_ok=True)
     os.makedirs("state", exist_ok=True)
     _configure_logging(args.log_level)
 
-    # 1. Load config
     from execution.bybit_live_runner import BybitLiveRunnerConfig
     cfg = BybitLiveRunnerConfig.from_env()
 
@@ -228,10 +188,7 @@ async def main() -> int:
         if len(parts) == 2 and parts[0] and parts[1]:
             cfg.symbol_y, cfg.symbol_x = parts[0].upper(), parts[1].upper()
         else:
-            logger.error(
-                "Invalid --pair format: {!r} (expected Y/X, both non-empty)",
-                args.pair,
-            )
+            logger.error("Invalid --pair format: {!r} (expected Y/X)", args.pair)
             return 1
     if args.interval:
         cfg.interval = args.interval
@@ -241,33 +198,24 @@ async def main() -> int:
         cfg.symbol_y, cfg.symbol_x, cfg.interval, cfg.dry_run,
     )
 
-    # 2. SIGTERM / SIGINT
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
     _install_signal_handlers(loop, shutdown_event)
 
-    # 3. Build shared components — construite O SINGURA DATA si injectate
     notifier_bus = await _build_notifier_bus(cfg)
     ws_feed      = await _build_ws_feed(cfg)
 
-    # 4. Wire RiskDashboardEngine
     from core.state_bus import bus as state_bus
     _wire_dashboard_engine(cfg, state_bus)
 
-    # 5. Build orchestrator — transmite notifier_bus si ws_feed
-    #    Orchestratorul le va injecta in BybitLiveRunner via _build_runner()
-    #    Evita constructia duplicata in runner._build_components()
     from execution.workflow_orchestrator import WorkflowOrchestrator
     orch = WorkflowOrchestrator.from_runner_cfg(
         cfg=cfg,
         notifier_bus=notifier_bus,
         ws_feed=ws_feed,
         skip_health_check=args.skip_health or cfg.dry_run,
-        dashboard_api_url=os.getenv("DASHBOARD_API_URL", ""),
-        dashboard_frontend_url=os.getenv("DASHBOARD_FRONTEND_URL", ""),
     )
 
-    # 6. Run startup workflow (Faze 0-4 + 6)
     ctx = await orch.run_startup_workflow()
 
     if ctx.should_halt:
@@ -282,7 +230,6 @@ async def main() -> int:
                 pass
         return 1
 
-    # 7. Start runner (Faza 5) — blocks until stop or shutdown signal
     runner_task = asyncio.create_task(orch.start_runner(ctx))
     await asyncio.wait(
         [runner_task, asyncio.create_task(shutdown_event.wait())],
