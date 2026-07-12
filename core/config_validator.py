@@ -43,6 +43,17 @@ class ConfigValidator:
         if not result.valid:
             print(result.summary())
             sys.exit(1)
+
+    Pentru validare completa cu parametrii de trading::
+
+        result = validator.validate_trading_params(
+            entry_zscore=cfg.entry_zscore,
+            exit_zscore=cfg.exit_zscore,
+            base_qty=cfg.base_qty,
+            warmup_bars=cfg.warmup_bars,
+            kalman_window=cfg.kalman_window,
+            max_drawdown_pct=cfg.max_drawdown_pct,
+        )
     """
 
     REQUIRED_LIVE_BYBIT = [
@@ -107,5 +118,72 @@ class ConfigValidator:
         dry_run = os.getenv("DRY_RUN", "true").lower()
         if self._mode == "live" and dry_run in ("true", "1", "yes"):
             warnings.append("DRY_RUN=true dar mode=live — comenzile NU vor fi trimise la exchange")
+
+        return ValidationResult(valid=len(errors) == 0, errors=errors, warnings=warnings)
+
+    def validate_trading_params(
+        self,
+        entry_zscore: float,
+        exit_zscore: float,
+        base_qty: float,
+        warmup_bars: int,
+        kalman_window: int,
+        max_drawdown_pct: float,
+    ) -> ValidationResult:
+        """Valideaza parametrii de trading din BybitLiveRunnerConfig.
+
+        Aceasta metoda completeaza validarea din __post_init__ cu warnings
+        suplimentare pentru valori legale dar riscante, si poate fi apelata
+        independent pentru logging in main.py.
+
+        Args:
+            entry_zscore: Pragul de intrare in pozitie.
+            exit_zscore: Pragul de iesire din pozitie.
+            base_qty: Cantitatea de baza per ordin.
+            warmup_bars: Numarul minim de bare pentru Kalman warmup.
+            kalman_window: Fereastra rolling pentru Kalman filter.
+            max_drawdown_pct: Drawdown maxim permis (in procente, ex: 10.0).
+
+        Returns:
+            ValidationResult cu erori si warnings.
+        """
+        errors: List[str] = []
+        warnings: List[str] = []
+
+        # Warnings pentru valori legale dar riscante
+        if entry_zscore < 1.0:
+            warnings.append(
+                f"ENTRY_ZSCORE={entry_zscore} este mic (< 1.0) — "
+                "semnale prea frecvente, risc over-trading."
+            )
+        if entry_zscore > 4.0:
+            warnings.append(
+                f"ENTRY_ZSCORE={entry_zscore} este mare (> 4.0) — "
+                "putine semnale, poate rata oportunitati."
+            )
+        if exit_zscore > 1.5:
+            warnings.append(
+                f"EXIT_ZSCORE={exit_zscore} este mare (> 1.5) — "
+                "pozitiile se tin mult pana se inchid."
+            )
+        if warmup_bars < 50:
+            warnings.append(
+                f"WARMUP_BARS={warmup_bars} mic (< 50) — "
+                "Kalman filter mai putin stabil in primele bare."
+            )
+        if kalman_window > 500:
+            warnings.append(
+                f"KALMAN_WINDOW={kalman_window} mare (> 500) — "
+                "reactie lenta la schimbari de regim."
+            )
+        if max_drawdown_pct > 30:
+            warnings.append(
+                f"MAX_DRAWDOWN_PCT={max_drawdown_pct}% este mare (> 30%) — risc ridicat."
+            )
+        if base_qty > 1.0:
+            warnings.append(
+                f"BASE_QTY={base_qty} este mare (> 1.0) — "
+                "verificati ca aveti lichiditate suficienta."
+            )
 
         return ValidationResult(valid=len(errors) == 0, errors=errors, warnings=warnings)

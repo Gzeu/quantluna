@@ -66,6 +66,71 @@ class BybitLiveRunnerConfig:
     # Checkpoint
     checkpoint_path: str = os.getenv("CHECKPOINT_PATH", "state/position_checkpoint.db")
 
+    def __post_init__(self) -> None:
+        """Validate all config values at construction time.
+
+        Raises ValueError with a descriptive message if any parameter
+        is out of range, preventing silent misconfiguration at startup.
+        """
+        errors = []
+
+        # --- Entry / Exit thresholds ---
+        if self.entry_zscore <= 0:
+            errors.append(
+                f"ENTRY_ZSCORE={self.entry_zscore} invalid: trebuie > 0. "
+                "La 0 se genereaza semnal la orice valoare de spread."
+            )
+        if self.exit_zscore <= 0:
+            errors.append(
+                f"EXIT_ZSCORE={self.exit_zscore} invalid: trebuie > 0."
+            )
+        if self.entry_zscore > 0 and self.exit_zscore >= self.entry_zscore:
+            errors.append(
+                f"EXIT_ZSCORE={self.exit_zscore} trebuie < ENTRY_ZSCORE={self.entry_zscore}. "
+                "Altfel pozitiile nu se vor inchide niciodata."
+            )
+        if self.base_qty <= 0:
+            errors.append(
+                f"BASE_QTY={self.base_qty} invalid: trebuie > 0. "
+                "Comenzile cu cantitate 0 sunt respinse de exchange."
+            )
+
+        # --- Model parameters ---
+        if self.warmup_bars < 20:
+            errors.append(
+                f"WARMUP_BARS={self.warmup_bars} prea mic: minim 20 pentru Kalman stabil. "
+                "Sub 20, z-score-urile initiale sunt nereprezentative."
+            )
+        if self.kalman_window < self.warmup_bars:
+            errors.append(
+                f"KALMAN_WINDOW={self.kalman_window} trebuie >= WARMUP_BARS={self.warmup_bars}."
+            )
+
+        # --- Risk management ---
+        if not (0 < self.max_drawdown_pct <= 100):
+            errors.append(
+                f"MAX_DRAWDOWN_PCT={self.max_drawdown_pct} invalid: trebuie in (0, 100]. "
+                "La 200 nu exista stop loss efectiv."
+            )
+        if self.cooldown_seconds < 0:
+            errors.append(
+                f"COOLDOWN_SECONDS={self.cooldown_seconds} invalid: trebuie >= 0."
+            )
+        if self.max_consec_losses < 1:
+            errors.append(
+                f"MAX_CONSEC_LOSSES={self.max_consec_losses} invalid: trebuie >= 1."
+            )
+
+        # --- Capital ---
+        if self.initial_capital <= 0:
+            errors.append(
+                f"INITIAL_CAPITAL={self.initial_capital} invalid: trebuie > 0."
+            )
+
+        if errors:
+            msg = "BybitLiveRunnerConfig invalid:\n" + "\n".join(f"  - {e}" for e in errors)
+            raise ValueError(msg)
+
     @classmethod
     def from_env(cls) -> "BybitLiveRunnerConfig":
         """Construct config purely from environment variables."""

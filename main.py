@@ -31,16 +31,17 @@ Env vars (all optional, have defaults):
 Flow:
     1. Parse CLI args
     2. Load BybitLiveRunnerConfig from env (+ CLI overrides)
-    3. Build NotifierBus (Telegram + Slack)
-    4. Build BybitWsFeed
-    5. Wire RiskDashboardEngine into StateBus + api/risk singleton
-    6. WorkflowOrchestrator.run_startup_workflow()
+    3. Validate config (ConfigValidator + __post_init__ guards)
+    4. Build NotifierBus (Telegram + Slack)
+    5. Build BybitWsFeed
+    6. Wire RiskDashboardEngine into StateBus + api/risk singleton
+    7. WorkflowOrchestrator.run_startup_workflow()
        Faza 0: HealthCheck -> halt on critical failure
        Faza 1: PositionScanner
        Faza 2: ResumeManager
        Faza 3: AdoptionEngine
        Faza 4: ProfitOptimizer
-    7. WorkflowOrchestrator.start_runner() -> blocks
+    8. WorkflowOrchestrator.start_runner() -> blocks
        Faza 5: BybitLiveRunner + optimizer loop in background
 """
 from __future__ import annotations
@@ -108,6 +109,63 @@ def _configure_logging(level: str) -> None:
     )
 
 
+def _validate_config(cfg, mode: str) -> None:
+    """Run ConfigValidator and log results. Fatal on errors in live mode.
+
+    Notes:
+        - __post_init__ in BybitLiveRunnerConfig already raises ValueError
+          for hard out-of-range values (entry_zscore=0, warmup_bars<20, etc.).
+        - This function adds env-level checks (API keys, notifications) and
+          trading-param warnings that are advisory rather than fatal in paper mode.
+    """
+    try:
+        from core.config_validator import ConfigValidator
+        validator = ConfigValidator(
+            exchange="bybit",
+            mode=mode,
+            capital_usdt=cfg.initial_capital,
+            max_drawdown_pct=cfg.max_drawdown_pct / 100.0,  # pct -> fraction
+        )
+        result = validator.validate()
+        trading_result = validator.validate_trading_params(
+            entry_zscore=cfg.entry_zscore,
+            exit_zscore=cfg.exit_zscore,
+            base_qty=cfg.base_qty,
+            warmup_bars=cfg.warmup_bars,
+            kalman_window=cfg.kalman_window,
+            max_drawdown_pct=cfg.max_drawdown_pct,
+        )
+
+        # Merge results
+        all_errors   = result.errors   + trading_result.errors
+        all_warnings = result.warnings + trading_result.warnings
+
+        for w in all_warnings:
+            logger.warning("Config warning: {}", w)
+
+        if all_errors:
+            for e in all_errors:
+                logger.error("Config error: {}", e)
+            if mode == "live":
+                logger.error(
+                    "main: {} config error(s) detected in live mode — aborting. "
+                    "Fix env vars and restart.",
+                    len(all_errors),
+                )
+                sys.exit(1)
+            else:
+                logger.warning(
+                    "main: {} config error(s) detected in {} mode — continuand "
+                    "(dry_run=True protects from real orders).",
+                    len(all_errors), mode,
+                )
+        else:
+            logger.info("main: config validation passed ({} warnings)", len(all_warnings))
+
+    except ImportError as exc:
+        logger.warning("main: ConfigValidator unavailable — skipping soft validation: {}", exc)
+
+
 def _wire_dashboard_engine(cfg, state_bus) -> None:
     """Inject RiskDashboardEngine into StateBus and api/risk singleton.
 
@@ -125,7 +183,7 @@ def _wire_dashboard_engine(cfg, state_bus) -> None:
         try:
             from api.risk import set_risk_engine
             set_risk_engine(engine)
-        except Exception as exc:  # fix #17: was bare `pass`
+        except Exception as exc:
             logger.warning(
                 "main: api.risk.set_risk_engine failed — dashboard API will use "
                 "StateBus fallback engine. Error: {}", exc
@@ -215,7 +273,12 @@ async def main() -> int:
     _configure_logging(args.log_level)
 
     from execution.bybit_live_runner import BybitLiveRunnerConfig
-    cfg = BybitLiveRunnerConfig.from_env()
+    # __post_init__ raises ValueError immediately for hard out-of-range values.
+    try:
+        cfg = BybitLiveRunnerConfig.from_env()
+    except ValueError as exc:
+        logger.error("Config validation failed at startup:\n{}", exc)
+        return 1
 
     if args.dry_run:
         cfg.dry_run = True
@@ -233,6 +296,11 @@ async def main() -> int:
         "QuantLuna starting — {}/{} interval={}m dry_run={} log_dir={} state_dir={}",
         cfg.symbol_y, cfg.symbol_x, cfg.interval, cfg.dry_run, LOG_DIR, STATE_DIR,
     )
+
+    # Soft validation: env-level checks (API keys, notifications) + advisory warnings.
+    # Hard validation already done by __post_init__ above.
+    mode = "live" if not cfg.dry_run else "paper"
+    _validate_config(cfg, mode)
 
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
