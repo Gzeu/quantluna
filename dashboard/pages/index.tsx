@@ -1,10 +1,11 @@
 /**
- * pages/index.tsx — S37 continue
+ * pages/index.tsx — S37 polish
  * Dashboard complet — toate componentele existente in grid masonry.
- * RiskMetricsLoader + toate paneluri: Arb, Spread, ExecutionLog, MarketHeatmap, Candle.
+ * NavBar inclus + RiskMetricsLoader + toate paneluri.
  */
 import type { NextPage } from 'next';
 import Head              from 'next/head';
+import NavBar            from '../components/NavBar';
 import { StatsBar }          from '../components/StatsBar';
 import { MetricsBadge }      from '../components/MetricsBadge';
 import { PnlChart }          from '../components/PnlChart';
@@ -39,11 +40,12 @@ const Dashboard: NextPage = () => (
   <>
     <Head><title>Dashboard — QuantLuna</title></Head>
     <RiskMetricsLoader />
+    <NavBar />
     <StatsBar />
     <main
       className="animate-fade-in"
       style={{
-        background: 'var(--bg-base)',
+        background: 'var(--bg-body)',
         minHeight: 'calc(100vh - var(--nav-h) - var(--stats-h))',
         padding: '16px 20px 40px',
         ...grid,
