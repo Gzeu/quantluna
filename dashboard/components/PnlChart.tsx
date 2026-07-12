@@ -1,8 +1,8 @@
 /**
  * PnlChart.tsx — S37 polish
- * Sursa date: useQuantLunaStore.pnl (populat de useQuantLunaWS simulator/WS real)
- * Fallback la SSE /risk/stream dacă store-ul este gol.
- * ComposedChart: Area equity + Bar net_pnl + zoom + CSV export
+ * Migrat la design system: ql-card, ql-btn-ghost, CSS vars.
+ * Skeleton shimmer in waiting state (in loc de text gri).
+ * Sursa: store -> fallback SSE.
  */
 'use client';
 import React, { useState, useMemo } from 'react';
@@ -13,16 +13,18 @@ import {
 import { useQuantLunaStore } from '../store/quantlunaStore';
 import { usePnlStream }      from '../hooks/usePnlStream';
 import type { PnlPoint }     from '../types/dashboard';
+import { Card }              from './ui/Card';
+import { Badge }             from './ui/Badge';
 
 const ZOOM_OPTIONS = [50, 100, 200, 0] as const;
 const ZOOM_LABELS  = ['50', '100', '200', 'ALL'];
 
-interface Props { maxPoints?: number; }
-
 function exportCsv(data: PnlPoint[]) {
   const rows = [
     'ts,equity,net_pnl',
-    ...data.map(d => `${new Date(d.ts).toISOString()},${d.equity},${d.net_pnl ?? ''}`),
+    ...data.map(d =>
+      `${new Date(d.ts).toISOString()},${d.equity},${d.net_pnl ?? ''}`
+    ),
   ].join('\n');
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([rows], { type: 'text/csv' }));
@@ -30,8 +32,41 @@ function exportCsv(data: PnlPoint[]) {
   a.click();
 }
 
+/* Skeleton pentru waiting state */
+function ChartSkeleton({ connected }: { connected: boolean }) {
+  return (
+    <div className="h-[260px] flex flex-col gap-3 pt-2">
+      {/* Y-axis mock */}
+      <div className="flex gap-3 h-full">
+        <div className="flex flex-col justify-between py-2" style={{ width: 56 }}>
+          {[1,2,3,4,5].map(i => (
+            <div key={i} className="skeleton h-3 rounded" style={{ width: '80%' }} />
+          ))}
+        </div>
+        <div className="flex-1 flex flex-col gap-2">
+          {/* Skeleton bars */}
+          <div className="flex items-end gap-1 h-full pb-6">
+            {Array.from({ length: 24 }).map((_, i) => (
+              <div
+                key={i}
+                className="skeleton flex-1 rounded-sm"
+                style={{ height: `${20 + Math.sin(i * 0.7) * 15 + 40}%` }}
+              />
+            ))}
+          </div>
+        </div>
+      </div>
+      {/* Status */}
+      <p className="text-center text-[var(--text-muted)] text-xs">
+        {connected ? 'Waiting for data…' : 'Connecting to stream…'}
+      </p>
+    </div>
+  );
+}
+
+interface Props { maxPoints?: number; }
+
 export function PnlChart({ maxPoints = 200 }: Props) {
-  // Sursa primă: store (populat de useQuantLunaWS)
   const storePnl = useQuantLunaStore(s => s.pnl);
   const storeHistory: PnlPoint[] = useMemo(() => {
     if (!storePnl?.equityHistory?.length) return [];
@@ -39,13 +74,13 @@ export function PnlChart({ maxPoints = 200 }: Props) {
       .slice(-maxPoints);
   }, [storePnl, maxPoints]);
 
-  // Fallback SSE dacă store gol
   const { data: sseData, connected: sseConnected } = usePnlStream(
-    storeHistory.length > 0 ? 0 : maxPoints  // 0 = nu conecta dacă avem store
+    storeHistory.length > 0 ? 0 : maxPoints
   );
 
-  const rawData: PnlPoint[] = storeHistory.length > 0 ? storeHistory : sseData;
-  const connected = storeHistory.length > 0 ? true : sseConnected;
+  const rawData: PnlPoint[]  = storeHistory.length > 0 ? storeHistory : sseData;
+  const connected            = storeHistory.length > 0 ? true : sseConnected;
+  const source               = storeHistory.length > 0 ? 'WS' : 'SSE';
 
   const [zoom, setZoom] = useState<number>(0);
   const visible = useMemo(
@@ -54,82 +89,115 @@ export function PnlChart({ maxPoints = 200 }: Props) {
   );
   const firstEquity = visible[0]?.equity;
 
-  const source = storeHistory.length > 0 ? 'STORE' : 'SSE';
-
   return (
-    <div className="bg-gray-900 rounded-2xl p-5 w-full">
-      {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
+    <Card>
+      <Card.Header>
         <div className="flex items-center gap-3">
-          <h2 className="text-white font-semibold text-lg">Live PnL — Equity Curve</h2>
-          <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-            connected ? 'bg-green-900 text-green-300' : 'bg-red-900 text-red-300'
-          }`}>
-            {connected ? `◉ LIVE (${source})` : '○ Connecting…'}
-          </span>
+          <Card.Title>Live PnL — Equity Curve</Card.Title>
+          <Badge
+            variant={connected ? 'green' : 'red'}
+            dot pulse={connected}
+          >
+            {connected ? `LIVE · ${source}` : 'Connecting…'}
+          </Badge>
         </div>
         <div className="flex items-center gap-2">
-          <div className="flex rounded-lg overflow-hidden border border-gray-700 text-xs">
+          {/* Zoom group */}
+          <div className="flex rounded-lg overflow-hidden border border-[var(--border)]">
             {ZOOM_OPTIONS.map((z, i) => (
-              <button key={z} onClick={() => setZoom(z)}
-                className={`px-2.5 py-1 transition-colors ${
+              <button
+                key={z}
+                onClick={() => setZoom(z)}
+                className={`ql-btn rounded-none border-0 px-2.5 py-1 text-xs transition-colors ${
                   zoom === z
-                    ? 'bg-cyan-900 text-cyan-200'
-                    : 'bg-gray-800 text-gray-400 hover:bg-gray-700'
-                }`}>{ZOOM_LABELS[i]}</button>
+                    ? 'bg-[var(--cyan-dim)] text-cyan-200'
+                    : 'bg-[var(--bg-elevated)] text-[var(--text-muted)] hover:bg-[var(--bg-card-hover)]'
+                }`}
+              >
+                {ZOOM_LABELS[i]}
+              </button>
             ))}
           </div>
           <button
             onClick={() => exportCsv(visible)}
             disabled={visible.length === 0}
-            className="text-xs px-3 py-1 rounded-lg bg-gray-800 hover:bg-gray-700 text-gray-300 border border-gray-700 disabled:opacity-40 transition-colors"
-          >↓ CSV</button>
+            className="ql-btn ql-btn-ghost"
+          >
+            ↓ CSV
+          </button>
         </div>
-      </div>
+      </Card.Header>
 
       {visible.length === 0 ? (
-        <div className="h-52 flex items-center justify-center text-gray-500 text-sm">
-          {connected ? 'Waiting for data…' : 'Connecting to stream…'}
-        </div>
+        <ChartSkeleton connected={connected} />
       ) : (
         <ResponsiveContainer width="100%" height={260}>
-          <ComposedChart data={visible} margin={{ top: 4, right: 16, left: 0, bottom: 0 }}>
+          <ComposedChart
+            data={visible}
+            margin={{ top: 4, right: 16, left: 0, bottom: 0 }}
+          >
             <defs>
               <linearGradient id="pnlGrad" x1="0" y1="0" x2="0" y2="1">
                 <stop offset="5%"  stopColor="#22d3ee" stopOpacity={0.28} />
                 <stop offset="95%" stopColor="#22d3ee" stopOpacity={0.02} />
               </linearGradient>
             </defs>
-            <CartesianGrid strokeDasharray="3 3" stroke="#1f2937" />
-            <XAxis dataKey="ts" tick={{ fill: '#6b7280', fontSize: 10 }}
-                   tickFormatter={v => new Date(v as number).toLocaleTimeString()}
-                   minTickGap={50} />
-            <YAxis yAxisId="equity" tick={{ fill: '#6b7280', fontSize: 10 }}
-                   tickFormatter={v => `$${(v as number).toLocaleString()}`} width={78} />
-            <YAxis yAxisId="pnl" orientation="right" tick={{ fill: '#6b7280', fontSize: 10 }}
-                   tickFormatter={v => `$${(v as number).toFixed(0)}`} width={64} />
+            <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
+            <XAxis
+              dataKey="ts"
+              tick={{ fill: 'var(--text-muted)', fontSize: 10 }}
+              tickFormatter={v => new Date(v as number).toLocaleTimeString()}
+              minTickGap={50}
+            />
+            <YAxis
+              yAxisId="equity"
+              tick={{ fill: 'var(--text-muted)', fontSize: 10 }}
+              tickFormatter={v => `$${(v as number).toLocaleString()}`}
+              width={78}
+            />
+            <YAxis
+              yAxisId="pnl"
+              orientation="right"
+              tick={{ fill: 'var(--text-muted)', fontSize: 10 }}
+              tickFormatter={v => `$${(v as number).toFixed(0)}`}
+              width={64}
+            />
             <Tooltip
-              contentStyle={{ background: '#111827', border: '1px solid #374151', borderRadius: 8, fontSize: 12 }}
+              contentStyle={{
+                background: 'var(--bg-elevated)',
+                border: '1px solid var(--border)',
+                borderRadius: 'var(--radius-sm)',
+                fontSize: 12,
+              }}
               labelFormatter={(v: number) => new Date(v).toLocaleTimeString()}
               formatter={(v: number, name: string) => [
                 `$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
                 name === 'equity' ? 'Equity' : 'Net PnL',
               ]}
             />
-            <Legend wrapperStyle={{ fontSize: 11, color: '#9ca3af', paddingTop: 8 }}
-                    formatter={v => v === 'equity' ? 'Equity' : 'Net PnL'} />
+            <Legend
+              wrapperStyle={{ fontSize: 11, color: 'var(--text-muted)', paddingTop: 8 }}
+              formatter={v => v === 'equity' ? 'Equity' : 'Net PnL'}
+            />
             {firstEquity !== undefined && (
-              <ReferenceLine yAxisId="equity" y={firstEquity}
-                             stroke="#374151" strokeDasharray="4 2" />
+              <ReferenceLine
+                yAxisId="equity" y={firstEquity}
+                stroke="var(--border)" strokeDasharray="4 2"
+              />
             )}
-            <Area yAxisId="equity" type="monotone" dataKey="equity"
-                  stroke="#22d3ee" strokeWidth={2} fill="url(#pnlGrad)"
-                  dot={false} isAnimationActive={false} />
-            <Bar  yAxisId="pnl" dataKey="net_pnl" fill="#818cf8" opacity={0.45}
-                  isAnimationActive={false} radius={[2,2,0,0]} />
+            <Area
+              yAxisId="equity" type="monotone" dataKey="equity"
+              stroke="var(--cyan)" strokeWidth={2} fill="url(#pnlGrad)"
+              dot={false} isAnimationActive={false}
+            />
+            <Bar
+              yAxisId="pnl" dataKey="net_pnl"
+              fill="var(--purple)" opacity={0.45}
+              isAnimationActive={false} radius={[2,2,0,0]}
+            />
           </ComposedChart>
         </ResponsiveContainer>
       )}
-    </div>
+    </Card>
   );
 }

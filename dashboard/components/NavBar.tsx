@@ -1,13 +1,17 @@
 /**
- * dashboard/components/NavBar.tsx  -  QuantLuna Navigation Bar v1.1
- * Sprint S45 (2026-07-12): adauga link Watchdog cu badge alerte recente
+ * NavBar.tsx — S37 polish
+ * Migrat la CSS vars (fara inline styles hardcodate).
+ * Active route cu var(--purple) border-bottom.
+ * Kbd ? hint in dreapta (shortcut help modal).
+ * LiveClock monospaced.
  */
-'use client'
+'use client';
 import React, { useEffect, useState } from 'react';
-import Link from 'next/link';
+import Link       from 'next/link';
 import { useRouter } from 'next/router';
+import { Kbd }    from './ui/Kbd';
 
-const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 
 interface NavBadge {
   servicesRunning:      number;
@@ -15,7 +19,7 @@ interface NavBadge {
   optimizerRunning:     boolean;
   optimizerAutoActive:  boolean;
   watchdogActive:       boolean;
-  watchdogAlertsRecent: number;   // alerte in ultimele 5min
+  watchdogAlertsRecent: number;
 }
 
 export default function NavBar() {
@@ -27,23 +31,17 @@ export default function NavBar() {
   });
 
   useEffect(() => {
-    async function fetchBadges() {
+    const fetchBadges = async () => {
       try {
         const [svc, opt, wd] = await Promise.all([
           fetch(`${API}/api/services/list`).then(r => r.json()).catch(() => null),
           fetch(`${API}/api/optimizer/status`).then(r => r.json()).catch(() => null),
           fetch(`${API}/api/watchdog/status`).then(r => r.json()).catch(() => null),
         ]);
-
-        // Alerte recente (ultimele 5min)
-        let alertsRecent = 0;
-        if (wd?.recent_alerts) {
-          const now = Date.now();
-          alertsRecent = (wd.recent_alerts as any[]).filter(a => {
-            return now - new Date(a.timestamp).getTime() < 5 * 60 * 1000;
-          }).length;
-        }
-
+        const now = Date.now();
+        const alertsRecent = (wd?.recent_alerts as any[] ?? []).filter(
+          (a: any) => now - new Date(a.timestamp).getTime() < 5 * 60_000
+        ).length;
         setBadge({
           servicesRunning:      svc?.running  ?? 0,
           servicesTotal:        svc?.total    ?? 0,
@@ -53,39 +51,37 @@ export default function NavBar() {
           watchdogAlertsRecent: alertsRecent,
         });
       } catch {}
-    }
+    };
     fetchBadges();
-    const id = setInterval(fetchBadges, 3000);
+    const id = setInterval(fetchBadges, 3_000);
     return () => clearInterval(id);
   }, []);
 
   const current = router.pathname;
 
-  const links: Array<{
-    href: string; label: string; badge?: React.ReactNode;
-  }> = [
-    { href: '/', label: '📈 Dashboard' },
+  const links: Array<{ href: string; label: string; badge?: React.ReactNode }> = [
+    { href: '/',          label: '📈 Dashboard' },
     { href: '/portfolio', label: '💼 Portfolio' },
     {
       href: '/services',
       label: '⚙ Services',
       badge: badge.servicesTotal > 0 ? (
-        <span style={{
-          fontSize: 10, fontWeight: 700, marginLeft: 4,
-          color: badge.servicesRunning > 0 ? '#4ade80' : '#666',
-        }}>{badge.servicesRunning}/{badge.servicesTotal}</span>
+        <span className={`text-[10px] font-bold ml-1 ${
+          badge.servicesRunning > 0 ? 'text-green-400' : 'text-[var(--text-muted)]'
+        }`}>
+          {badge.servicesRunning}/{badge.servicesTotal}
+        </span>
       ) : undefined,
     },
     {
       href: '/optimizer',
       label: '🔬 Optimizer',
       badge: (
-        <span style={{
-          fontSize: 9, marginLeft: 5,
-          color: badge.optimizerRunning    ? '#4ade80'
-               : badge.optimizerAutoActive ? '#8b5cf6'
-               : '#555',
-        }}>
+        <span className={`text-[9px] ml-1 ${
+          badge.optimizerRunning    ? 'text-green-400'
+          : badge.optimizerAutoActive ? 'text-purple-400'
+          : 'text-[var(--text-disabled)]'
+        }`}>
           {badge.optimizerRunning    ? '● run'
            : badge.optimizerAutoActive ? '● auto'
            : '○'}
@@ -96,13 +92,11 @@ export default function NavBar() {
       href: '/watchdog',
       label: '👁 Watchdog',
       badge: (
-        <span style={{
-          fontSize: 9, marginLeft: 5,
-          color: badge.watchdogAlertsRecent > 0 ? '#f87171'
-               : badge.watchdogActive           ? '#4ade80'
-               : '#555',
-          fontWeight: badge.watchdogAlertsRecent > 0 ? 700 : 400,
-        }}>
+        <span className={`text-[9px] ml-1 font-bold ${
+          badge.watchdogAlertsRecent > 0 ? 'text-red-400'
+          : badge.watchdogActive         ? 'text-green-400'
+          : 'text-[var(--text-disabled)]'
+        }`}>
           {badge.watchdogAlertsRecent > 0
             ? `🚨 ${badge.watchdogAlertsRecent}`
             : badge.watchdogActive ? '●'
@@ -110,43 +104,41 @@ export default function NavBar() {
         </span>
       ),
     },
+    { href: '/strategy', label: '🧠 Strategy' },
   ];
 
   return (
-    <nav style={{
-      background: '#0d0d1a',
-      borderBottom: '1px solid #1a1a2e',
-      padding: '0 32px',
-      display: 'flex',
-      alignItems: 'center',
-      height: 52,
-      position: 'sticky',
-      top: 0,
-      zIndex: 100,
-      backdropFilter: 'blur(8px)',
-    }}>
+    <nav
+      className="flex items-center px-8 sticky top-0 z-[100]"
+      style={{
+        background: 'rgba(13,13,26,0.92)',
+        borderBottom: '1px solid var(--border)',
+        height: 'var(--nav-h)',
+        backdropFilter: 'blur(10px)',
+        WebkitBackdropFilter: 'blur(10px)',
+      }}
+    >
       {/* Logo */}
-      <div style={{
-        display: 'flex', alignItems: 'center', gap: 8,
-        marginRight: 32, flexShrink: 0,
-      }}>
-        <span style={{
-          fontSize: 16, fontWeight: 800,
-          background: 'linear-gradient(135deg, #8b5cf6, #22d3ee)',
-          WebkitBackgroundClip: 'text',
-          WebkitTextFillColor: 'transparent',
-          letterSpacing: -0.5,
-        }}>QuantLuna</span>
-        <span style={{
-          width: 6, height: 6, borderRadius: '50%',
-          background: '#4ade80',
-          boxShadow: '0 0 6px #4ade80',
-          display: 'inline-block',
-        }} />
+      <div className="flex items-center gap-2 mr-8 shrink-0">
+        <span
+          className="text-base font-extrabold"
+          style={{
+            background: 'linear-gradient(135deg, var(--purple), var(--cyan))',
+            WebkitBackgroundClip: 'text',
+            WebkitTextFillColor: 'transparent',
+            letterSpacing: -0.5,
+          }}
+        >
+          QuantLuna
+        </span>
+        <span
+          className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse"
+          style={{ boxShadow: '0 0 6px #4ade80' }}
+        />
       </div>
 
       {/* Links */}
-      <div style={{ display: 'flex', gap: 2, flex: 1 }}>
+      <div className="flex flex-1 h-full">
         {links.map(({ href, label, badge }) => {
           const isActive = current === href
             || (href !== '/' && current.startsWith(href));
@@ -154,29 +146,37 @@ export default function NavBar() {
             <Link
               key={href}
               href={href}
-              style={{
-                display: 'flex', alignItems: 'center',
-                padding: '0 14px', height: 52,
-                textDecoration: 'none',
-                fontSize: 13, fontWeight: isActive ? 700 : 400,
-                color: isActive ? '#e0e0ff' : '#666',
-                borderBottom: isActive ? '2px solid #8b5cf6' : '2px solid transparent',
-                transition: 'color 0.15s, border-color 0.15s',
-              }}
-              onMouseEnter={e => {
-                if (!isActive)
-                  (e.currentTarget as HTMLAnchorElement).style.color = '#aaa';
-              }}
-              onMouseLeave={e => {
-                if (!isActive)
-                  (e.currentTarget as HTMLAnchorElement).style.color = '#666';
-              }}
-            >{label}{badge}</Link>
+              className={`
+                flex items-center px-3.5 h-full text-[13px] no-underline
+                transition-colors duration-150
+                border-b-2 border-t-2 border-t-transparent
+                ${
+                  isActive
+                    ? 'font-bold text-[var(--text-primary)] border-b-[var(--purple)]'
+                    : 'font-normal text-[var(--text-muted)] border-b-transparent hover:text-[var(--text-secondary)]'
+                }
+              `}
+            >
+              {label}{badge}
+            </Link>
           );
         })}
       </div>
 
-      <LiveClock />
+      {/* Right: clock + kbd hint */}
+      <div className="flex items-center gap-3 shrink-0">
+        <button
+          onClick={() => window.dispatchEvent(new KeyboardEvent('keydown', { key: '?' }))}
+          className="flex items-center gap-1 text-[var(--text-muted)] hover:text-[var(--text-secondary)]
+                     transition-colors text-[10px] cursor-pointer"
+          data-tooltip="Keyboard shortcuts"
+          aria-label="Show keyboard shortcuts"
+        >
+          <span>shortcuts</span>
+          <Kbd>?</Kbd>
+        </button>
+        <LiveClock />
+      </div>
     </nav>
   );
 }
@@ -184,19 +184,16 @@ export default function NavBar() {
 function LiveClock() {
   const [t, setT] = useState('');
   useEffect(() => {
-    const update = () => setT(
+    const tick = () => setT(
       new Date().toLocaleTimeString('ro-RO', {
         hour: '2-digit', minute: '2-digit', second: '2-digit',
       })
     );
-    update();
-    const id = setInterval(update, 1000);
+    tick();
+    const id = setInterval(tick, 1_000);
     return () => clearInterval(id);
   }, []);
   return (
-    <span style={{
-      fontFamily: 'monospace', fontSize: 12,
-      color: '#444', flexShrink: 0,
-    }}>{t}</span>
+    <span className="mono text-[11px] text-[var(--text-muted)] tabular">{t}</span>
   );
 }
