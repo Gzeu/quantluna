@@ -23,6 +23,9 @@ Env vars (all optional, have defaults):
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, SLACK_WEBHOOK_URL
     HEALTH_PORT, FUNDING_GATE_ENABLED, PNL_RECONCILER_ENABLED
     MARKET_TRADE_ENABLED, CHECKPOINT_PATH, INITIAL_CAPITAL
+    LOG_DIR  (default: logs)   — directory for rotating log files
+    STATE_DIR (default: state) — directory for checkpoint/state files
+    RUNNER_TIMEOUT_SECONDS (default: 7200) — hard timeout before force-cancel
     See BybitLiveRunnerConfig.from_env() for full list.
 
 Flow:
@@ -50,6 +53,16 @@ import sys
 
 from loguru import logger
 
+# ---------------------------------------------------------------------------
+# Directory constants — overridable via env for Docker / custom mounts
+# ---------------------------------------------------------------------------
+LOG_DIR = os.getenv("LOG_DIR", "logs")
+STATE_DIR = os.getenv("STATE_DIR", "state")
+
+# Hard timeout (seconds) for the runner task before force-cancel.
+# Default 2h — set RUNNER_TIMEOUT_SECONDS=0 to disable (infinite, not recommended).
+_RUNNER_TIMEOUT: int = int(os.getenv("RUNNER_TIMEOUT_SECONDS", "7200"))
+
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -59,7 +72,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", default=None)
     parser.add_argument("--pair", type=str, default=None, metavar="Y/X")
     parser.add_argument("--interval", type=str, default=None, metavar="MIN")
-    parser.add_argument("--skip-health", action="store_true", default=False)
+    parser.add_argument(
+        "--skip-health",
+        action="store_true",
+        default=False,
+        help="Skip pre-flight health check. Use only in CI or isolated tests.",
+    )
     parser.add_argument(
         "--log-level", type=str, default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -81,7 +99,7 @@ def _configure_logging(level: str) -> None:
         colorize=True,
     )
     logger.add(
-        "logs/quantluna_{time:YYYY-MM-DD}.log",
+        f"{LOG_DIR}/quantluna_{{time:YYYY-MM-DD}}.log",
         level="DEBUG",
         rotation="00:00",
         retention="14 days",
@@ -91,6 +109,11 @@ def _configure_logging(level: str) -> None:
 
 
 def _wire_dashboard_engine(cfg, state_bus) -> None:
+    """Inject RiskDashboardEngine into StateBus and api/risk singleton.
+
+    Failures are logged as WARNING (non-fatal) since the bot can operate
+    without the dashboard, but operators MUST see the warning.
+    """
     try:
         from risk.dashboard_engine import RiskDashboardEngine
         initial_capital = float(
@@ -102,17 +125,27 @@ def _wire_dashboard_engine(cfg, state_bus) -> None:
         try:
             from api.risk import set_risk_engine
             set_risk_engine(engine)
-        except Exception:
-            pass
+        except Exception as exc:  # fix #17: was bare `pass`
+            logger.warning(
+                "main: api.risk.set_risk_engine failed — dashboard API will use "
+                "StateBus fallback engine. Error: {}", exc
+            )
         logger.info(
             "main: RiskDashboardEngine wired (capital={:.0f} USDT)",
             initial_capital,
         )
     except Exception as exc:
-        logger.warning("main: RiskDashboardEngine wiring failed: {}", exc)
+        logger.warning(
+            "main: RiskDashboardEngine wiring failed — bot will run without "
+            "risk dashboard. Error: {}", exc
+        )
 
 
 async def _build_notifier_bus(cfg):
+    """Build and register notification channels.
+
+    All failures are WARNING-logged; the bot can run without notifications.
+    """
     try:
         from notifications.notifier_bus import NotifierBus
         bus = NotifierBus(fail_silent=True)
@@ -125,7 +158,7 @@ async def _build_notifier_bus(cfg):
                 ))
                 logger.info("main: Telegram notifier registered")
             except Exception as exc:
-                logger.warning("main: Telegram notifier failed: {}", exc)
+                logger.warning("main: Telegram notifier registration failed: {}", exc)
         if cfg.slack_webhook_url:
             try:
                 from notifications.slack_notifier import SlackNotifier, SlackConfig
@@ -134,14 +167,15 @@ async def _build_notifier_bus(cfg):
                 ))
                 logger.info("main: Slack notifier registered")
             except Exception as exc:
-                logger.warning("main: Slack notifier failed: {}", exc)
+                logger.warning("main: Slack notifier registration failed: {}", exc)
         return bus
     except Exception as exc:
-        logger.warning("main: NotifierBus unavailable: {}", exc)
+        logger.warning("main: NotifierBus unavailable — running without notifications: {}", exc)
         return None
 
 
 async def _build_ws_feed(cfg):
+    """Build BybitWsFeed. Failure is WARNING-logged; runner may fall back to REST polling."""
     try:
         from execution.bybit_ws_feed import BybitWsFeed, BybitWsFeedConfig
         feed_cfg = BybitWsFeedConfig(
@@ -157,7 +191,9 @@ async def _build_ws_feed(cfg):
         )
         return feed
     except Exception as exc:
-        logger.warning("main: BybitWsFeed build failed: {}", exc)
+        logger.warning(
+            "main: BybitWsFeed build failed — runner will use REST fallback: {}", exc
+        )
         return None
 
 
@@ -174,8 +210,8 @@ def _install_signal_handlers(loop, shutdown_event) -> None:
 
 async def main() -> int:
     args = _parse_args()
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("state", exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)    # fix #21: use env-overridable LOG_DIR
+    os.makedirs(STATE_DIR, exist_ok=True)  # fix #21: use env-overridable STATE_DIR
     _configure_logging(args.log_level)
 
     from execution.bybit_live_runner import BybitLiveRunnerConfig
@@ -194,8 +230,8 @@ async def main() -> int:
         cfg.interval = args.interval
 
     logger.info(
-        "QuantLuna starting — {}/{} interval={}m dry_run={}",
-        cfg.symbol_y, cfg.symbol_x, cfg.interval, cfg.dry_run,
+        "QuantLuna starting — {}/{} interval={}m dry_run={} log_dir={} state_dir={}",
+        cfg.symbol_y, cfg.symbol_x, cfg.interval, cfg.dry_run, LOG_DIR, STATE_DIR,
     )
 
     loop = asyncio.get_running_loop()
@@ -213,7 +249,9 @@ async def main() -> int:
         cfg=cfg,
         notifier_bus=notifier_bus,
         ws_feed=ws_feed,
-        skip_health_check=args.skip_health or cfg.dry_run,
+        # fix #18: dry_run alone no longer skips health check.
+        # Only the explicit --skip-health flag bypasses it.
+        skip_health_check=args.skip_health,
     )
 
     ctx = await orch.run_startup_workflow()
@@ -226,18 +264,36 @@ async def main() -> int:
                     f"\u274c QuantLuna HALT: {ctx.halt_reason}",
                     level="error",
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("main: failed to send HALT notification: {}", exc)
         return 1
 
     runner_task = asyncio.create_task(orch.start_runner(ctx))
-    await asyncio.wait(
-        [runner_task, asyncio.create_task(shutdown_event.wait())],
+    shutdown_task = asyncio.create_task(shutdown_event.wait())
+
+    # fix #20: asyncio.wait with hard timeout to prevent infinite hang.
+    # RUNNER_TIMEOUT_SECONDS=0 disables the timeout (infinite — not recommended).
+    timeout = _RUNNER_TIMEOUT if _RUNNER_TIMEOUT > 0 else None
+    done, _ = await asyncio.wait(
+        [runner_task, shutdown_task],
         return_when=asyncio.FIRST_COMPLETED,
+        timeout=timeout,
     )
 
-    if shutdown_event.is_set() and not runner_task.done():
-        logger.info("main: shutdown signal received — cancelling runner")
+    if not done:
+        # Timeout expired — neither runner nor shutdown signal fired.
+        logger.error(
+            "main: runner hard timeout reached ({:.0f}s) — forcing shutdown. "
+            "Check for deadlocks or increase RUNNER_TIMEOUT_SECONDS.",
+            _RUNNER_TIMEOUT,
+        )
+        shutdown_event.set()
+
+    if not shutdown_task.done():
+        shutdown_task.cancel()
+
+    if not runner_task.done():
+        logger.info("main: cancelling runner task...")
         runner_task.cancel()
         try:
             await runner_task
