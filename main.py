@@ -136,7 +136,6 @@ def _validate_config(cfg, mode: str) -> None:
             max_drawdown_pct=cfg.max_drawdown_pct,
         )
 
-        # Merge results
         all_errors   = result.errors   + trading_result.errors
         all_warnings = result.warnings + trading_result.warnings
 
@@ -268,12 +267,11 @@ def _install_signal_handlers(loop, shutdown_event) -> None:
 
 async def main() -> int:
     args = _parse_args()
-    os.makedirs(LOG_DIR, exist_ok=True)    # fix #21: use env-overridable LOG_DIR
-    os.makedirs(STATE_DIR, exist_ok=True)  # fix #21: use env-overridable STATE_DIR
+    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(STATE_DIR, exist_ok=True)
     _configure_logging(args.log_level)
 
     from execution.bybit_live_runner import BybitLiveRunnerConfig
-    # __post_init__ raises ValueError immediately for hard out-of-range values.
     try:
         cfg = BybitLiveRunnerConfig.from_env()
     except ValueError as exc:
@@ -297,8 +295,6 @@ async def main() -> int:
         cfg.symbol_y, cfg.symbol_x, cfg.interval, cfg.dry_run, LOG_DIR, STATE_DIR,
     )
 
-    # Soft validation: env-level checks (API keys, notifications) + advisory warnings.
-    # Hard validation already done by __post_init__ above.
     mode = "live" if not cfg.dry_run else "paper"
     _validate_config(cfg, mode)
 
@@ -312,13 +308,15 @@ async def main() -> int:
     from core.state_bus import bus as state_bus
     _wire_dashboard_engine(cfg, state_bus)
 
+    # Canonical import: execution.workflow_orchestrator is the startup-workflow
+    # orchestrator (5 phases: HealthCheck, PositionScanner, ResumeManager,
+    # AdoptionEngine, ProfitOptimizer -> BybitLiveRunner).
+    # core/workflow_orchestrator.py is a deprecated shim — do NOT import from there.
     from execution.workflow_orchestrator import WorkflowOrchestrator
     orch = WorkflowOrchestrator.from_runner_cfg(
         cfg=cfg,
         notifier_bus=notifier_bus,
         ws_feed=ws_feed,
-        # fix #18: dry_run alone no longer skips health check.
-        # Only the explicit --skip-health flag bypasses it.
         skip_health_check=args.skip_health,
     )
 
@@ -339,8 +337,6 @@ async def main() -> int:
     runner_task = asyncio.create_task(orch.start_runner(ctx))
     shutdown_task = asyncio.create_task(shutdown_event.wait())
 
-    # fix #20: asyncio.wait with hard timeout to prevent infinite hang.
-    # RUNNER_TIMEOUT_SECONDS=0 disables the timeout (infinite — not recommended).
     timeout = _RUNNER_TIMEOUT if _RUNNER_TIMEOUT > 0 else None
     done, _ = await asyncio.wait(
         [runner_task, shutdown_task],
@@ -349,7 +345,6 @@ async def main() -> int:
     )
 
     if not done:
-        # Timeout expired — neither runner nor shutdown signal fired.
         logger.error(
             "main: runner hard timeout reached ({:.0f}s) — forcing shutdown. "
             "Check for deadlocks or increase RUNNER_TIMEOUT_SECONDS.",
