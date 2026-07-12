@@ -77,20 +77,27 @@ _REDUCE_REGISTRY: List[ReduceRecord] = []
 _MAX_REDUCE_HISTORY = 200
 
 
+def _record_reduce(record: ReduceRecord) -> None:
+    """Append record in _REDUCE_REGISTRY si trimite la max 200."""
+    _REDUCE_REGISTRY.append(record)
+    if len(_REDUCE_REGISTRY) > _MAX_REDUCE_HISTORY:
+        del _REDUCE_REGISTRY[:-_MAX_REDUCE_HISTORY]
+
+
 # ---------------------------------------------------------------------------
 # reduce_pair_size() — importabil de MultiMarketOrchestrator.reduce_callback
 # ---------------------------------------------------------------------------
 
 async def reduce_pair_size(pair: str, factor: float = 0.5) -> None:
     """
-    Reduce sizing-ul unei perechi active la `factor` din valoarea curentă.
+    Reduce sizing-ul unei perechi active la `factor` din valoarea curenta.
 
     Apelat de MonitoringWatchdog via reduce_callback(pair, factor) din
     core/multi_market_orchestrator.py._make_reduce_callback().
 
-    Strategie (cascadă):
+    Strategie (cascada):
       1. SizingEngine injectat (_SIZING_STATE["sizing_engine"]) are set_pair_factor()
-      2. MultiPairManager are set_alloc_factor() sau similar
+      2. MultiPairManager are set_alloc_factor()
       3. Fallback: log WARNING — nu crash
 
     Args:
@@ -98,7 +105,7 @@ async def reduce_pair_size(pair: str, factor: float = 0.5) -> None:
         factor: multiplicator sizing (0.5 = 50% din valoarea curenta)
 
     Raises:
-        Nu ridică niciodată — eşuarile sunt logate + înregistrate in ReduceRecord.
+        Nu ridica niciodata — esuarile sunt logate + inregistrate in ReduceRecord.
     """
     ts = datetime.now(timezone.utc).isoformat()
     pair_id = pair.replace("/", "-")
@@ -109,18 +116,15 @@ async def reduce_pair_size(pair: str, factor: float = 0.5) -> None:
     if engine is not None and hasattr(engine, "set_pair_factor"):
         try:
             engine.set_pair_factor(pair_id, factor)
-            record = ReduceRecord(
+            _record_reduce(ReduceRecord(
                 timestamp=ts, pair=pair_id, factor=factor,
                 success=True,
                 detail=f"set_pair_factor({factor:.2f}) via SizingEngine OK",
-            )
+            ))
             logger.info(
                 "[reduce_pair_size] %s -> factor=%.2f via SizingEngine",
                 pair_id, factor,
             )
-            _REDUCE_REGISTRY.append(record)
-            if len(_REDUCE_REGISTRY) > _MAX_REDUCE_HISTORY:
-                del _REDUCE_REGISTRY[:-_MAX_REDUCE_HISTORY]
             return
         except Exception as exc:
             logger.warning(
@@ -134,18 +138,15 @@ async def reduce_pair_size(pair: str, factor: float = 0.5) -> None:
         mgr = get_manager()
         if hasattr(mgr, "set_alloc_factor"):
             mgr.set_alloc_factor(pair_id, factor)
-            record = ReduceRecord(
+            _record_reduce(ReduceRecord(
                 timestamp=ts, pair=pair_id, factor=factor,
                 success=True,
                 detail=f"set_alloc_factor({factor:.2f}) via MultiPairManager OK",
-            )
+            ))
             logger.info(
                 "[reduce_pair_size] %s -> factor=%.2f via MultiPairManager",
                 pair_id, factor,
             )
-            _REDUCE_REGISTRY.append(record)
-            if len(_REDUCE_REGISTRY) > _MAX_REDUCE_HISTORY:
-                del _REDUCE_REGISTRY[:-_MAX_REDUCE_HISTORY]
             return
     except Exception as exc:
         logger.warning(
@@ -160,14 +161,11 @@ async def reduce_pair_size(pair: str, factor: float = 0.5) -> None:
         "sau implementeaza MultiPairManager.set_alloc_factor().",
         pair_id, factor,
     )
-    record = ReduceRecord(
+    _record_reduce(ReduceRecord(
         timestamp=ts, pair=pair_id, factor=factor,
         success=False,
         detail="Niciun engine disponibil (SizingEngine=None, MultiPairManager fara set_alloc_factor)",
-    )
-    _REDUCE_REGISTRY.append(record)
-    if len(_REDUCE_REGISTRY) > _MAX_REDUCE_HISTORY:
-        del _REDUCE_REGISTRY[:-_MAX_REDUCE_HISTORY]
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -298,14 +296,15 @@ def live_status():
         }
     if hasattr(engine, "get_status"):
         return {"enabled": True, "source": "SizingEngine", **engine.get_status()}
-    return {
-        "enabled":        True,
-        "source":         type(engine).__name__,
-        "status":         "engine activ dar fara get_status()",
-        "capital_usdt":   getattr(engine, "_capital",       None),
-        "max_leverage":   getattr(engine, "_max_leverage",  None),
-        "kelly_fraction": getattr(engine, "_kelly_fraction", None),
-    }
+    else:
+        return {
+            "enabled":        True,
+            "source":         type(engine).__name__,
+            "status":         "engine activ dar fara get_status()",
+            "capital_usdt":   getattr(engine, "_capital",       None),
+            "max_leverage":   getattr(engine, "_max_leverage",  None),
+            "kelly_fraction": getattr(engine, "_kelly_fraction", None),
+        }
 
 
 @router.get("/decision_status")
@@ -340,12 +339,15 @@ async def reduce_pair_endpoint(pair_id: str, req: ReducePairRequest = ReducePair
     """
     POST /sizing/reduce/{pair_id}
 
-    Reduce sizing-ul unei perechi la `factor` din valoarea curentă.
+    Reduce sizing-ul unei perechi la `factor` din valoarea curenta.
     Apelat de MonitoringWatchdog (indirect via reduce_pair_size() callable)
     sau manual din dashboard.
 
-    Body JSON (opţional):
+    Body JSON (optional):
         {"factor": 0.5}   — default 0.5 (50%)
+
+    Nota: returneaza 200 chiar si la success=False (fire-and-forget async).
+    Verifica campul `success` + `detail` din raspuns pentru statusul real.
     """
     await reduce_pair_size(pair=pair_id, factor=req.factor)
     last = _REDUCE_REGISTRY[-1] if _REDUCE_REGISTRY else None
@@ -360,11 +362,7 @@ async def reduce_pair_endpoint(pair_id: str, req: ReducePairRequest = ReducePair
 
 @router.get("/reduce/history")
 def reduce_history(limit: int = 50):
-    """
-    GET /sizing/reduce/history
-
-    Returnează ultimele `limit` evenimente REDUCE_SIZE (audit log).
-    """
+    """GET /sizing/reduce/history — ultimele `limit` evenimente REDUCE_SIZE (audit log)."""
     records = _REDUCE_REGISTRY[-limit:]
     return {
         "count":   len(records),
