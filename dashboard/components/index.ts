@@ -21,4 +21,11 @@ export { ToastContainer, useToast }   from './Toast';
 export { Card, Badge, Spinner, Kbd }  from './ui';
 
 /* Modals */
-export { ConfirmModal, SettingsModal, ShortcutsModal } from './modals';
+export {
+  ConfirmModal,
+  SettingsModal,
+  ShortcutsModal,
+  CircuitBreakerModal,
+  OrderManagerModal,
+  ModalsHost,
+} from './modals';

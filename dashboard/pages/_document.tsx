@@ -2,6 +2,7 @@
  * pages/_document.tsx
  * Custom Document: font preload, meta tags, dark background pe <html>.
  * Ruleaza server-side only — nu are acces la hooks/state.
+ * charSet este injectat automat de Next.js — nu il duplicam.
  */
 import { Html, Head, Main, NextScript } from 'next/document';
 
@@ -9,8 +10,6 @@ export default function Document() {
   return (
     <Html lang="ro" className="dark">
       <Head>
-        {/* Charset + Viewport sunt gestionate automat de Next.js */}
-        <meta charSet="utf-8" />
         <meta name="theme-color" content="#0a0a14" />
         <meta name="description" content="QuantLuna — Crypto Stat-Arb Trading Dashboard" />
         <meta name="robots" content="noindex,nofollow" />
@@ -29,10 +28,8 @@ export default function Document() {
           rel="stylesheet"
         />
 
-        {/* Prevent FOUC: bg-ul initial = bg-body */}
-        <style dangerouslySetInnerHTML={{ __html: `
-          html, body { background: #0a0a14; }
-        ` }} />
+        {/* Prevent FOUC */}
+        <style dangerouslySetInnerHTML={{ __html: `html,body{background:#0a0a14}` }} />
       </Head>
       <body>
         <Main />
