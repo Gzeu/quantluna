@@ -1,6 +1,6 @@
 """
 QuantLuna — FastAPI Application Entry Point
-Sprint S46 (2026-07-12)  — versiune 0.31.0
+Sprint S46 (2026-07-12)  — versiune 0.32.0
 
 Ruleaza cu:
     uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
@@ -16,6 +16,7 @@ Endpoints expuse:
   /sizing/*            — Position Sizer: Kelly + Fixed, leverage-aware Bybit
   /sizing/live_status  — SizingEngine v2.5 live status
   /sizing/decision_status — DecisionEngine v2.5 (alias compat)
+  /sizing/reduce/*     — Watchdog reduce hooks (S33)
   /notifications/*     — AlertDispatcher status + test send
   /health              — uptime, version, system status
   /api/services/*      — Services Control Panel: start/stop/restart + WebSocket live
@@ -34,7 +35,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-# ─ Routers existenti ────────────────────────────────────────────────────────────────────
+# ─ Routers existenti ────────────────────────────────────────────────────────────────────────────────────
 from api.backtest      import router as backtest_router
 from api.data          import router as data_router
 from api.health        import router as health_router
@@ -47,15 +48,15 @@ from api.risk          import router as risk_router
 from api.sizing        import router as sizing_router, set_sizing_state
 from api.strategy      import router as strategy_router
 
-# ─ Routers noi S41–S44 ──────────────────────────────────────────────────────────────────
+# ─ Routers noi S41–S44 ───────────────────────────────────────────────────────────────────────────
 from api.services  import services_router
 from api.optimizer import optimizer_router, set_optimizer_state
 from api.watchdog  import watchdog_router, set_watchdog_state
 
-# ─ Router nou S46 ───────────────────────────────────────────────────────────────────────
+# ─ Router nou S46 ────────────────────────────────────────────────────────────────────────────────────
 from api.decision  import decision_router, set_decision_state
 
-# ─ Orchestrator ───────────────────────────────────────────────────────────────────────────────
+# ─ Orchestrator ───────────────────────────────────────────────────────────────────────────────────────────────
 from notifications.alert_dispatcher import AlertDispatcher
 from core.workflow_orchestrator import WorkflowOrchestrator
 
@@ -65,7 +66,7 @@ _START_TIME = time.time()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("QuantLuna API v0.31.0 starting up...")
+    logger.info("QuantLuna API v0.32.0 starting up...")
 
     # 1. AlertDispatcher
     dispatcher = AlertDispatcher()
@@ -89,11 +90,53 @@ async def lifespan(app: FastAPI):
         "dispatcher": dispatcher,
     })
 
-    # 4. S46: Injecteaza sizing_engine / decision_engine din context
-    #    getattr cu None default — graceful daca engineul nu exista pe ctx
+    # 4. S34: construieste SizingEngine si injecteaza via set_sizing_state()
+    #    Prioritate: ctx.sizing_engine (deja construit de orchestrator)
+    #               -> wrap in SizingEngine daca nu e deja
+    #               -> construieste SizingEngine standalone din env vars
+    from risk.bybit_position_sizer import BybitPositionSizer
+    from risk.sizing_engine import SizingEngine
+
     ctx = orchestrator.context
+    raw_engine = getattr(ctx, "sizing_engine", None)
+
+    if isinstance(raw_engine, SizingEngine):
+        # Orchestratorul a construit deja un SizingEngine — folosim direct
+        sizing_engine = raw_engine
+        logger.info("[lifespan] SizingEngine preluat din orchestrator context")
+    elif raw_engine is not None:
+        # Orchestratorul a construit un BybitPositionSizer sau alt engine
+        # Wrap in SizingEngine pentru set_pair_factor() support
+        try:
+            sizing_engine = SizingEngine(sizer=raw_engine)
+            logger.info(
+                "[lifespan] SizingEngine wrapat in jurul %s din orchestrator context",
+                type(raw_engine).__name__,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[lifespan] Nu am putut wrapa raw_engine (%s) in SizingEngine: %s — "
+                "construiesc standalone din env",
+                type(raw_engine).__name__, exc,
+            )
+            sizing_engine = SizingEngine(sizer=BybitPositionSizer(
+                capital_usdt=float(os.getenv("INITIAL_CAPITAL_USD", "10000")),
+                max_leverage=float(os.getenv("MAX_LEVERAGE", "3.0")),
+                kelly_fraction=os.getenv("KELLY_FRACTION", "half"),
+                max_position_pct=float(os.getenv("MAX_POSITION_PCT", "0.25")),
+            ))
+    else:
+        # ctx nu are sizing_engine — construieste standalone
+        sizing_engine = SizingEngine(sizer=BybitPositionSizer(
+            capital_usdt=float(os.getenv("INITIAL_CAPITAL_USD", "10000")),
+            max_leverage=float(os.getenv("MAX_LEVERAGE", "3.0")),
+            kelly_fraction=os.getenv("KELLY_FRACTION", "half"),
+            max_position_pct=float(os.getenv("MAX_POSITION_PCT", "0.25")),
+        ))
+        logger.info("[lifespan] SizingEngine construit standalone din env vars")
+
     set_sizing_state({
-        "sizing_engine":   getattr(ctx, "sizing_engine",   None),
+        "sizing_engine":   sizing_engine,
         "decision_engine": getattr(ctx, "decision_engine", None),
     })
     set_decision_state({
@@ -104,7 +147,7 @@ async def lifespan(app: FastAPI):
     from notifications.event_types import AlertEvent, EventType
     await dispatcher.emit(AlertEvent(
         event_type=EventType.SYSTEM_START,
-        payload={"version": "0.31.0", "exchange": os.getenv("EXCHANGE", "bybit")},
+        payload={"version": "0.32.0", "exchange": os.getenv("EXCHANGE", "bybit")},
     ))
 
     # 6. Porneste runner + reoptimizer + watchdog in background
@@ -125,7 +168,7 @@ async def lifespan(app: FastAPI):
         pass
     await orchestrator.stop_runner()
     await dispatcher.stop()
-    logger.info("QuantLuna API v0.31.0 shutdown complete.")
+    logger.info("QuantLuna API v0.32.0 shutdown complete.")
 
 
 app = FastAPI(
@@ -149,7 +192,7 @@ QuantLuna — Crypto Pairs Trading Engine (Bybit + Binance)
 - **Decision** — DecisionEngine v2.5: status live pentru dashboard unificat
 - **Health** — uptime, version
     """,
-    version="0.31.0",
+    version="0.32.0",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
@@ -163,7 +206,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─ Routers existenti ────────────────────────────────────────────────────────────────────
+# ─ Routers existenti ────────────────────────────────────────────────────────────────────────────────────
 app.include_router(backtest_router)
 app.include_router(strategy_router)
 app.include_router(live_router)
@@ -175,12 +218,12 @@ app.include_router(sizing_router)
 app.include_router(notifications_router)
 app.include_router(health_router)
 
-# ─ Routers noi S41–S44 (prefix /api/*) ───────────────────────────────────────────────────
+# ─ Routers noi S41–S44 (prefix /api/*) ──────────────────────────────────────────────────────────
 app.include_router(services_router,  prefix="/api/services",  tags=["services"])
 app.include_router(optimizer_router, prefix="/api/optimizer", tags=["optimizer"])
 app.include_router(watchdog_router,  prefix="/api/watchdog",  tags=["watchdog"])
 
-# ─ Router nou S46 (prefix /api/decision) ──────────────────────────────────────────────
+# ─ Router nou S46 (prefix /api/decision) ───────────────────────────────────────────────────────
 app.include_router(decision_router,  prefix="/api/decision",  tags=["decision"])
 
 
@@ -188,7 +231,7 @@ app.include_router(decision_router,  prefix="/api/decision",  tags=["decision"])
 def root():
     return {
         "name":    "QuantLuna API",
-        "version": "0.31.0",
+        "version": "0.32.0",
         "uptime_seconds": round(time.time() - _START_TIME, 1),
         "exchange":       os.getenv("EXCHANGE", "bybit"),
         "mode":           os.getenv("EXCHANGE_MODE", "paper"),

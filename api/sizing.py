@@ -1,6 +1,6 @@
 """
 QuantLuna — Sizing API
-Sprint S46 (base) | Sprint 33 (watchdog action hooks)
+Sprint S46 (base) | Sprint 33 (watchdog hooks) | Sprint 34 (SizingEngine)
 
 Endpoints:
   POST /sizing/calculate            — calcul complet position size
@@ -96,7 +96,7 @@ async def reduce_pair_size(pair: str, factor: float = 0.5) -> None:
     core/multi_market_orchestrator.py._make_reduce_callback().
 
     Strategie (cascada):
-      1. SizingEngine injectat (_SIZING_STATE["sizing_engine"]) are set_pair_factor()
+      1. SizingEngine injectat (_SIZING_STATE["sizing_engine"]) are set_pair_factor()  <- S34
       2. MultiPairManager are set_alloc_factor()
       3. Fallback: log WARNING — nu crash
 
@@ -111,7 +111,7 @@ async def reduce_pair_size(pair: str, factor: float = 0.5) -> None:
     pair_id = pair.replace("/", "-")
     factor  = max(0.0, min(1.0, factor))  # clamp [0, 1]
 
-    # --- Cale 1: SizingEngine injectat are set_pair_factor() ---
+    # --- Cale 1: SizingEngine injectat (S34) are set_pair_factor() ---
     engine = _SIZING_STATE.get("sizing_engine")
     if engine is not None and hasattr(engine, "set_pair_factor"):
         try:
@@ -119,7 +119,7 @@ async def reduce_pair_size(pair: str, factor: float = 0.5) -> None:
             _record_reduce(ReduceRecord(
                 timestamp=ts, pair=pair_id, factor=factor,
                 success=True,
-                detail=f"set_pair_factor({factor:.2f}) via SizingEngine OK",
+                detail=f"set_pair_factor({factor:.2f}) via SizingEngine (S34) OK",
             ))
             logger.info(
                 "[reduce_pair_size] %s -> factor=%.2f via SizingEngine",
