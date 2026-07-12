@@ -1,9 +1,10 @@
 /**
- * pages/watchdog.tsx — S37 UI/UX
- * NavBar din layout, StatsBar, MetricsBadge + WatchdogPanel full-page
+ * pages/watchdog.tsx
+ * Watchdog page — NavBar + StatsBar + MetricsBadge + WatchdogPanel.
  */
 import type { NextPage } from 'next';
-import Head from 'next/head';
+import Head              from 'next/head';
+import NavBar            from '../components/NavBar';
 import { StatsBar }      from '../components/StatsBar';
 import { MetricsBadge }  from '../components/MetricsBadge';
 import { WatchdogPanel } from '../components/WatchdogPanel';
@@ -11,16 +12,20 @@ import { WatchdogPanel } from '../components/WatchdogPanel';
 const WatchdogPage: NextPage = () => (
   <>
     <Head><title>Watchdog — QuantLuna</title></Head>
+    <NavBar />
     <StatsBar />
     <main
       className="animate-fade-in"
       style={{
-        background: 'var(--bg-base)',
+        background: 'var(--bg-body)',
         minHeight: 'calc(100vh - var(--nav-h) - var(--stats-h))',
         padding: '16px 20px 40px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 16,
       }}
     >
-      <section className="mb-4"><MetricsBadge /></section>
+      <MetricsBadge />
       <WatchdogPanel fullPage />
     </main>
   </>

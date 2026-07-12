@@ -1,71 +1,53 @@
 /**
- * pages/services.tsx — S37 continue
- * Pagina dedicata serviciilor. Previne 404 la G+S shortcut.
- * Afiseaza ServiceList (daca exista) sau placeholder elegant.
+ * pages/services.tsx
+ * Services page — NavBar + StatsBar + tabel servicii via useServices hook.
  */
-import type { NextPage }  from 'next';
-import Head               from 'next/head';
-import { StatsBar }       from '../components/StatsBar';
-import { MetricsBadge }   from '../components/MetricsBadge';
-import { useRiskMetrics } from '../hooks/useRiskMetrics';
-import { useState, useEffect } from 'react';
-import { Card }           from '../components/ui/Card';
-import { Badge }          from '../components/ui/Badge';
-import { Spinner }        from '../components/ui/Spinner';
-
-function RiskMetricsLoader() { useRiskMetrics(); return null; }
+import type { NextPage } from 'next';
+import Head              from 'next/head';
+import NavBar            from '../components/NavBar';
+import { StatsBar }      from '../components/StatsBar';
+import { MetricsBadge }  from '../components/MetricsBadge';
+import { Card }          from '../components/ui/Card';
+import { Badge }         from '../components/ui/Badge';
+import { Spinner }       from '../components/ui/Spinner';
+import { useServices, ServiceInfo } from '../hooks/useServices';
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 
-interface Service {
-  name: string;
-  status: 'running' | 'stopped' | 'error';
-  pid?: number;
-  uptime?: string;
-  cpu?: number;
-  mem?: number;
+function StatusPill({ status }: { status: ServiceInfo['status'] }) {
+  const map = {
+    running: 'ql-pill-green',
+    stopped: 'ql-pill-gray',
+    unknown: 'ql-pill-yellow',
+  };
+  return (
+    <span className={`ql-pill ${map[status] ?? 'ql-pill-gray'}`}>
+      <span className="w-1.5 h-1.5 rounded-full bg-current" />
+      {status}
+    </span>
+  );
 }
 
-function ServiceRow({ svc }: { svc: Service }) {
-  const color = svc.status === 'running' ? 'green' : svc.status === 'error' ? 'red' : 'gray';
+function ServiceRow({ svc }: { svc: ServiceInfo }) {
   return (
     <tr className="border-b border-[var(--border)] hover:bg-[var(--bg-elevated)] transition-colors">
       <td className="py-3 pr-4 font-mono text-[var(--text-primary)] text-sm">{svc.name}</td>
-      <td className="py-3 pr-4">
-        <Badge variant={color as any} dot pulse={svc.status === 'running'}>
-          {svc.status}
-        </Badge>
-      </td>
+      <td className="py-3 pr-4"><StatusPill status={svc.status} /></td>
       <td className="py-3 pr-4 text-[var(--text-muted)] text-xs tabular">{svc.pid ?? '—'}</td>
       <td className="py-3 pr-4 text-[var(--text-muted)] text-xs tabular">{svc.uptime ?? '—'}</td>
       <td className="py-3 pr-4 text-right text-[var(--text-secondary)] text-xs tabular">
         {svc.cpu !== undefined ? `${svc.cpu.toFixed(1)}%` : '—'}
       </td>
       <td className="py-3 text-right text-[var(--text-secondary)] text-xs tabular">
-        {svc.mem !== undefined ? `${svc.mem.toFixed(0)}MB` : '—'}
+        {svc.mem !== undefined ? `${svc.mem.toFixed(0)} MB` : '—'}
       </td>
     </tr>
   );
 }
 
 function ServiceList() {
-  const [services, setServices] = useState<Service[]>([]);
-  const [loading,  setLoading]  = useState(true);
-  const [error,    setError]    = useState<string | null>(null);
-
-  useEffect(() => {
-    const load = () =>
-      fetch(`${API}/api/services/list`)
-        .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
-        .then((d: { services: Service[] }) => { setServices(d.services ?? []); setError(null); })
-        .catch(e => setError(e.message))
-        .finally(() => setLoading(false));
-    load();
-    const id = setInterval(load, 5_000);
-    return () => clearInterval(id);
-  }, []);
-
-  const running = services.filter(s => s.status === 'running').length;
+  const { data, loading, error } = useServices(5_000);
+  const { services, running, total } = data;
 
   return (
     <Card>
@@ -75,7 +57,7 @@ function ServiceList() {
           {!loading && (
             <span className="text-[10px] bg-[var(--bg-elevated)] text-[var(--text-muted)]
                              rounded-full px-2 py-0.5 border border-[var(--border)]">
-              {running}/{services.length} running
+              {running}/{total} running
             </span>
           )}
           {loading && <Spinner size="sm" />}
@@ -109,10 +91,12 @@ function ServiceList() {
           <table className="ql-table w-full">
             <thead style={{ position: 'sticky', top: 0, background: 'var(--bg-card)' }}>
               <tr>
-                {['Service','Status','PID','Uptime','CPU','MEM'].map(h => (
-                  <th key={h} className={`py-2 ${h === 'CPU' || h === 'MEM' ? 'text-right' : 'text-left'}
-                                         pr-4 text-[9px] uppercase tracking-wider
-                                         text-[var(--text-muted)]`}>{h}</th>
+                {['Service', 'Status', 'PID', 'Uptime', 'CPU', 'MEM'].map(h => (
+                  <th key={h} className={`py-2 ${
+                    h === 'CPU' || h === 'MEM' ? 'text-right' : 'text-left'
+                  } pr-4 text-[9px] uppercase tracking-wider text-[var(--text-muted)]`}>
+                    {h}
+                  </th>
                 ))}
               </tr>
             </thead>
@@ -129,17 +113,20 @@ function ServiceList() {
 const ServicesPage: NextPage = () => (
   <>
     <Head><title>Services — QuantLuna</title></Head>
-    <RiskMetricsLoader />
+    <NavBar />
     <StatsBar />
     <main
       className="animate-fade-in"
       style={{
-        background: 'var(--bg-base)',
+        background: 'var(--bg-body)',
         minHeight: 'calc(100vh - var(--nav-h) - var(--stats-h))',
         padding: '16px 20px 40px',
         display: 'flex',
         flexDirection: 'column',
         gap: 16,
+        maxWidth: 1400,
+        margin: '0 auto',
+        width: '100%',
       }}
     >
       <MetricsBadge />

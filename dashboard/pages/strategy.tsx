@@ -1,9 +1,10 @@
 /**
- * pages/strategy.tsx — S37 UI/UX
- * NavBar din layout, StatsBar, MetricsBadge + StrategyScores full-page
+ * pages/strategy.tsx
+ * Strategy page — NavBar + StatsBar + MetricsBadge + StrategyScores.
  */
 import type { NextPage } from 'next';
-import Head from 'next/head';
+import Head              from 'next/head';
+import NavBar            from '../components/NavBar';
 import { StatsBar }       from '../components/StatsBar';
 import { MetricsBadge }   from '../components/MetricsBadge';
 import { StrategyScores } from '../components/StrategyScores';
@@ -11,16 +12,20 @@ import { StrategyScores } from '../components/StrategyScores';
 const StrategyPage: NextPage = () => (
   <>
     <Head><title>Strategy — QuantLuna</title></Head>
+    <NavBar />
     <StatsBar />
     <main
       className="animate-fade-in"
       style={{
-        background: 'var(--bg-base)',
+        background: 'var(--bg-body)',
         minHeight: 'calc(100vh - var(--nav-h) - var(--stats-h))',
         padding: '16px 20px 40px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 16,
       }}
     >
-      <section className="mb-4"><MetricsBadge /></section>
+      <MetricsBadge />
       <StrategyScores fullPage />
     </main>
   </>
