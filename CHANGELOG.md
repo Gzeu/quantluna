@@ -5,6 +5,28 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased] — S45 production cleanup
+
+### Fixed
+- **#19 — WorkflowOrchestrator canonical location** (PR #28)
+  - `execution/workflow_orchestrator.py` = canonic (startup workflow 5 faze)
+  - `core/workflow_orchestrator.py` rescris ca shim cu `DeprecationWarning`
+  - `main.py` import explicit din `execution/` cu comentariu arhitectural
+- **#23 — Config validation robusta** (PR #27)
+  - `BybitLiveRunnerConfig.__post_init__` valideaza entry/exit z-score, warmup_bars,
+    base_qty, max_drawdown_pct, cooldown_seconds la instantiere
+  - `main.py` apeleaza `ConfigValidator` + `validate_trading_params()` si face
+    sys.exit(1) la erori in live mode
+  - `LOG_DIR` / `STATE_DIR` overridabile via env (Docker volumes)
+  - `RUNNER_TIMEOUT_SECONDS` hard timeout configurabil
+
+### Added
+- **core/multi_market_orchestrator.py** — stub `MultiMarketOrchestrator`
+  (extragere v2.2 din fostul `core/workflow_orchestrator.py`);
+  implementare completa in Sprint 32
+
+---
+
 ## [0.30.0] — 2026-07-12  (Sprint S44–S45)
 
 ### Added
