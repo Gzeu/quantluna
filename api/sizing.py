@@ -1,18 +1,20 @@
 """
 QuantLuna — Sizing API
-Sprint 28
+Sprint S46 (2026-07-12): live_status + decision_status pentru dashboard unificat
 
 Endpoints:
   POST /sizing/calculate          — calcul complet position size
   POST /sizing/kelly              — calcul Kelly fraction doar
   GET  /sizing/instrument/{sym}   — instrument info (qtyStep, minNotional)
   GET  /sizing/sizer_config       — configuratia curenta a sizer-ului
+  GET  /sizing/live_status        — status live SizingEngine v2.5
+  GET  /sizing/decision_status    — status live DecisionEngine v2.5 (alias compat)
 """
 from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from typing import Optional, Any, Dict
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -22,6 +24,23 @@ from risk.bybit_position_sizer import BybitPositionSizer, SizingParams
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sizing", tags=["sizing"])
 
+# ---------------------------------------------------------------------------
+# Stare injectabila — populata din api/main.py la lifespan startup
+# ---------------------------------------------------------------------------
+_SIZING_STATE: Dict[str, Any] = {
+    "sizing_engine": None,
+    "decision_engine": None,
+}
+
+
+def set_sizing_state(state: Dict[str, Any]) -> None:
+    """Injectat din api/main.py la lifespan startup."""
+    _SIZING_STATE.update(state or {})
+
+
+# ---------------------------------------------------------------------------
+# Helper intern
+# ---------------------------------------------------------------------------
 
 def _get_sizer() -> BybitPositionSizer:
     return BybitPositionSizer(
@@ -61,10 +80,6 @@ def sizing_calculate(req: SizingRequest):
     """
     POST /sizing/calculate
     Calculeaza marimea pozitiei (Kelly sau Fixed) pentru Bybit linear.
-
-    Exemplu:
-    {"symbol":"BTCUSDT","entry_price":65000,"win_rate":0.55,
-     "avg_win_usd":120,"avg_loss_usd":80,"leverage":2,"method":"kelly"}
     """
     sizer  = _get_sizer()
     params = SizingParams(
@@ -116,7 +131,6 @@ def instrument_info(symbol: str):
     """
     mode = os.getenv("EXCHANGE_MODE", "paper")
     if mode != "live":
-        # Default values pentru paper/dry
         defaults = {
             "BTCUSDT":  {"qty_step": 0.001, "min_notional": 5.0, "tick_size": 0.1},
             "ETHUSDT":  {"qty_step": 0.01,  "min_notional": 5.0, "tick_size": 0.05},
@@ -127,7 +141,6 @@ def instrument_info(symbol: str):
         }
         info = defaults.get(symbol.upper(), {"qty_step": 0.001, "min_notional": 5.0, "tick_size": 0.1})
         return {"symbol": symbol.upper(), "source": "default", **info}
-    # Live: fetch from Bybit API
     try:
         from execution.bybit_order_router import BybitOrderRouter
         import asyncio
@@ -149,4 +162,66 @@ def sizer_config():
         "kelly_fraction":  os.getenv("KELLY_FRACTION", "half"),
         "max_position_pct": float(os.getenv("MAX_POSITION_PCT", "0.25")),
         "category":        os.getenv("BYBIT_CATEGORY", "linear"),
+    }
+
+
+@router.get("/live_status")
+def live_status():
+    """
+    GET /sizing/live_status
+    Status live SizingEngine v2.5: streak, drawdown, kelly cap, ultimul multiplier.
+    Returneaza enabled=False daca engineul nu a fost injectat inca.
+    """
+    engine = _SIZING_STATE.get("sizing_engine")
+    if engine is None:
+        return {
+            "enabled": False,
+            "source":  "none",
+            "status":  "SizingEngine indisponibil — bot-ul nu a injectat engine-ul inca",
+        }
+
+    if hasattr(engine, "get_status"):
+        return {
+            "enabled": True,
+            "source":  "SizingEngine",
+            **engine.get_status(),
+        }
+
+    # Engine exista dar nu are get_status() — expunem ce putem
+    return {
+        "enabled": True,
+        "source":  type(engine).__name__,
+        "status":  "engine activ dar fara get_status()",
+        "capital_usdt":    getattr(engine, "_capital", None),
+        "max_leverage":    getattr(engine, "_max_leverage", None),
+        "kelly_fraction":  getattr(engine, "_kelly_fraction", None),
+    }
+
+
+@router.get("/decision_status")
+def decision_status():
+    """
+    GET /sizing/decision_status
+    Alias compatibil — status live DecisionEngine v2.5.
+    Dashboard-ul nou trebuie sa foloseasca /api/decision/status.
+    Acest endpoint ramane pentru compatibilitate si debugging.
+    """
+    engine = _SIZING_STATE.get("decision_engine")
+    if engine is None:
+        return {
+            "enabled": False,
+            "status":  "DecisionEngine indisponibil — bot-ul nu a injectat engine-ul inca",
+        }
+
+    return {
+        "enabled":             True,
+        "entry_zscore":        getattr(engine, "_entry_z",       None),
+        "exit_zscore":         getattr(engine, "_exit_z",        None),
+        "partial_exit_zscore": getattr(engine, "_partial_z",     None),
+        "scale_in_zscore":     getattr(engine, "_scale_z",       None),
+        "base_qty_y":          getattr(engine, "_base_qty_y",    None),
+        "base_qty_x":          getattr(engine, "_base_qty_x",    None),
+        "current_streak":      getattr(engine, "_current_streak", 0),
+        "current_drawdown":    getattr(engine, "_current_dd",    0.0),
+        "in_position":         getattr(engine, "_in_position",   False),
     }
