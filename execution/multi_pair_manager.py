@@ -1,15 +1,16 @@
 """
 QuantLuna — MultiPairManager
-Sprint 27
+Sprint 27 (base) | Sprint 33 (set_alloc_factor watchdog hook)
 
-Rulează simultan N perechi de tranzacționare cu:
+Ruleză simultan N perechi de tranzacționare cu:
   - Alocare capital per pereche (fixed USD | equal split | kelly-weighted)
-  - Correlation filter — skip noua pereche dacă corr > threshold cu o pereche activă
+  - Correlation filter — skip nouă pereche dacă corr > threshold cu o pereche activă
   - Monitorizare sănătate per pereche (state, PnL, uptime)
   - Start/stop individual per pereche
   - Global HALT cascade (stopă toate instantaneu)
   - NotifierBus integrare (entry, exit, stop-loss, halt per pereche)
   - RiskDashboardEngine — metrici agregate live
+  - set_alloc_factor(pair, factor) — reduce/restore sizing per pereche (S33)
 
 Usage:
     from execution.multi_pair_manager import MultiPairManager, PairConfig
@@ -40,6 +41,9 @@ Usage:
     await manager.stop_pair("BTCUSDT-ETHUSDT")
     # HALT everything
     await manager.halt_all(reason="MANUAL")
+    # Reduce sizing (watchdog REDUCE_SIZE)
+    manager.set_alloc_factor("BTCUSDT-ETHUSDT", 0.5)   # -> 50% din alloc original
+    manager.restore_alloc("BTCUSDT-ETHUSDT")            # -> restaureaza alloc original
 """
 from __future__ import annotations
 
@@ -108,7 +112,7 @@ class PairStatus:
 
 class MultiPairManager:
     """
-    Orchestrește N perechi simultan via asyncio tasks.
+    Orchestrează N perechi simultan via asyncio tasks.
     Fiecare pereche rulează în propriul task izolat.
     Eroarea unei perechi nu afectează celelalte.
     """
@@ -130,6 +134,8 @@ class MultiPairManager:
         self._exchange             = exchange or __import__("os").getenv("EXCHANGE", "bybit")
         self._pairs:               Dict[str, PairStatus] = {}
         self._halted:              bool = False
+        # Sprint 33: memorie alloc originale inainte de set_alloc_factor()
+        self._original_alloc:      Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Pair management
@@ -154,6 +160,7 @@ class MultiPairManager:
         if ps and ps.state in (PairState.RUNNING,):
             raise RuntimeError(f"Pair {pair_id} is running. Stop it first.")
         self._pairs.pop(pair_id, None)
+        self._original_alloc.pop(pair_id, None)
 
     async def start_pair(self, pair_id: str) -> None:
         """Start a single pair."""
@@ -222,18 +229,127 @@ class MultiPairManager:
         logger.info("MultiPairManager: halted flag cleared")
 
     # ------------------------------------------------------------------
+    # Sprint 33 — Sizing control (watchdog REDUCE_SIZE hook)
+    # ------------------------------------------------------------------
+
+    def set_alloc_factor(self, pair_id: str, factor: float) -> None:
+        """
+        Reduce (sau restaurează) alloc_usd al unei perechi la `factor` din
+        valoarea originală (pre-reduce).
+
+        Apelat de api/sizing.reduce_pair_size() — cale 2 (MultiPairManager
+        fallback dacă SizingEngine nu e injectat).
+
+        Args:
+            pair_id: ID pereche (ex: "BTCUSDT-ETHUSDT")
+            factor:  multiplicator [0.0, 1.0]
+                       0.5  = 50% din alloc original
+                       1.0  = restaurează la original (echivalent restore_alloc)
+                       0.0  = zero sizing (WARNING emis, nu blocat)
+
+        Comportament:
+            - La prima apelare salvează alloc_usd curent in _original_alloc[pair_id]
+            - Actualizează config.alloc_usd = original * factor
+            - Dacă pereche RUNNING: actualizează RiskDashboardEngine.update_exposure()
+            - Dacă pair_id necunoscut: KeyError (locat, nu ridicat)
+
+        Raises:
+            Nu ridică niciodată — failsafe.
+        """
+        factor = max(0.0, min(1.0, factor))  # clamp [0, 1]
+        ps = self._pairs.get(pair_id)
+        if ps is None:
+            logger.warning(
+                "[MPM.set_alloc_factor] pair_id '%s' necunoscut — ignorat",
+                pair_id,
+            )
+            return
+
+        # Salvează alloc original la prima reducere
+        if pair_id not in self._original_alloc:
+            self._original_alloc[pair_id] = ps.config.alloc_usd
+
+        original = self._original_alloc[pair_id]
+        new_alloc = round(original * factor, 4)
+
+        if factor == 0.0:
+            logger.warning(
+                "[MPM.set_alloc_factor] %s: factor=0.0 — sizing zeroed "
+                "(pereche nu va mai deschide pozitii noi pana la restore_alloc)",
+                pair_id,
+            )
+
+        ps.config.alloc_usd = new_alloc
+        logger.info(
+            "[MPM.set_alloc_factor] %s: alloc %.2f -> %.2f USD (factor=%.2f, original=%.2f)",
+            pair_id, original, new_alloc, factor, original,
+        )
+
+        # Actualizează RiskDashboardEngine dacă e injectat
+        if self._risk_engine is not None:
+            try:
+                self._risk_engine.update_exposure(pair_id, new_alloc)
+            except Exception as exc:
+                logger.warning(
+                    "[MPM.set_alloc_factor] risk_engine.update_exposure failed: %s", exc
+                )
+
+    def get_alloc_factor(self, pair_id: str) -> Optional[float]:
+        """
+        Returnează factorul curent aplicat perechii.
+
+        Returns:
+            float in [0, 1] dacă a fost apelat set_alloc_factor() anterior,
+            1.0 dacă nu a fost modificat (alloc = alloc original),
+            None dacă pair_id necunoscut.
+        """
+        ps = self._pairs.get(pair_id)
+        if ps is None:
+            return None
+        original = self._original_alloc.get(pair_id, ps.config.alloc_usd)
+        if original == 0:
+            return 1.0
+        return round(ps.config.alloc_usd / original, 6)
+
+    def restore_alloc(self, pair_id: str) -> None:
+        """
+        Restaurează alloc_usd la valoarea originală (pre-reduce).
+
+        No-op dacă set_alloc_factor() nu a fost apelat anterior
+        sau dacă pair_id e necunoscut.
+        """
+        ps = self._pairs.get(pair_id)
+        if ps is None:
+            return
+        original = self._original_alloc.pop(pair_id, None)
+        if original is None:
+            return  # nicio reducere anterioara
+        ps.config.alloc_usd = original
+        logger.info(
+            "[MPM.restore_alloc] %s: alloc restaurat la %.2f USD",
+            pair_id, original,
+        )
+        if self._risk_engine is not None:
+            try:
+                self._risk_engine.update_exposure(pair_id, original)
+            except Exception as exc:
+                logger.warning(
+                    "[MPM.restore_alloc] risk_engine.update_exposure failed: %s", exc
+                )
+
+    # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
 
     def status(self) -> dict:
         """Return status for all pairs."""
         return {
-            "halted":      self._halted,
-            "n_pairs":     len(self._pairs),
-            "n_running":   sum(1 for ps in self._pairs.values() if ps.state == PairState.RUNNING),
+            "halted":            self._halted,
+            "n_pairs":           len(self._pairs),
+            "n_running":         sum(1 for ps in self._pairs.values() if ps.state == PairState.RUNNING),
             "total_capital_usd": self.total_capital_usd,
-            "exchange":    self._exchange,
-            "pairs":       {pid: ps.to_dict() for pid, ps in self._pairs.items()},
+            "exchange":          self._exchange,
+            "pairs":             {pid: ps.to_dict() for pid, ps in self._pairs.items()},
         }
 
     # ------------------------------------------------------------------
@@ -247,8 +363,8 @@ class MultiPairManager:
         Aici: skeleton cu tick artificial pentru integrare fără WS real.
         LiveTrader real este injectat via PairConfig.extra_kwargs["trader"].
         """
-        pid     = ps.config.pair_id
-        trader  = ps.config.extra_kwargs.get("trader")  # LiveTrader instance optional
+        pid    = ps.config.pair_id
+        trader = ps.config.extra_kwargs.get("trader")  # LiveTrader instance optional
 
         logger.info(f"[{pid}] pair loop started (alloc={ps.config.alloc_usd:.0f} USD)")
 
@@ -263,9 +379,14 @@ class MultiPairManager:
                 if self._risk_engine:
                     pair_snap = self._risk_engine.pair_snapshot(pid)
                     if pair_snap:
-                        dd = abs(pair_snap.get("net_pnl_usd", 0)) / ps.config.alloc_usd
+                        # Foloseste alloc_usd curent (poate fi redus de set_alloc_factor)
+                        alloc = ps.config.alloc_usd or self._auto_alloc()
+                        dd = abs(pair_snap.get("net_pnl_usd", 0)) / alloc if alloc > 0 else 0.0
                         if dd > ps.config.max_drawdown:
-                            logger.warning(f"[{pid}] per-pair DD {dd:.2%} > {ps.config.max_drawdown:.2%} — stopping")
+                            logger.warning(
+                                f"[{pid}] per-pair DD {dd:.2%} > "
+                                f"{ps.config.max_drawdown:.2%} — stopping"
+                            )
                             if self._bus:
                                 asyncio.create_task(self._bus.stop_loss(
                                     pair=pid,
