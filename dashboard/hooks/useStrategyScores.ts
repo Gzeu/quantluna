@@ -1,58 +1,59 @@
 /**
- * QuantLuna — useStrategyScores
- * Sprint 24
- *
- * React hook: polls GET /strategy/scores every `interval` ms.
- * Returns { data, error, loading }.
- *
- * Usage:
- *   const { data, error, loading } = useStrategyScores("live", 5000);
+ * useStrategyScores.ts — S37
+ * Hook polling /api/optimizer/results (interval 10s)
+ * Normalizeaza raspunsul in array PairScore[]
  */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState, useCallback } from 'react';
 
-export interface StrategyScoresData {
-  active_strategy: string;
-  scores:          Record<string, number>;
-  recent_win_rate: number;
-  switch_history:  Array<{ from: string; to: string; manual?: boolean }>;
-  total_bars:      number;
-  selector_id:     string;
+const API = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
+
+export interface PairScore {
+  pair:         string;
+  strategy:     string;
+  score:        number;
+  sharpe:       number;
+  win_rate:     number;
+  total_trades: number;
+  active:       boolean;
 }
 
-export function useStrategyScores(
-  selectorId: string = "live",
-  interval:   number  = 5000,
-  apiBase:    string  = "",
-): { data: StrategyScoresData | null; error: string | null; loading: boolean } {
-  const [data,    setData]    = useState<StrategyScoresData | null>(null);
-  const [error,   setError]   = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+function normalize(raw: unknown): PairScore[] {
+  if (Array.isArray(raw)) return raw as PairScore[];
+  if (raw && typeof raw === 'object') {
+    const r = raw as Record<string, unknown>;
+    if (Array.isArray(r.results))  return r.results  as PairScore[];
+    if (Array.isArray(r.scores))   return r.scores   as PairScore[];
+    if (Array.isArray(r.pairs))    return r.pairs     as PairScore[];
+  }
+  return [];
+}
+
+export function useStrategyScores(intervalMs = 10_000) {
+  const [scores,      setScores]      = useState<PairScore[]>([]);
+  const [loading,     setLoading]     = useState(true);
+  const [error,       setError]       = useState<string | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<number | null>(null);
+
+  const fetchScores = useCallback(async () => {
+    try {
+      const r = await fetch(`${API}/api/optimizer/results`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const raw = await r.json();
+      setScores(normalize(raw));
+      setLastUpdated(Date.now());
+      setError(null);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Optimizer unavailable');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
-    let cancelled = false;
+    fetchScores();
+    const id = setInterval(fetchScores, intervalMs);
+    return () => clearInterval(id);
+  }, [fetchScores, intervalMs]);
 
-    const fetch_ = async () => {
-      try {
-        const res = await fetch(`${apiBase}/strategy/scores?selector_id=${encodeURIComponent(selectorId)}`);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const json = await res.json() as StrategyScoresData;
-        if (!cancelled) { setData(json); setError(null); }
-      } catch (e: unknown) {
-        if (!cancelled) setError(e instanceof Error ? e.message : String(e));
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    };
-
-    fetch_();
-    timerRef.current = setInterval(fetch_, interval);
-
-    return () => {
-      cancelled = true;
-      if (timerRef.current) clearInterval(timerRef.current);
-    };
-  }, [selectorId, interval, apiBase]);
-
-  return { data, error, loading };
+  return { scores, loading, error, lastUpdated };
 }
