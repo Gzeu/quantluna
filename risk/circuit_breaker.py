@@ -6,7 +6,7 @@ This module contains TWO circuit breaker implementations with distinct roles:
   RiskCircuitBreaker  (defined here)
     - Sync, P&L-aware breaker used by the risk layer.
     - Monitors: consecutive losses, drawdown %, execution error count.
-    - State machine: CLOSED → OPEN → HALF_OPEN (time-based cooldown).
+    - State machine: CLOSED -> OPEN -> HALF_OPEN (time-based cooldown).
     - Use this when reacting to trading outcomes (wins/losses/errors).
 
   CircuitBreaker  (from execution.circuit_breaker — re-exported here)
@@ -18,6 +18,12 @@ Quick-reference:
     from risk.circuit_breaker import RiskCircuitBreaker   # P&L breaker
     from risk.circuit_breaker import CircuitBreaker        # WS/async breaker (re-export)
     from execution.circuit_breaker import CircuitBreaker   # same, direct import
+
+Changes (code review 2026-07-12):
+  - Patch 1: removed early `return` in record_loss() so the drawdown
+    check always executes even when consecutive-loss threshold is hit.
+  - Patch 2: record_win() now transitions HALF_OPEN -> CLOSED on a
+    confirmed win, preventing the breaker from sticking in HALF_OPEN.
 """
 from __future__ import annotations
 
@@ -32,9 +38,9 @@ from execution.circuit_breaker import CircuitBreaker, CircuitOpenError, CircuitS
 
 
 class BreakerState(Enum):
-    CLOSED    = "closed"       # normal, trading permis
-    OPEN      = "open"         # blocat
-    HALF_OPEN = "half_open"    # test dupa cooldown
+    CLOSED    = "closed"       # normal, trading allowed
+    OPEN      = "open"         # blocked
+    HALF_OPEN = "half_open"    # test after cooldown
 
 
 @dataclass
@@ -89,20 +95,38 @@ class RiskCircuitBreaker:
         return self.state != BreakerState.OPEN
 
     def record_win(self, pnl: float) -> None:
+        """
+        Record a winning trade.
+
+        Patch 2: transitions HALF_OPEN -> CLOSED on a confirmed win so
+        the breaker does not stay stuck in HALF_OPEN indefinitely.
+        """
         self._consecutive_losses = 0
         self._current_equity += pnl
         if self._current_equity > self._peak_equity:
             self._peak_equity = self._current_equity
+        # Transition HALF_OPEN -> CLOSED on confirmed win
+        if self._state == BreakerState.HALF_OPEN:
+            self._state = BreakerState.CLOSED
+            self.last_reason = ""
 
     def record_loss(self, pnl: float) -> None:
-        """pnl can be positive or negative — treated as an absolute loss."""
+        """
+        Record a losing trade. pnl can be positive or negative — treated as
+        an absolute loss.
+
+        Patch 1: removed early `return` after the consecutive-loss trip so
+        that the drawdown check always executes regardless of which threshold
+        was hit first. Previously, hitting max_consecutive_losses would skip
+        the drawdown check entirely.
+        """
         loss = abs(pnl)
         self._current_equity -= loss
         self._consecutive_losses += 1
 
         if self._consecutive_losses >= self._max_losses:
             self._trip(f"{self._consecutive_losses} consecutive losses")
-            return
+            # NOTE: no early return — fall through to drawdown check too
 
         if self._peak_equity > 0:
             dd = (self._peak_equity - self._current_equity) / self._peak_equity

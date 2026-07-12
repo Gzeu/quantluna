@@ -12,10 +12,10 @@ Design rationale:
   HMM is opt-in via use_hmm=True — falls back gracefully if hmmlearn not installed.
 
 Regime sizing scalars (get_regime_multiplier):
-  NORMAL     → 1.00  (full size)
-  HIGH_VOL   → 0.50  (half size)
-  TRANSITION → 0.75  (cautious)
-  BREAKDOWN  → 0.00  (no new trades, flatten)
+  NORMAL     -> 1.00  (full size)
+  HIGH_VOL   -> 0.50  (half size)
+  TRANSITION -> 0.75  (cautious)
+  BREAKDOWN  -> 0.00  (no new trades, flatten)
 
 Changes v2:
   - TRANSITION no longer permanently sticks: only first bar of regime candidate
@@ -27,12 +27,22 @@ Changes v2:
   - batch(): hmm_state column included when HMM available (None otherwise)
   - baseline_vol clamped to 1e-10 (division-by-zero guard on short series)
   - _reset_online_state() resets all counters including _transition_bars
+
+Changes (code review 2026-07-12):
+  - Patch 4: replaced spread.pct_change() in batch() with diff()/abs_mean
+    normalisation. pct_change() produces +-inf when spread crosses zero
+    (common in pairs trading), corrupting the vol-ratio calculation.
+    Same fix already applied in risk/kelly.py.
+  - Patch 5: replaced unbounded List[float] _spread_returns with
+    collections.deque(maxlen=baseline_window+vol_window) to prevent
+    unbounded memory growth during long-running live sessions.
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Deque, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -74,8 +84,8 @@ class RegimeDetector:
     ----------
     vol_window          : short rolling window for current vol (default 24 bars)
     baseline_window     : longer window for baseline vol (default 168 bars = 1 week @ 1h)
-    high_vol_threshold  : vol_ratio above this → HIGH_VOL (default 1.5)
-    breakdown_threshold : vol_ratio above this → BREAKDOWN (default 2.5)
+    high_vol_threshold  : vol_ratio above this -> HIGH_VOL (default 1.5)
+    breakdown_threshold : vol_ratio above this -> BREAKDOWN (default 2.5)
     min_persistence     : consecutive bars before regime switch is confirmed (default 3)
     adf_deterioration   : ADF p-value above this forces BREAKDOWN (default 0.10)
     use_hmm             : fit Gaussian HMM 2-state on batch() if hmmlearn available
@@ -112,8 +122,12 @@ class RegimeDetector:
         if use_hmm and not self._hmm_available:
             logger.warning("use_hmm=True but hmmlearn not installed — falling back to vol-ratio only")
 
-        # Online state
-        self._spread_returns: List[float] = []
+        # Patch 5: bounded deque prevents unbounded memory growth in live mode.
+        # The deque auto-evicts the oldest element when full, so _step() logic
+        # using arr[-vol_window:] and arr[-baseline_window:] remains correct.
+        self._spread_returns: Deque[float] = deque(
+            maxlen=self.baseline_window + self.vol_window
+        )
         self._raw_regime_count: int = 0
         self._raw_regime: VolRegime = VolRegime.NORMAL
         self._confirmed_regime: VolRegime = VolRegime.NORMAL
@@ -142,7 +156,20 @@ class RegimeDetector:
         DataFrame with columns: regime, vol_ratio, current_vol, baseline_vol,
                                  confirmed, multiplier, hmm_state
         """
-        spread_ret = spread.pct_change().fillna(0.0)
+        # Patch 4: use diff()/abs_mean instead of pct_change().
+        # pct_change() produces +-inf when spread crosses zero, which is
+        # normal in pairs trading and corrupts the vol-ratio calculation.
+        # abs_mean normalisation gives a comparable dimensionless return.
+        spread_abs_mean = (
+            spread.abs()
+            .rolling(window=self.baseline_window, min_periods=1)
+            .mean()
+            .replace(0, np.nan)
+            .ffill()
+            .fillna(1.0)
+        )
+        spread_ret = spread.diff().fillna(0.0) / spread_abs_mean
+
         self._reset_online_state()
 
         regimes: List[Dict] = []
@@ -160,7 +187,6 @@ class RegimeDetector:
 
         result = pd.DataFrame(regimes, index=spread.index)
 
-        # Optional HMM layer — batch only (Viterbi requires full sequence)
         if self.use_hmm and self._hmm_available:
             result["hmm_state"] = self._fit_predict_hmm(spread_ret.values)
         else:
@@ -209,6 +235,7 @@ class RegimeDetector:
         adf_p: Optional[float] = None,
         ts: Optional[pd.Timestamp] = None,
     ) -> RegimeState:
+        # Patch 5: deque.append() auto-evicts oldest when maxlen is reached.
         self._spread_returns.append(spread_return)
 
         if len(self._spread_returns) < self.vol_window:
@@ -225,11 +252,10 @@ class RegimeDetector:
         arr = np.asarray(self._spread_returns)
         current_vol  = float(np.std(arr[-self.vol_window:]))
         baseline_arr = arr[-self.baseline_window:] if len(arr) >= self.baseline_window else arr
-        baseline_vol = max(float(np.std(baseline_arr)), 1e-10)  # division-by-zero guard
+        baseline_vol = max(float(np.std(baseline_arr)), 1e-10)
 
         vol_ratio = current_vol / baseline_vol
 
-        # Raw regime from vol ratio
         if vol_ratio >= self.breakdown_threshold:
             raw = VolRegime.BREAKDOWN
         elif vol_ratio >= self.high_vol_threshold:
@@ -237,11 +263,9 @@ class RegimeDetector:
         else:
             raw = VolRegime.NORMAL
 
-        # ADF deterioration override
         if adf_p is not None and adf_p > self.adf_deterioration:
             raw = VolRegime.BREAKDOWN
 
-        # Persistence filter
         if raw == self._raw_regime:
             self._raw_regime_count += 1
         else:
@@ -253,17 +277,14 @@ class RegimeDetector:
         if confirmed:
             if self._confirmed_regime != raw:
                 logger.info(
-                    f"Regime switch: {self._confirmed_regime.value} → {raw.value} "
+                    f"Regime switch: {self._confirmed_regime.value} -> {raw.value} "
                     f"(vol_ratio={vol_ratio:.2f}, persistence={self._raw_regime_count})"
                 )
             self._confirmed_regime = raw
             self._transition_bars = 0
         elif self._raw_regime_count == 1 and raw != self._confirmed_regime:
-            # First bar of a new candidate regime → TRANSITION
-            # Subsequent bars (2..N-1) keep the previous confirmed regime
             self._transition_bars += 1
             self._confirmed_regime = VolRegime.TRANSITION
-        # else: accumulating persistence but not confirmed → keep prior regime
 
         return RegimeState(
             regime=self._confirmed_regime,
@@ -276,7 +297,7 @@ class RegimeDetector:
         )
 
     def _reset_online_state(self) -> None:
-        self._spread_returns = []
+        self._spread_returns = deque(maxlen=self.baseline_window + self.vol_window)
         self._raw_regime_count = 0
         self._raw_regime = VolRegime.NORMAL
         self._confirmed_regime = VolRegime.NORMAL
@@ -322,7 +343,6 @@ class RegimeDetector:
             model.fit(X)
             states = model.predict(X)
 
-            # Normalise: state with lower abs mean = 0 (low-vol)
             means  = np.array([np.abs(model.means_[s]).mean() for s in range(n_components)])
             order  = np.argsort(means)
             remap  = {int(order[i]): i for i in range(n_components)}
