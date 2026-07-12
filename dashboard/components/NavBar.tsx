@@ -104,7 +104,9 @@ export default function NavBar() {
         </span>
       ),
     },
-    { href: '/strategy', label: '🧠 Strategy' },
+    { href: '/strategy',  label: '🧠 Strategy' },
+    { href: '/risk',      label: '🛡 Risk' },
+    { href: '/backtest',  label: '🔭 Backtest' },
   ];
 
   return (
@@ -138,7 +140,7 @@ export default function NavBar() {
       </div>
 
       {/* Links */}
-      <div className="flex flex-1 h-full">
+      <div className="flex flex-1 h-full overflow-x-auto">
         {links.map(({ href, label, badge }) => {
           const isActive = current === href
             || (href !== '/' && current.startsWith(href));
@@ -148,7 +150,7 @@ export default function NavBar() {
               href={href}
               className={`
                 flex items-center px-3.5 h-full text-[13px] no-underline
-                transition-colors duration-150
+                transition-colors duration-150 whitespace-nowrap
                 border-b-2 border-t-2 border-t-transparent
                 ${
                   isActive
