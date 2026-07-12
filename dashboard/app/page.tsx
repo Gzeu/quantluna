@@ -1,17 +1,23 @@
 'use client'
-import { useEffect } from 'react'
-import HeaderBar         from '../components/HeaderBar'
-import SidebarPanel      from '../components/SidebarPanel'
-import CandlestickChart  from '../components/CandlestickChart'
+/**
+ * DashboardPage — QuantLuna S46
+ *
+ * Grid layout: header / sidebar / central / right / log
+ * Zona right: BalanceTracker + PnLChart + SizingPanel + ArbitragePanel
+ */
+import HeaderBar          from '../components/HeaderBar'
+import SidebarPanel       from '../components/SidebarPanel'
+import CandlestickChart   from '../components/CandlestickChart'
 import SpreadMonitorPanel from '../components/SpreadMonitorPanel'
-import MarketHeatmap     from '../components/MarketHeatmap'
-import BalanceTracker    from '../components/BalanceTracker'
-import PnLChart          from '../components/PnLChart'
-import ArbitragePanel    from '../components/ArbitragePanel'
-import ExecutionLog      from '../components/ExecutionLog'
-import ModalsHost        from '../components/modals/ModalsHost'
-import { useQuantLunaWS }          from '../hooks/useQuantLunaWS'
-import { useKeyboardShortcuts }    from '../hooks/useKeyboardShortcuts'
+import MarketHeatmap      from '../components/MarketHeatmap'
+import BalanceTracker     from '../components/BalanceTracker'
+import PnLChart           from '../components/PnLChart'
+import ArbitragePanel     from '../components/ArbitragePanel'
+import ExecutionLog       from '../components/ExecutionLog'
+import ModalsHost         from '../components/modals/ModalsHost'
+import SizingPanel        from '../components/SizingPanel'
+import { useQuantLunaWS }       from '../hooks/useQuantLunaWS'
+import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts'
 
 function QuantLunaApp() {
   useQuantLunaWS()
@@ -51,7 +57,7 @@ export default function DashboardPage() {
         <SidebarPanel />
       </div>
 
-      {/* Central zone: Chart + Spread + Heatmap */}
+      {/* Central: Chart + Spread + Heatmap */}
       <div
         style={{
           gridArea: 'central',
@@ -62,18 +68,12 @@ export default function DashboardPage() {
           minHeight: 0,
         }}
       >
-        <div style={{ flex: '6 1 0', minHeight: 0 }}>
-          <CandlestickChart />
-        </div>
-        <div style={{ flex: '2 1 0', minHeight: 0 }}>
-          <SpreadMonitorPanel />
-        </div>
-        <div style={{ flex: '2 1 0', minHeight: 0 }}>
-          <MarketHeatmap />
-        </div>
+        <div style={{ flex: '6 1 0', minHeight: 0 }}><CandlestickChart /></div>
+        <div style={{ flex: '2 1 0', minHeight: 0 }}><SpreadMonitorPanel /></div>
+        <div style={{ flex: '2 1 0', minHeight: 0 }}><MarketHeatmap /></div>
       </div>
 
-      {/* Right zone: Balance + PnL + Arb */}
+      {/* Right: Balance + PnL + Sizing/Decision + Arb */}
       <div
         style={{
           gridArea: 'right',
@@ -84,15 +84,11 @@ export default function DashboardPage() {
           minHeight: 0,
         }}
       >
-        <div style={{ flex: '3 1 0', minHeight: 0 }}>
-          <BalanceTracker />
-        </div>
-        <div style={{ flex: '3 1 0', minHeight: 0 }}>
-          <PnLChart />
-        </div>
-        <div style={{ flex: '4 1 0', minHeight: 0 }}>
-          <ArbitragePanel />
-        </div>
+        <div style={{ flex: '2 1 0', minHeight: 0 }}><BalanceTracker /></div>
+        <div style={{ flex: '2 1 0', minHeight: 0 }}><PnLChart /></div>
+        {/* S46: SizingEngine + DecisionEngine live status */}
+        <div style={{ flex: '3 1 0', minHeight: 0 }}><SizingPanel /></div>
+        <div style={{ flex: '3 1 0', minHeight: 0 }}><ArbitragePanel /></div>
       </div>
 
       {/* Execution Log */}

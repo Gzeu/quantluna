@@ -1,6 +1,6 @@
 /**
  * QuantLuna Dashboard — API Client
- * Sprint 30
+ * Sprint S46 (2026-07-12) — versiune 0.31.0
  *
  * Wrapper fetch pentru backend QuantLuna API.
  * Toate request-urile merg la NEXT_PUBLIC_API_URL.
@@ -55,8 +55,43 @@ export interface AlertItem {
   payload:    Record<string, unknown>;
 }
 
-export const getRiskSnapshot  = () => apiFetch<RiskSnapshot>('/risk/snapshot');
-export const getPairsStatus   = () => apiFetch<PairStatus[]>('/pairs/status');
-export const getEquityCurve   = () => apiFetch<EquityPoint[]>('/risk/equity_curve');
+/** GET /sizing/live_status — SizingEngine v2.5 */
+export interface SizingLiveStatus {
+  enabled:           boolean;
+  source:            string;
+  status?:           string;
+  capital_usdt?:     number;
+  max_leverage?:     number;
+  kelly_fraction?:   string;
+  // campuri expuse de get_status() daca engineul e prezent
+  last_multiplier?:  number;
+  current_streak?:   number;
+  current_drawdown?: number;
+  kelly_cap?:        number;
+  [key: string]:     unknown;
+}
+
+/** GET /api/decision/status — DecisionEngine v2.5 */
+export interface DecisionStatus {
+  enabled:               boolean;
+  status?:               string;
+  entry_zscore?:         number | null;
+  exit_zscore?:          number | null;
+  partial_exit_zscore?:  number | null;
+  scale_in_zscore?:      number | null;
+  base_qty_y?:           number | null;
+  base_qty_x?:           number | null;
+  current_streak?:       number;
+  current_drawdown?:     number;
+  in_position?:          boolean;
+}
+
+export const getRiskSnapshot     = () => apiFetch<RiskSnapshot>('/risk/snapshot');
+export const getPairsStatus      = () => apiFetch<PairStatus[]>('/pairs/status');
+export const getEquityCurve      = () => apiFetch<EquityPoint[]>('/risk/equity_curve');
 export const getRebalancerStatus = () => apiFetch('/rebalancer/status');
-export const triggerRebalance = () => apiFetch('/rebalancer/run', { method: 'POST' });
+export const triggerRebalance    = () => apiFetch('/rebalancer/run', { method: 'POST' });
+
+/** S46: Sizing + Decision endpoints pentru dashboard unificat */
+export const getSizingLiveStatus = () => apiFetch<SizingLiveStatus>('/sizing/live_status');
+export const getDecisionStatus   = () => apiFetch<DecisionStatus>('/api/decision/status');
