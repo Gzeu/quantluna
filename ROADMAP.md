@@ -1,18 +1,44 @@
-# QuantLuna — Roadmap complet S30–S36
+# QuantLuna — Roadmap S30–S46+
 
 > Ultima actualizare: 2026-07-12  
-> Baza: Sprint S29 v3.3 (orchestrator + hedge manager activ)
+> Baza: Sprint S46 (audit sync post-S45 — MonitoringWatchdog + WorkflowOrchestrator v2.2)
 
 ---
 
 ## Viziune generală
 
 QuantLuna devine un sistem **multi-market, multi-strategie, auto-scaling** care:
-- Tranzacționează **Futures Linear** (deja activ) + **Spot** (S30) + **Margin** (S35)
+- Tranzacționează **Futures Linear** (activ) + **Spot** (S30) + **Margin** (S35)
 - Alocă capital dinamic per strategie bazat pe PnL zilnic (S31)
 - Mută fonduri automat între wallet-urile Bybit intern (S32)
 - Propune retrageri externe cu confirmare manuală Telegram (S33)
 - Rulează toate piețele în paralel cu un singur orchestrator (S34)
+- Monitorizează continuu Sharpe, DD, z-score, half-life prin Watchdog (S45)
+
+---
+
+## ✅ Completed Sprints (S29–S46)
+
+| Sprint | Focus | Status |
+|--------|-------|--------|
+| S29 | Orchestrator v3.3 + HedgeManager activ | ✅ Done |
+| S30 | Spot Trading Support — SpotOrderRouter | ✅ Done |
+| S31 | Capital Allocator + DailyPnLTracker | ✅ Done |
+| S32 | Internal Transfer Manager (Bybit intern) | ✅ Done |
+| S33 | Withdrawal Guard (confirmare Telegram) | ✅ Done |
+| S34 | Multi-Market Runner (Futures + Spot gather) | ✅ Done |
+| S35 | Margin Trading + MarginRiskGuard | ✅ Done |
+| S36 | Portfolio Dashboard Extension | ✅ Done |
+| S37 | Walk-forward Optimizer v1 + baseline tests | ✅ Done |
+| S38 | Regime Detector integration + vol adapter | ✅ Done |
+| S39 | Live Data Bridge + WebSocket reconnect logic | ✅ Done |
+| S40 | State Bus refactor + Redis pub/sub | ✅ Done |
+| S41 | Performance Analytics + Trade Journal | ✅ Done |
+| S42 | WFO v2 — rolling windows + fold validation | ✅ Done |
+| S43 | Cointegration module + correlation matrix | ✅ Done |
+| S44 | ParamGridOptimizer + AutoReoptimizer scaffold | ✅ Done |
+| S45 | MonitoringWatchdog + WorkflowOrchestrator v2.2 | ✅ Done |
+| S46 | Audit sync: core exports, env vars, tests, roadmap | ✅ Done |
 
 ---
 
@@ -45,17 +71,6 @@ pe `category=spot` fără qty rounding de futures.
 | Telegram raport zilnic 23:59 UTC | capital_allocator.py | MEDIU |
 | ReserveManager — USDT idle tracking | capital_allocator.py | MEDIU |
 
-**Logică:**
-```
-zilnic la 23:55 UTC:
-  pnl = DailyPnLTracker.get_today()
-  if pnl.realised_pct > PROFIT_TAKE_PCT:        # ex: 3%
-      CapitalAllocator.move_to_reserve(pnl.excess_usdt)
-  if equity_total > HIGH_WATERMARK * 1.20:       # +20% față de max anterior
-      CapitalAllocator.rebalance_strategies()
-  Telegram: raport complet
-```
-
 ---
 
 ## S32 — Internal Transfer Manager
@@ -85,10 +100,6 @@ zilnic la 23:55 UTC:
 | Blacklist adrese neautorizate | withdrawal_guard.py | CRITIC |
 | Audit log complet cu IP + timestamp | withdrawal_guard.py | CRITIC |
 
-**Principiu de securitate:** Sistemul NICIODATĂ nu execută o retragere fără
-comanda `/confirm_<UUID>` din Telegram de la chat_id autorizat.
-Retragerea este ireversibilă — confirmare dublă obligatorie.
-
 ---
 
 ## S34 — Multi-Market Runner
@@ -101,18 +112,6 @@ Retragerea este ireversibilă — confirmare dublă obligatorie.
 | Config: `markets: [futures, spot]` în runner_cfg | config/ | MEDIU |
 | Dashboard: tab separat per piață | dashboard/ | MEDIU |
 
-**Arhitectură:**
-```
-MultiMarketRunner.start()
-  ├── asyncio.gather(
-  │     BybitLiveRunner.start(),        # Futures Linear
-  │     SpotStrategyRunner.start(),     # Spot (nou S30)
-  │     [HedgeManager_i.manage()],      # Solo hedges
-  │     CapitalAllocator.run_loop(),    # S31
-  │     InternalTransferManager.watch() # S32
-  │   )
-```
-
 ---
 
 ## S35 — Margin Trading
@@ -124,9 +123,6 @@ MultiMarketRunner.start()
 | MarginRiskGuard — monitorizare margin ratio | margin_risk_guard.py | CRITIC |
 | Auto-deleverage dacă margin ratio < 110% | margin_risk_guard.py | CRITIC |
 | Telegram ALERT la margin ratio < 150% | margin_risk_guard.py | CRITIC |
-
-**Atenție:** Margin trading adaugă risc de lichidare. `MarginRiskGuard`
-monitor izează la fiecare 30s și închide automat dacă se apropie de liquidation.
 
 ---
 
@@ -142,15 +138,11 @@ monitor izează la fiecare 30s și închide automat dacă se apropie de liquidat
 
 ---
 
-## Status Sprints
+## S47+ — Backlog planificat
 
-| Sprint | Status | ETA |
-|--------|--------|-----|
-| S29 — Orchestrator v3.3 + HedgeManager | ✅ DONE | 2026-07-12 |
-| S30 — Spot Support | 🔄 IN PROGRESS | 2026-07-12 |
-| S31 — Capital Allocator | 🔄 IN PROGRESS | 2026-07-12 |
-| S32 — Internal Transfer | ⏳ PLANNED | 2026-07-13 |
-| S33 — Withdrawal Guard | ⏳ PLANNED | 2026-07-14 |
-| S34 — Multi-Market Runner | ⏳ PLANNED | 2026-07-15 |
-| S35 — Margin Trading | ⏳ PLANNED | 2026-07-17 |
-| S36 — Portfolio Dashboard | ⏳ PLANNED | 2026-07-19 |
+| Sprint | Focus | Status |
+|--------|-------|--------|
+| S47 | AI/ML signal layer — feature engineering + model inference | ⏳ PLANNED |
+| S48 | Multi-strategy coordinator — weight allocation per regime | ⏳ PLANNED |
+| S49 | Live paper trading environment cu shadow P&L | ⏳ PLANNED |
+| S50 | Production hardening — circuit breakers + chaos testing | ⏳ PLANNED |
