@@ -389,7 +389,8 @@ class BybitOrderRouter:
             if symbol:
                 sym = symbol.upper().replace("/USDT:USDT", "USDT").replace("/", "")
                 params["symbol"] = sym
-            resp = self._get_client().get_positions(**params)
+            client = self._get_client()
+            resp = client.get_positions(**params)
             positions = resp.get("result", {}).get("list", [])
             return [
                 {
@@ -446,12 +447,18 @@ class BybitOrderRouter:
 
     def _get_client(self):
         if self._client is None:
-            from pybit.unified_trading import HTTP
-            self._client = HTTP(
-                testnet=self.testnet,
-                api_key=self.api_key,
-                api_secret=self.api_secret,
-            )
+            try:
+                from pybit.unified_trading import HTTP
+                self._client = HTTP(
+                    testnet=self.testnet,
+                    api_key=self.api_key,
+                    api_secret=self.api_secret,
+                )
+            except ImportError:
+                logger.error(
+                    "pybit is not installed. Install with: pip install pybit"
+                )
+                raise
         return self._client
 
     async def _place(

@@ -155,7 +155,7 @@ class SingleHedgeManager:
         try:
             positions = await self._router.get_open_positions(symbol=self._symbol)
             if not positions:
-                logger.warning(
+                logger.info(
                     "SingleHedgeManager [%s]: No positions found on Bybit for symbol",
                     self._symbol,
                 )
@@ -186,6 +186,13 @@ class SingleHedgeManager:
                         "SingleHedgeManager [%s]: Verified SHORT position: "
                         "size=%s entry=%.4f uPnL=%+.4f",
                         self._symbol, size, entry, upnl,
+                    )
+                else:
+                    # Position exists on Bybit but not in our state
+                    logger.warning(
+                        "SingleHedgeManager [%s]: Found %s position on Bybit "
+                        "but no matching state exists",
+                        self._symbol, side,
                     )
 
                 # Register position on StateBus

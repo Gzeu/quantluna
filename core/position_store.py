@@ -24,6 +24,11 @@ class PositionStore:
     """
 
     def __init__(self, backend: Optional[str] = None) -> None:
+        try:
+            from core.store import _BACKEND, _DB_PATH
+        except ImportError:
+            _BACKEND = "sqlite"
+            _DB_PATH = "data/quantluna.db"
         b = (backend or _BACKEND).lower()
         if b == "redis":
             self._store: AbstractStore = RedisStore(prefix="ql_positions")
