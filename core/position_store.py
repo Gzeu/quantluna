@@ -30,7 +30,8 @@ class PositionStore:
         elif b == "sqlite":
             self._store = SQLiteStore(table="positions", db_path=_DB_PATH)
         else:
-            self._store = MemoryStore()
+            # Default to SQLite for persistence across restarts
+            self._store = SQLiteStore(table="positions", db_path=_DB_PATH)
 
     def save_positions(self, positions: Dict[str, Any]) -> None:
         """Save all open positions."""

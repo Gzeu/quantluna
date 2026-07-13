@@ -33,7 +33,7 @@ def get_engine() -> PaperTradingEngine:
         import os
         from core.position_store import PositionStore
         capital = float(os.getenv("INITIAL_CAPITAL_USD", "10000"))
-        store = PositionStore()
+        store = PositionStore(backend="sqlite")
         _engine = PaperTradingEngine(initial_capital=capital, store=store)
     return _engine
 
