@@ -144,28 +144,28 @@ docker-dashboard:
 # Productie
 prod-build:
 	@echo "$(CYAN)Building productie...$(RESET)"
-	docker compose -f docker-compose.prod.yml build --no-cache
+	cd deploy && docker compose -f docker-compose.prod.yml build --no-cache
 	@echo "$(GREEN)✓ Build complet.$(RESET)"
 
 prod-up:
 	@echo "$(CYAN)Pornire stiva productie...$(RESET)"
 	@test -f .env || (echo "$(RED)Eroare: .env nu exista! cp .env.production.example .env$(RESET)" && exit 1)
-	docker compose -f docker-compose.prod.yml up -d
+	cd deploy && docker compose -f docker-compose.prod.yml up -d
 	@echo "$(GREEN)✓ Productie activa. Dashboard: http://localhost$(RESET)"
 
 prod-down:
 	@echo "$(YEL)Oprire stiva productie...$(RESET)"
-	docker compose -f docker-compose.prod.yml down
+	cd deploy && docker compose -f docker-compose.prod.yml down
 
 prod-restart:
-	docker compose -f docker-compose.prod.yml restart
+	cd deploy && docker compose -f docker-compose.prod.yml restart
 	@echo "$(GREEN)✓ Restart complet.$(RESET)"
 
 prod-logs:
-	docker compose -f docker-compose.prod.yml logs -f --tail=100
+	cd deploy && docker compose -f docker-compose.prod.yml logs -f --tail=100
 
 prod-status:
-	docker compose -f docker-compose.prod.yml ps
+	cd deploy && docker compose -f docker-compose.prod.yml ps
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

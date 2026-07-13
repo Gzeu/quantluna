@@ -105,6 +105,10 @@ class HealthConfig:
     cache_stale_h: float = 6.0
 
 
+# Alias for backward compatibility
+HealthCheckConfig = HealthConfig
+
+
 class HealthCheck:
     """
     Pre-flight health check pentru QuantLuna.

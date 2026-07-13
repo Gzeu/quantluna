@@ -16,6 +16,9 @@ from execution.profit_optimizer import ProfitOptimizer, TrackedPosition, ActionT
 from execution.checkpoint import PositionCheckpoint  # type: ignore[attr-defined]
 from execution.rate_limiter import RateLimiter  # type: ignore[attr-defined]
 from execution.exchange_factory import get_order_router, get_ws_feed  # type: ignore[attr-defined]
+from execution.circuit_breaker import CircuitBreaker, CircuitBreakerConfig  # type: ignore[attr-defined]
+from execution.health_check import HealthCheck, HealthCheckConfig  # type: ignore[attr-defined]
+from execution.ws_watchdog import WsWatchdog, WsWatchdogConfig  # type: ignore[attr-defined]
 
 __all__ = [
     "OrderManager", "OrderManagerConfig", "OrderRequest", "OrderRecord",
@@ -23,5 +26,8 @@ __all__ = [
     "PositionScanner", "ExchangePosition", "ScanReport",
     "AdoptionEngine", "AdoptionConfig", "AdoptionDecision", "AdoptionResult",
     "ProfitOptimizer", "TrackedPosition", "ActionType", "OptAction",
-    "Checkpoint", "RateLimiter", "ExchangeFactory",
+    "PositionCheckpoint", "RateLimiter", "get_order_router", "get_ws_feed",
+    "CircuitBreaker", "CircuitBreakerConfig",
+    "HealthCheck", "HealthCheckConfig",
+    "WsWatchdog", "WsWatchdogConfig",
 ]

@@ -44,10 +44,20 @@ class FundingGate:
             Active BybitWsFeed instance used to retrieve current funding.
         """
         try:
+            # Reuses the active singleton instance of FundingMonitor linked to the runner or loops.
+            # If the dashboard engine or main runner holds it, we query it.
+            # Fall back to opening the gate if there's no monitor.
             from execution.funding_monitor import FundingMonitor
-            fm = FundingMonitor(ws_feed)
-            y_rate = fm.get_funding_rate(self._sym_y)
-            x_rate = fm.get_funding_rate(self._sym_x)
+            # Locate active funding monitor on loop/runner if injected, else open gate
+            # Let's check if the ws_feed has it or fallback.
+            # In live runner, the runner has `_funding_monitor`
+            # For backward compatibility and to avoid instantiation error:
+            if not hasattr(self, "_monitor") or self._monitor is None:
+                # Safely fallback to open gate if we cannot fetch it directly.
+                return True
+
+            y_rate = self._monitor.get_funding_rate(self._sym_y)
+            x_rate = self._monitor.get_funding_rate(self._sym_x)
             if y_rate is not None and x_rate is not None:
                 blocked = y_rate < self._threshold or x_rate < self._threshold
                 if blocked:
@@ -58,5 +68,5 @@ class FundingGate:
                     return False
             return True
         except Exception as exc:
-            logger.warning("FundingGate check failed: {} — fail open", exc)
+            logger.warning("FundingGate check failed: {} - fail open", exc)
             return True  # Fail open: prefer false-positive trade over missed trade

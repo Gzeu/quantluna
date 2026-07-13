@@ -38,6 +38,7 @@ class FundingConfig:
 
 
 class FundingMonitor:
+    """
     Lansează un asyncio.Task care polling funding rates și publică în bus.
 
     Usage:
@@ -45,6 +46,7 @@ class FundingMonitor:
         task = asyncio.create_task(monitor.run())
         # la shutdown:
         task.cancel()
+    """
 
     def __init__(self, cfg: FundingConfig, exchange: ccxt.Exchange, bus) -> None:
         self.cfg = cfg
@@ -54,7 +56,9 @@ class FundingMonitor:
         self._last_x: float = 0.0
 
     async def run(self) -> None:
+        """
         Main polling loop. Runs until CancelledError.
+        """
         logger.info(
             f"FundingMonitor started — {self.cfg.sym_y} / {self.cfg.sym_x} "
             f"poll={self.cfg.poll_interval_s}s"
@@ -70,7 +74,9 @@ class FundingMonitor:
             await asyncio.sleep(self.cfg.poll_interval_s)
 
     async def _poll_and_publish(self) -> None:
+        """
         Fetch both legs and push to StateBus.
+        """
         fy = await self._fetch_annualized(self.cfg.sym_y)
         fx = await self._fetch_annualized(self.cfg.sym_x)
 
@@ -97,8 +103,10 @@ class FundingMonitor:
         )
 
     async def _fetch_annualized(self, symbol: str) -> Optional[float]:
+        """
         Fetch current funding rate and annualize.
         Returns None on error (caller uses last known value).
+        """
         try:
             data = await self.exchange.fetch_funding_rate(symbol)
             if data is None:
@@ -116,9 +124,10 @@ async def create_funding_monitor(
     api_secret: str,
     bus,
 ) -> tuple:
-    Factory helper — creează exchange CCXT async și FundingMonitor.
-    Returnează (monitor, exchange) pentru ca exchange-ul să poată fi
-    închis explicit la shutdown.
+    """
+    Factory helper - creeaza exchange CCXT async si FundingMonitor.
+    Returneaza (monitor, exchange) pentru ca exchange-ul sa poata fi
+    inchis explicit la shutdown.
 
     Usage:
         monitor, exchange = await create_funding_monitor(cfg, key, secret, bus)
@@ -126,6 +135,7 @@ async def create_funding_monitor(
         # la shutdown:
         task.cancel()
         await exchange.close()
+    """
 
     exchange_cls = getattr(ccxt, cfg.exchange_id)
     exchange = exchange_cls({

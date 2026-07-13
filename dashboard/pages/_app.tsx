@@ -10,7 +10,7 @@
 import type { AppProps } from 'next/app';
 import { useRouter }    from 'next/router';
 import { useEffect, useRef, useState, useCallback } from 'react';
-import '../app/globals.css';
+import '../styles/globals.css';
 import { ErrorBoundary }            from '../components/ErrorBoundary';
 import { ToastContainer, useToast } from '../components/Toast';
 import { useQuantLunaWS }           from '../hooks/useQuantLunaWS';

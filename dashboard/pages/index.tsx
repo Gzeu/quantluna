@@ -6,18 +6,20 @@
 import type { NextPage } from 'next';
 import Head              from 'next/head';
 import NavBar            from '../components/NavBar';
-import { StatsBar }          from '../components/StatsBar';
-import { MetricsBadge }      from '../components/MetricsBadge';
-import { PnlChart }          from '../components/PnlChart';
-import { TradeBreakdown }    from '../components/TradeBreakdown';
-import { StrategyScores }    from '../components/StrategyScores';
-import { WatchdogPanel }     from '../components/WatchdogPanel';
-import { BalanceTracker }    from '../components/BalanceTracker';
-import { ArbitragePanel }    from '../components/ArbitragePanel';
-import { SpreadMonitorPanel } from '../components/SpreadMonitorPanel';
-import { ExecutionLog }      from '../components/ExecutionLog';
-import { MarketHeatmap }     from '../components/MarketHeatmap';
-import { CandlestickChart }  from '../components/CandlestickChart';
+import {
+  StatsBar,
+  MetricsBadge,
+  PnlChart,
+  TradeBreakdown,
+  StrategyScores,
+  WatchdogPanel,
+  BalanceTracker,
+  ArbitragePanel,
+  SpreadMonitorPanel,
+  ExecutionLog,
+  MarketHeatmap,
+  CandlestickChart
+} from '../components';
 import { useRiskMetrics }    from '../hooks/useRiskMetrics';
 
 function RiskMetricsLoader() {

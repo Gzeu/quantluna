@@ -8,12 +8,12 @@ export { PnlChart }                   from './PnlChart';
 export { TradeBreakdown }             from './TradeBreakdown';
 export { StrategyScores }             from './StrategyScores';
 export { WatchdogPanel }              from './WatchdogPanel';
-export { BalanceTracker }             from './BalanceTracker';
-export { ArbitragePanel }             from './ArbitragePanel';
-export { SpreadMonitorPanel }         from './SpreadMonitorPanel';
-export { ExecutionLog }               from './ExecutionLog';
-export { MarketHeatmap }              from './MarketHeatmap';
-export { CandlestickChart }           from './CandlestickChart';
+export { default as BalanceTracker }     from './BalanceTracker';
+export { default as ArbitragePanel }     from './ArbitragePanel';
+export { default as SpreadMonitorPanel } from './SpreadMonitorPanel';
+export { default as ExecutionLog }       from './ExecutionLog';
+export { default as MarketHeatmap }      from './MarketHeatmap';
+export { default as CandlestickChart }   from './CandlestickChart';
 export { ErrorBoundary }              from './ErrorBoundary';
 export { ToastContainer, useToast }   from './Toast';
 

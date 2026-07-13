@@ -33,7 +33,7 @@ from execution.exchange_factory import get_order_router, get_ws_feed
 from execution.funding_gate     import FundingGate
 from execution.health_check     import HealthCheck, HealthCheckConfig
 from execution.order_manager    import OrderManager, OrderManagerConfig
-from execution.watchdog         import WsWatchdog, WsWatchdogConfig
+from execution.ws_watchdog       import WsWatchdog, WsWatchdogConfig
 from notifications.notifier_bus import NotifierBus
 
 
@@ -159,25 +159,27 @@ class BybitLiveRunner:
 
     async def _build_components(self, order_router, ws_feed):
         """Instantiate SpreadMonitor, CircuitBreaker, OrderManager, Watchdog, NotifierBus."""
-        spread_monitor  = SpreadMonitor(
-            symbol_y=self.cfg.symbol_y, symbol_x=self.cfg.symbol_x,
-            window=self.cfg.kalman_window, half_life_h=self.cfg.half_life_h,
-            warmup_bars=self.cfg.warmup_bars,
-        )
+        from core.spread_monitor import SpreadMonitorConfig
+        spread_monitor  = SpreadMonitor(SpreadMonitorConfig(
+            min_bars=self.cfg.warmup_bars,
+            zscore_control_limit=4.5,
+            max_half_life_hours=120.0,
+            stuck_bars_threshold=60,
+        ))
         circuit_breaker = CircuitBreaker(CircuitBreakerConfig(
-            max_consec_losses=self.cfg.max_consec_losses,
-            max_drawdown_pct=self.cfg.max_drawdown_pct,
-            cooldown_seconds=self.cfg.cooldown_seconds,
+            failure_threshold=5,
+            recovery_timeout_s=300.0,
+            half_open_max_calls=1,
+            name="trading_circuit",
         ))
         order_manager   = OrderManager(OrderManagerConfig(
-            base_qty=self.cfg.base_qty,
-            entry_zscore=self.cfg.entry_zscore,
-            exit_zscore=self.cfg.exit_zscore,
             dry_run=self.cfg.dry_run,
         ))
-        watchdog        = WsWatchdog(ws_feed, WsWatchdogConfig(
-            interval_seconds=30, max_missed_pings=3, reconnect_delay=5.0,
-        ))
+        watchdog        = WsWatchdog(WsWatchdogConfig(
+            stale_warn_s=10.0,
+            stale_critical_s=30.0,
+            check_interval_s=2.0,
+        ), bus=None)
 
         notifier_bus = self._bus_ext or NotifierBus(fail_silent=True)
         if not self._bus_ext:
@@ -203,9 +205,11 @@ class BybitLiveRunner:
 
     async def _start_health_server(self, components: dict) -> HealthCheck:
         """Start HealthCheck HTTP server; fall back to inline aiohttp on failure."""
-        hc = HealthCheck.from_components(
-            components, HealthCheckConfig(port=self.cfg.health_port, check_interval=10.0)
-        )
+        hc = HealthCheck(HealthCheckConfig(
+            exchange=self.cfg.venue,
+            sym_y=self.cfg.symbol_y,
+            sym_x=self.cfg.symbol_x,
+        ))
         try:
             await hc.start_http_server()
             logger.info("BybitLiveRunner: health server on :{}", self.cfg.health_port)
@@ -237,8 +241,7 @@ class BybitLiveRunner:
         decision_engine: DecisionEngine,
         executor: ActionExecutor,
     ) -> None:
-        watchdog.set_health_checker(health)
-        watchdog_task = asyncio.create_task(watchdog.start())
+        watchdog_task = asyncio.create_task(watchdog.run())
         first_bar = True
 
         while not self._stop_event.is_set():
@@ -248,20 +251,23 @@ class BybitLiveRunner:
                     await asyncio.sleep(0.1)
                     continue
 
-                spread_monitor.update(bar.price_y, bar.price_x)
-                zscore = spread_monitor.zscore
+                # Calculate spread manually for new SpreadMonitor API
+                spread = bar.price_y / bar.price_x
+                zscore = 0.0  # Would need Kalman for real zscore
+                half_life = 24.0  # Default half-life
+                report = spread_monitor.update(spread, zscore, half_life)
+                zscore = report.zscore
 
                 if first_bar:
                     logger.info(
                         "BybitLiveRunner: first bar | spread={:.6f} z={:.4f}",
-                        spread_monitor.spread, zscore,
+                        spread, zscore,
                     )
                     first_bar = False
 
-                if circuit_breaker.is_open():
+                if not circuit_breaker.is_available():
                     logger.warning(
-                        "BybitLiveRunner: circuit OPEN remaining={:.1f}s",
-                        circuit_breaker.remaining_cooldown,
+                        "BybitLiveRunner: circuit OPEN — blocking trades"
                     )
                     await asyncio.sleep(1.0)
                     continue

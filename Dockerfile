@@ -53,14 +53,7 @@ USER quantluna
 # Health check — runner HTTP health endpoint (port 8081)
 # Probe-ul loveste /api/health al runner-ului, nu dashboard-ul (8000)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD python -c "
-import urllib.request, sys
-try:
-    r = urllib.request.urlopen('http://localhost:8081/api/health', timeout=8)
-    sys.exit(0 if r.status == 200 else 1)
-except Exception:
-    sys.exit(1)
-"
+    CMD python -c "import urllib.request, sys; r = urllib.request.urlopen('http://localhost:8081/api/health', timeout=8); sys.exit(0 if r.status == 200 else 1)"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \

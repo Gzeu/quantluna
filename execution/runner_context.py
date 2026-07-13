@@ -17,7 +17,7 @@ from typing import Any, Optional
 from core.spread_monitor import SpreadMonitor
 from execution.circuit_breaker import CircuitBreaker
 from execution.order_manager import OrderManager
-from execution.watchdog import WsWatchdog
+from execution.ws_watchdog import WsWatchdog
 from notifications.notifier_bus import NotifierBus
 
 

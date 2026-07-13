@@ -1,42 +1,31 @@
 version: '3.9'
 
 services:
-  quantluna:
+  # API FastAPI
+  ql-api:
     build:
       context: ..
       dockerfile: Dockerfile
-    container_name: quantluna_live
+    container_name: quantluna_api
     restart: on-failure:5
-    # Restart automat la crash, maxim 5 ori consecutiv.
-    # `on-failure` NU restartează la `docker stop` manual.
-
     env_file:
       - ../.env
-
     volumes:
-      # Persistă toate DB-urile şi log-urile în afara containerului
-      - quantluna_data:/opt/quantluna/data
-      - quantluna_logs:/opt/quantluna/logs
-
+      - quantluna_data:/app/data
+      - quantluna_logs:/app/logs
     ports:
-      # API intern — NU expus public; accesat via reverse proxy sau VPN
       - "127.0.0.1:8000:8000"
-
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 45s
-      # Docker va restarted containerul dacă /health eşuează de 3 ori consecutiv
-
     logging:
       driver: "json-file"
       options:
         max-size: "50m"
         max-file: "5"
-
-    # Limită de resurse — previne OOM killer
     deploy:
       resources:
         limits:
@@ -44,8 +33,96 @@ services:
           cpus: '1.0'
         reservations:
           memory: 256M
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    networks:
+      - quantluna-net
 
+  # Dashboard Next.js
+  ql-nextjs:
+    build:
+      context: ../dashboard
+      dockerfile: Dockerfile
+    container_name: quantluna_dashboard
+    restart: on-failure:5
+    env_file:
+      - ../.env
+    environment:
+      - NEXT_PUBLIC_API_URL=http://ql-api:8000
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - quantluna_data:/app/data
+      - quantluna_logs:/app/logs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+    networks:
+      - quantluna-net
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: quantluna_nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ../nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - ql-api
+      - ql-nextjs
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+    networks:
+      - quantluna-net
+
+  # Trader Live
+  quantluna:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: quantluna_live
+    restart: on-failure:5
+    env_file:
+      - ../.env
+    volumes:
+      - quantluna_data:/app/data
+      - quantluna_logs:/app/logs
+    ports:
+      - "127.0.0.1:8081:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 256M
     command: python main.py --mode live
+    networks:
+      - quantluna-net
 
   # Watchdog extern: curl la /health la fiecare 5 min
   # Dacă eşuează → trimite alerta Telegram şi restartează containerul
@@ -56,24 +133,39 @@ services:
     env_file:
       - ../.env
     depends_on:
+      - ql-api
       - quantluna
     command: >
       sh -c '
         while true; do
           sleep 300;
-          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" http://quantluna:8000/health || echo "000");
+          STATUS=$(curl -sf -o /dev/null -w "%{http_code}" http://quantluna:8081/api/health || echo "000");
           if [ "$$STATUS" != "200" ]; then
-            echo "[Watchdog] /health returned $$STATUS — alerting";
+            echo "[Watchdog] /api/health returned $$STATUS — alerting";
             curl -s -X POST "https://api.telegram.org/bot$${TELEGRAM_BOT_TOKEN}/sendMessage" \
               -d "chat_id=$${TELEGRAM_CHAT_ID}" \
-              -d "text=⚠️ QuantLuna /health FAILED ($$STATUS) — container restarting";
+              -d "text=⚠️ QuantLuna /api/health FAILED ($$STATUS) — container restarting";
             docker restart quantluna_live;
+          fi;
+          STATUS_API=$(curl -sf -o /dev/null -w "%{http_code}" http://ql-api:8000/health || echo "000");
+          if [ "$$STATUS_API" != "200" ]; then
+            echo "[Watchdog] API /health returned $$STATUS_API — alerting";
+            curl -s -X POST "https://api.telegram.org/bot$${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              -d "chat_id=$${TELEGRAM_CHAT_ID}" \
+              -d "text=⚠️ QuantLuna API /health FAILED ($$STATUS_API) — container restarting";
+            docker restart quantluna_api;
           fi;
         done
       '
+    networks:
+      - quantluna-net
 
 volumes:
   quantluna_data:
     driver: local
   quantluna_logs:
     driver: local
+
+networks:
+  quantluna-net:
+    driver: bridge

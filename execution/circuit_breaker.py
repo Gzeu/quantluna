@@ -21,10 +21,20 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CircuitBreakerConfig:
+    """Configuration for CircuitBreaker."""
+    failure_threshold: int = 5
+    recovery_timeout_s: float = 60.0
+    half_open_max_calls: int = 1
+    name: str = "circuit"
 
 
 class CircuitState(Enum):
@@ -48,6 +58,16 @@ class CircuitBreaker:
         half_open_max_calls: apeluri permise în HALF_OPEN (default 1)
         name:                label pentru logging
     """
+
+    @classmethod
+    def from_config(cls, cfg: CircuitBreakerConfig) -> "CircuitBreaker":
+        """Create CircuitBreaker from config."""
+        return cls(
+            failure_threshold=cfg.failure_threshold,
+            recovery_timeout_s=cfg.recovery_timeout_s,
+            half_open_max_calls=cfg.half_open_max_calls,
+            name=cfg.name,
+        )
 
     def __init__(
         self,
@@ -157,3 +177,7 @@ class CircuitBreaker:
         self._state     = CircuitState.CLOSED
         self._last_opened = None
         logger.info(f"[CB:{self._name}] reset forțat → CLOSED")
+
+    def is_open(self) -> bool:
+        """Check if the circuit is currently OPEN. Note: does not transition to HALF_OPEN (use is_available for checking connectivity state)."""
+        return self._state == CircuitState.OPEN

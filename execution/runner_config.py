@@ -66,6 +66,9 @@ class BybitLiveRunnerConfig:
     # Checkpoint
     checkpoint_path: str = os.getenv("CHECKPOINT_PATH", "state/position_checkpoint.db")
 
+    # Venue / Exchange name
+    venue: str = "bybit"
+
     def __post_init__(self) -> None:
         """Validate all config values at construction time.
 

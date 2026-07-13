@@ -49,6 +49,10 @@ class WatchdogConfig:
     check_interval_s: float = 2.0   # polling interval pentru health check
 
 
+# Alias for backward compatibility
+WsWatchdogConfig = WatchdogConfig
+
+
 class WsWatchdog:
     """
     Monitorizare health WebSocket.

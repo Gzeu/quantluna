@@ -5,11 +5,13 @@
 import type { NextPage } from 'next';
 import Head             from 'next/head';
 import NavBar           from '../components/NavBar';
-import { StatsBar }      from '../components/StatsBar';
-import { MetricsBadge }  from '../components/MetricsBadge';
-import { BalanceTracker } from '../components/BalanceTracker';
-import { PnlChart }      from '../components/PnlChart';
-import { TradeBreakdown } from '../components/TradeBreakdown';
+import {
+  StatsBar,
+  MetricsBadge,
+  BalanceTracker,
+  PnlChart,
+  TradeBreakdown
+} from '../components';
 
 const PortfolioPage: NextPage = () => (
   <>

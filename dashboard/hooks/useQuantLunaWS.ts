@@ -252,10 +252,10 @@ export function useQuantLunaWS() {
     connect('regime', `${WS_BASE}/ws/regime`)
     connect('orders', `${WS_BASE}/ws/orders`)
 
-    // Simulation @ 4Hz
-    simRef.current = setInterval(() => {
-      if (!isPaused()) simulateTick()
-    }, 250)
+    // Simulation @ 4Hz (DISABLED to show real backend/exchange data)
+    // simRef.current = setInterval(() => {
+    //   if (!isPaused()) simulateTick()
+    // }, 250)
 
     // REST polling — prefer real backend data
     pollRef.current = setInterval(async () => {
