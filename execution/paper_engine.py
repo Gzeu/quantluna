@@ -41,6 +41,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from execution.paper_order import OrderSide, OrderStatus, OrderType, PaperOrder
+from core.position_store import PositionStore
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,7 @@ class PaperTradingEngine:
 
             if order.status == OrderStatus.FILLED:
                 self._update_position(order)
+                self._save_positions()
                 self._record_equity()
 
         logger.info(f"[PAPER] {order.side.value.upper()} {order.qty} {order.symbol} "
@@ -197,6 +199,7 @@ class PaperTradingEngine:
             "closed_at":   datetime.now(timezone.utc).isoformat(),
         }
         self._trades.append(trade)
+        self._save_positions()
         self._record_equity()
 
         logger.info(f"[PAPER CLOSE] {symbol} pnl={net_pnl:+.4f} USDT | reason={reason}")
@@ -228,6 +231,42 @@ class PaperTradingEngine:
     def equity_curve(self) -> List[dict]:
         return self._equity_curve
 
+    def _load_positions(self) -> None:
+        """Load previously saved positions from store."""
+        if not self._store:
+            return
+        data = self._store.load_positions()
+        for symbol, pos_dict in data.items():
+            try:
+                side = OrderSide(pos_dict.get("side", "buy"))
+                qty = pos_dict.get("qty", 0.0)
+                entry_price = pos_dict.get("entry_price", 0.0)
+                pair = pos_dict.get("pair", "")
+                if qty > 0 and entry_price > 0:
+                    pos = Position(symbol, side, qty, entry_price, pair)
+                    pos.realised_pnl = pos_dict.get("realised_pnl", 0.0)
+                    self._positions[symbol] = pos
+                    logger.info(f"[PAPER] Restored position: {symbol} {side.value} {qty} @ {entry_price}")
+            except Exception as exc:
+                logger.warning(f"[PAPER] Failed to restore position {symbol}: {exc}")
+
+    def _save_positions(self) -> None:
+        """Save current positions to store."""
+        if not self._store:
+            return
+        serializable = {}
+        for symbol, pos in self._positions.items():
+            serializable[symbol] = {
+                "symbol": pos.symbol,
+                "side": pos.side.value,
+                "qty": pos.qty,
+                "entry_price": pos.entry_price,
+                "pair": pos.pair,
+                "realised_pnl": pos.realised_pnl,
+                "opened_at": pos.opened_at.isoformat(),
+            }
+        self._store.save_positions(serializable)
+
     def reset(self) -> None:
         """Reset complet la starea initiala."""
         self._equity        = self.initial_capital
@@ -239,6 +278,8 @@ class PaperTradingEngine:
         self._equity_curve  = [
             {"ts": datetime.now(timezone.utc).isoformat(), "equity": self.initial_capital, "pnl": 0.0}
         ]
+        if self._store:
+            self._store.clear()
         logger.info("[PAPER] Engine reset.")
 
     # ------------------------------------------------------------------
@@ -311,14 +352,17 @@ class PaperTradingEngine:
                         "closed_at":   datetime.now(timezone.utc).isoformat(),
                     })
                     del self._positions[sym]
+                    self._save_positions()
                 else:
                     pos.qty -= order.filled_qty
+                    self._save_positions()
         else:
             self._positions[sym] = Position(
                 symbol=sym, side=order.side,
                 qty=order.filled_qty, entry_price=order.avg_fill_price,
                 pair=order.pair,
             )
+            self._save_positions()
         # Scade comision din equity
         self._equity -= order.commission
 

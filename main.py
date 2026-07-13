@@ -272,6 +272,11 @@ async def main() -> int:
     _configure_logging(args.log_level)
 
     from execution.bybit_live_runner import BybitLiveRunnerConfig
+    from core.position_store import PositionStore
+
+    # Initialize position store for persistence
+    position_store = PositionStore()
+
     try:
         cfg = BybitLiveRunnerConfig.from_env()
     except ValueError as exc:

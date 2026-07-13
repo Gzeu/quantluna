@@ -31,8 +31,10 @@ def get_engine() -> PaperTradingEngine:
     global _engine
     if _engine is None:
         import os
+        from core.position_store import PositionStore
         capital = float(os.getenv("INITIAL_CAPITAL_USD", "10000"))
-        _engine = PaperTradingEngine(initial_capital=capital)
+        store = PositionStore()
+        _engine = PaperTradingEngine(initial_capital=capital, store=store)
     return _engine
 
 
