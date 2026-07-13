@@ -96,11 +96,13 @@ class PaperTradingEngine:
         taker_commission: float = _TAKER_COMMISSION,
         max_slippage_bps: float = _SLIPPAGE_BPS_MAX,
         simulate_latency: bool  = True,
+        store: Optional[PositionStore] = None,
     ) -> None:
         self.initial_capital  = initial_capital
         self.taker_commission = taker_commission
         self.max_slippage_bps = max_slippage_bps
         self.simulate_latency = simulate_latency
+        self._store = store
 
         self._equity:     float = initial_capital
         self._realised_pnl: float = 0.0
@@ -112,6 +114,10 @@ class PaperTradingEngine:
         ]
         self._lock = asyncio.Lock()
         self._order_counter = 0
+
+        # Load persisted positions on startup
+        if self._store:
+            self._load_positions()
 
     # ------------------------------------------------------------------
     # Public API
