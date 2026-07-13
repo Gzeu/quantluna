@@ -351,6 +351,36 @@ class BybitOrderRouter:
 
     async def get_open_positions(self, symbol: Optional[str] = None) -> list[dict]:
         if self.mode != "live":
+            # Return simulated positions for paper/dry mode
+            if self.mode == "paper":
+                # Check if we have any simulated positions stored
+                try:
+                    from core.position_store import PositionStore
+                    store = PositionStore()
+                    # Try Bybit-specific positions first
+                    data = store.load_bybit_positions()
+                    if data:
+                        if symbol:
+                            return [p for p in data if p.get("symbol") == symbol.upper()]
+                        return data
+                    # Fallback to generic positions
+                    data = store.load_positions()
+                    if data:
+                        positions = []
+                        for sym, pos_dict in data.items():
+                            if symbol and sym != symbol.upper():
+                                continue
+                            positions.append({
+                                "symbol":        sym,
+                                "side":          pos_dict.get("side", "Buy").capitalize(),
+                                "size":          float(pos_dict.get("qty", 0)),
+                                "entryPrice":    float(pos_dict.get("entry_price", 0)),
+                                "unrealisedPnl": float(pos_dict.get("unrealised_pnl", 0)),
+                                "leverage":      1.0,
+                            })
+                        return positions
+                except Exception:
+                    pass
             return []
         try:
             params = {"category": self.category}

@@ -25,10 +25,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from pydantic import BaseModel
 
-from execution.multi_pair_manager import MultiPairManager, PairConfig
+from execution.multi_pair_manager import MultiPairManager, PairConfig, PairState
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/pairs", tags=["pairs"])
@@ -241,6 +241,36 @@ def pair_status(pair_id: str):
     if not ps:
         raise HTTPException(status_code=404, detail=f"Pair '{pair_id}' not found")
     return ps.to_dict()
+
+
+@router.get("/positions")
+async def get_positions(
+    symbol: Optional[str] = Query(None, description="Filtreaza dupa simbol")
+):
+    """
+    GET /pairs/positions
+
+    Returneaza pozitiile curente de pe Bybit (sau din paper store).
+    """
+    mgr = get_manager()
+    # Try to get order_router from the first running pair
+    order_router = None
+    for pid, ps in mgr._pairs.items():
+        if ps.state == PairState.RUNNING:
+            order_router = ps.config.extra_kwargs.get("order_router")
+            if order_router:
+                break
+
+    if not order_router:
+        # Fallback: create a temporary router
+        from execution.bybit_order_router import BybitOrderRouter
+        order_router = BybitOrderRouter()
+
+    try:
+        positions = await order_router.get_open_positions(symbol=symbol)
+        return {"positions": positions, "count": len(positions)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch positions: {e}")
 
 
 # ---------------------------------------------------------------------------

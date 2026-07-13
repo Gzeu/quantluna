@@ -371,9 +371,47 @@ class MultiPairManager:
         if self._risk_engine:
             self._risk_engine.update_exposure(pid, ps.config.alloc_usd)
 
+        # Initialize position fetcher if available
+        order_router = ps.config.extra_kwargs.get("order_router")
+        symbols = [ps.config.sym_y, ps.config.sym_x]
+
         try:
             while True:
                 await asyncio.sleep(1.0)  # tick every 1s (replaced by WS event in real usage)
+
+                # Fetch current positions from Bybit
+                if order_router:
+                    try:
+                        positions = await order_router.get_open_positions()
+                        # Update pair status with position info
+                        for pos in positions:
+                            sym = pos.get("symbol", "")
+                            if sym in symbols:
+                                side = pos.get("side", "").lower()
+                                size = float(pos.get("size", 0))
+                                entry = float(pos.get("entryPrice", 0))
+                                upnl = float(pos.get("unrealisedPnl", 0))
+                                logger.debug(
+                                    f"[{pid}] Position: {sym} {side} {size} @ {entry} "
+                                    f"uPnL={upnl:+.4f}"
+                                )
+                                # Update risk engine with position data
+                                if self._risk_engine:
+                                    try:
+                                        self._risk_engine.update_position(
+                                            pair_id=pid,
+                                            symbol=sym,
+                                            side=side,
+                                            size=size,
+                                            entry_price=entry,
+                                            unrealised_pnl=upnl,
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            f"[{pid}] Failed to update risk engine: {e}"
+                                        )
+                    except Exception as e:
+                        logger.warning(f"[{pid}] Failed to fetch positions: {e}")
 
                 # Drawdown check
                 if self._risk_engine:

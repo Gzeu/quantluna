@@ -147,6 +147,69 @@ class SingleHedgeManager:
                 trailing_low=group.short_leg.mark_price or group.short_leg.entry_price,
             )
 
+        # Fetch current positions from Bybit to verify state
+        self._verify_positions_task = None
+
+    async def _verify_positions(self) -> None:
+        """Fetch current positions from Bybit and verify they match our state."""
+        try:
+            positions = await self._router.get_open_positions(symbol=self._symbol)
+            if not positions:
+                logger.warning(
+                    "SingleHedgeManager [%s]: No positions found on Bybit for symbol",
+                    self._symbol,
+                )
+                return
+
+            for pos in positions:
+                side = pos.get("side", "").lower()
+                size = float(pos.get("size", 0))
+                entry = float(pos.get("entryPrice", 0))
+                upnl = float(pos.get("unrealisedPnl", 0))
+
+                if side == "long" and self._long_state:
+                    self._long_state.current_price = entry
+                    self._long_state.trailing_high = max(
+                        self._long_state.trailing_high, entry
+                    )
+                    logger.info(
+                        "SingleHedgeManager [%s]: Verified LONG position: "
+                        "size=%s entry=%.4f uPnL=%+.4f",
+                        self._symbol, size, entry, upnl,
+                    )
+                elif side == "short" and self._short_state:
+                    self._short_state.current_price = entry
+                    self._short_state.trailing_low = min(
+                        self._short_state.trailing_low, entry
+                    )
+                    logger.info(
+                        "SingleHedgeManager [%s]: Verified SHORT position: "
+                        "size=%s entry=%.4f uPnL=%+.4f",
+                        self._symbol, size, entry, upnl,
+                    )
+
+                # Register position on StateBus
+                try:
+                    from core.state_bus import bus
+                    bus.add_bybit_position(
+                        symbol=self._symbol,
+                        side=side,
+                        size=size,
+                        entry_price=entry,
+                        unrealised_pnl=upnl,
+                        pair_id=self._symbol,
+                    )
+                except Exception as exc:
+                    logger.debug(
+                        "SingleHedgeManager [%s]: Failed to register position on bus: %s",
+                        self._symbol, exc,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "SingleHedgeManager [%s]: Position verification failed: %s",
+                self._symbol, exc,
+            )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -157,10 +220,14 @@ class SingleHedgeManager:
         sau pana cand stop() e apelat.
 
         Secventa:
-          1. Notificare Telegram: adoptie + stare initiala
-          2. Aplica SL/TP initial daca e configurat
-          3. Loop principal: poll pret -> trailing SL -> check SL/TP -> PnL report
+          1. Verifica pozitiile pe Bybit
+          2. Notificare Telegram: adoptie + stare initiala
+          3. Aplica SL/TP initial daca e configurat
+          4. Loop principal: poll pret -> trailing SL -> check SL/TP -> PnL report
         """
+        # Verify positions on Bybit first
+        await self._verify_positions()
+
         logger.info(
             "SingleHedgeManager [%s]: pornit | %s",
             self._symbol, self._group,
@@ -437,6 +504,7 @@ class SingleHedgeManager:
     async def _fetch_mark_price(self) -> Optional[float]:
         """Citeste mark price curent pt symbol via order_router REST."""
         try:
+            # Try get_mark_price first
             if hasattr(self._router, "get_mark_price"):
                 raw = await self._router.get_mark_price(
                     symbol=self._symbol, category=self._cfg.category
@@ -457,6 +525,15 @@ class SingleHedgeManager:
                 )
                 if price > 0:
                     return price
+
+            # Fallback: get_open_positions (for paper/dry mode)
+            if hasattr(self._router, "get_open_positions"):
+                positions = await self._router.get_open_positions(symbol=self._symbol)
+                if positions:
+                    # Use entry price as fallback
+                    price = float(positions[0].get("entryPrice", 0))
+                    if price > 0:
+                        return price
         except Exception as exc:
             logger.debug(
                 "SingleHedgeManager [%s] fetch_mark_price failed: %s",

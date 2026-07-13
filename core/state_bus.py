@@ -48,6 +48,41 @@ class Position:
     hedge_ratio: float = 1.0
     notional_usdt: float = 0.0
 
+    @classmethod
+    def from_bybit_position(
+        cls,
+        symbol: str,
+        side: str,
+        size: float,
+        entry_price: float,
+        unrealised_pnl: float = 0.0,
+        pair_id: str = "",
+    ) -> "Position":
+        """
+        Creeaza un obiect Position dintr-o pozitie Bybit.
+
+        Args:
+            symbol: simbolul Bybit (ex: "BTCUSDT")
+            side:   "Buy" | "Sell" (Bybit API)
+            size:   cantitatea
+            entry_price: pretul mediu de intrare
+            unrealised_pnl: PnL nerealizat
+            pair_id: ID pereche (ex: "BTCUSDT-ETHUSDT")
+
+        Returns:
+            Position
+        """
+        direction = "LONG" if side.lower() in ("buy", "long") else "SHORT"
+        return cls(
+            pair=pair_id or symbol,
+            direction=direction,
+            qty_y=size,
+            qty_x=0.0,
+            entry_price_y=entry_price,
+            entry_price_x=0.0,
+            notional_usdt=size * entry_price,
+        )
+
 
 class StateBus:
     """
@@ -126,6 +161,36 @@ class StateBus:
         """Register an open position."""
         self._positions.append(pos)
         logger.debug("StateBus: position added %s %s", pos.pair, pos.direction)
+
+    def add_bybit_position(
+        self,
+        symbol: str,
+        side: str,
+        size: float,
+        entry_price: float,
+        unrealised_pnl: float = 0.0,
+        pair_id: str = "",
+    ) -> None:
+        """
+        Register a position from Bybit data.
+
+        Args:
+            symbol: Bybit symbol (ex: "BTCUSDT")
+            side:   "Buy" | "Sell"
+            size:   quantity
+            entry_price: average entry price
+            unrealised_pnl: unrealised PnL
+            pair_id: optional pair ID for multi-pair trading
+        """
+        pos = Position.from_bybit_position(
+            symbol=symbol,
+            side=side,
+            size=size,
+            entry_price=entry_price,
+            unrealised_pnl=unrealised_pnl,
+            pair_id=pair_id,
+        )
+        self.add_position(pos)
 
     def remove_position(self, pair: str) -> None:
         """Remove position for pair (on close)."""

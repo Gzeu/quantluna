@@ -56,3 +56,49 @@ class PositionStore:
         """Delete all saved positions."""
         self._store.delete("open_positions")
         logger.info("PositionStore: cleared all positions")
+
+    def save_bybit_positions(self, positions: list[dict]) -> None:
+        """
+        Save positions fetched from Bybit API.
+
+        Args:
+            positions: list of dicts from get_open_positions()
+        """
+        serializable = {}
+        for pos in positions:
+            symbol = pos.get("symbol", "")
+            if not symbol:
+                continue
+            serializable[symbol] = {
+                "symbol":        symbol,
+                "side":          pos.get("side", ""),
+                "size":          float(pos.get("size", 0)),
+                "entry_price":   float(pos.get("entryPrice", 0)),
+                "unrealised_pnl": float(pos.get("unrealisedPnl", 0)),
+                "leverage":      float(pos.get("leverage", 1)),
+            }
+        self._store.set("bybit_positions", serializable)
+        logger.info(f"PositionStore: saved {len(serializable)} Bybit positions")
+
+    def load_bybit_positions(self) -> list[dict]:
+        """
+        Load previously saved Bybit positions.
+
+        Returns:
+            list of dicts compatible with get_open_positions() format
+        """
+        data = self._store.get("bybit_positions")
+        if data is None:
+            return []
+        positions = []
+        for symbol, pos_dict in data.items():
+            positions.append({
+                "symbol":        symbol,
+                "side":          pos_dict.get("side", ""),
+                "size":          float(pos_dict.get("size", 0)),
+                "entryPrice":    float(pos_dict.get("entry_price", 0)),
+                "unrealisedPnl": float(pos_dict.get("unrealised_pnl", 0)),
+                "leverage":      float(pos_dict.get("leverage", 1)),
+            })
+        logger.info(f"PositionStore: loaded {len(positions)} Bybit positions")
+        return positions

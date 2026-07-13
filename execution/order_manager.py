@@ -191,6 +191,8 @@ class OrderManager:
         x_qty: float,
         y_entry_price: float,
         x_entry_price: float,
+        y_unrealised_pnl: float = 0.0,
+        x_unrealised_pnl: float = 0.0,
     ) -> None:
         """
         Sprint 21: Adopta o pozitie externa detectata la startup.
@@ -207,6 +209,8 @@ class OrderManager:
         y_qty, x_qty       : cantitate absoluta per leg
         y_entry_price,
         x_entry_price      : pretul mediu de intrare per leg
+        y_unrealised_pnl,
+        x_unrealised_pnl   : PnL nerealizat per leg (optional)
         """
 
         class _AdoptedPos:
@@ -220,7 +224,9 @@ class OrderManager:
         pos.x_qty  = x_qty
         pos.y_entry = y_entry_price
         pos.x_entry = x_entry_price
-        pos.pnl     = 0.0
+        pos.pnl     = y_unrealised_pnl + x_unrealised_pnl
+        pos.y_unrealised_pnl = y_unrealised_pnl
+        pos.x_unrealised_pnl = x_unrealised_pnl
 
         self.current_position = pos
         self._adopted = True
@@ -228,8 +234,10 @@ class OrderManager:
 
         logger.info(
             f"OrderManager: pozitie adoptata — "
-            f"{symbol_y} {y_side} {y_qty:.6f} @ {y_entry_price:.4f} | "
-            f"{symbol_x} {x_side} {x_qty:.6f} @ {x_entry_price:.4f}"
+            f"{symbol_y} {y_side} {y_qty:.6f} @ {y_entry_price:.4f} "
+            f"(uPnL={y_unrealised_pnl:+.4f}) | "
+            f"{symbol_x} {x_side} {x_qty:.6f} @ {x_entry_price:.4f} "
+            f"(uPnL={x_unrealised_pnl:+.4f})"
         )
 
     def release_adopted_position(self) -> None:

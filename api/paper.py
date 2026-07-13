@@ -71,7 +71,7 @@ async def submit_order(req: OrderRequest):
 
 
 @router.get("/positions")
-def get_positions(
+async def get_positions(
     symbol: Optional[str] = Query(None, description="Filtreaza dupa simbol")
 ):
     """
@@ -83,6 +83,25 @@ def get_positions(
     if symbol:
         positions = [p for p in positions if p["symbol"] == symbol.upper()]
     return {"positions": positions, "count": len(positions)}
+
+
+@router.get("/bybit-positions")
+async def get_bybit_positions(
+    symbol: Optional[str] = Query(None, description="Filtreaza dupa simbol")
+):
+    """
+    GET /paper/bybit-positions
+
+    Returneaza pozitiile curente de pe Bybit (sau din paper store).
+    """
+    try:
+        from execution.bybit_order_router import BybitOrderRouter
+        router = BybitOrderRouter()
+        positions = await router.get_open_positions(symbol=symbol)
+        return {"positions": positions, "count": len(positions)}
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=f"Failed to fetch Bybit positions: {e}")
 
 
 @router.get("/trades")

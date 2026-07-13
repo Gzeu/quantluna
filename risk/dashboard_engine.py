@@ -18,11 +18,14 @@ Usage:
 """
 from __future__ import annotations
 
+import logging
 import math
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -244,6 +247,48 @@ class RiskDashboardEngine:
     def update_unrealized(self, unrealized_pnl: float) -> None:
         """Seteaza PnL nerealizat total (pozitii deschise)."""
         self._unrealized_pnl = unrealized_pnl
+
+    def update_position(
+        self,
+        pair_id: str,
+        symbol: str,
+        side: str,
+        size: float,
+        entry_price: float,
+        unrealised_pnl: float,
+    ) -> None:
+        """
+        Actualizeaza starea unei pozitii individuale (de pe Bybit).
+
+        Apelat periodic de MultiPairManager._run_pair() pentru a mentine
+        metricile per-pereche sincronizate cu pozitiile reale.
+
+        Args:
+            pair_id: ID pereche (ex: "BTCUSDT-ETHUSDT")
+            symbol:  simbolul individual (ex: "BTCUSDT")
+            side:    "Long" | "Short"
+            size:    cantitatea
+            entry_price: pretul mediu de intrare
+            unrealised_pnl: PnL nerealizat in USDT
+        """
+        # Actualizeaza expunerea per-pereche
+        notional = size * entry_price
+        self.update_exposure(pair_id, notional, active=(size > 0))
+
+        # Actualizeaza PnL nerealizat total
+        self._unrealized_pnl += unrealised_pnl
+
+        # Actualizeaza PairStats pentru perechea respectiva
+        ps = self._get_pair(pair_id)
+        ps.current_notional = notional
+        ps.active = (size > 0)
+        ps.last_update = time.time()
+
+        logger.debug(
+            "RiskDashboardEngine.update_position: pair=%s symbol=%s side=%s "
+            "size=%.4f entry=%.4f uPnL=%+.4f",
+            pair_id, symbol, side, size, entry_price, unrealised_pnl,
+        )
 
     # ------------------------------------------------------------------
     # Computed metrics

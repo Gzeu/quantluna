@@ -244,13 +244,18 @@ class PaperTradingEngine:
         data = self._store.load_positions()
         for symbol, pos_dict in data.items():
             try:
-                side = OrderSide(pos_dict.get("side", "buy"))
-                qty = pos_dict.get("qty", 0.0)
-                entry_price = pos_dict.get("entry_price", 0.0)
-                pair = pos_dict.get("pair", "")
+                side_str = pos_dict.get("side", "buy")
+                # Handle both string and enum values
+                if isinstance(side_str, str):
+                    side = OrderSide(side_str.lower())
+                else:
+                    side = side_str
+                qty = float(pos_dict.get("qty", 0.0))
+                entry_price = float(pos_dict.get("entry_price", 0.0))
+                pair = str(pos_dict.get("pair", ""))
                 if qty > 0 and entry_price > 0:
                     pos = Position(symbol, side, qty, entry_price, pair)
-                    pos.realised_pnl = pos_dict.get("realised_pnl", 0.0)
+                    pos.realised_pnl = float(pos_dict.get("realised_pnl", 0.0))
                     self._positions[symbol] = pos
                     logger.info(f"[PAPER] Restored position: {symbol} {side.value} {qty} @ {entry_price}")
             except Exception as exc:
