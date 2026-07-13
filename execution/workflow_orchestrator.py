@@ -93,7 +93,7 @@ class WorkflowOrchestrator:
     def __init__(self, exchange=None, checkpoint_path="state/position_checkpoint.db",
                  notifier_bus=None, adoption_config=None, min_notional=1.0,
                  runner=None, runner_cfg=None, private_ws=None, ws_feed=None,
-                 skip_health_check=False) -> None:
+                 skip_health_check=False, position_store=None) -> None:
         self._exchange = exchange
         self._checkpoint_path = checkpoint_path
         self._bus = notifier_bus
@@ -104,14 +104,17 @@ class WorkflowOrchestrator:
         self._private_ws = private_ws
         self._ws_feed = ws_feed
         self._skip_health = skip_health_check
+        self._position_store = position_store
 
     @classmethod
     def from_runner_cfg(cls, cfg, notifier_bus=None, ws_feed=None,
-                        private_ws=None, skip_health_check=False):
+                        private_ws=None, skip_health_check=False,
+                        position_store=None):
         return cls(
             exchange=None, checkpoint_path=cfg.checkpoint_path,
             notifier_bus=notifier_bus, runner_cfg=cfg, ws_feed=ws_feed,
             private_ws=private_ws, skip_health_check=skip_health_check,
+            position_store=position_store,
         )
 
     async def run_startup_workflow(self) -> StartupContext:
@@ -146,6 +149,13 @@ class WorkflowOrchestrator:
             scanner = PositionScanner(self._exchange, cp, self._min_notional)
             ctx.scan_report = await scanner.scan()
             logger.info("[Orchestrator] {}", ctx.scan_report.summary())
+
+            # Salvează pozițiile scanate în PositionStore pentru persistență
+            # (folosit de BybitOrderRouter în paper mode la get_open_positions)
+            if self._position_store is not None:
+                raw_positions = await self._exchange.fetch_positions() if hasattr(self._exchange, 'fetch_positions') else []
+                self._position_store.save_bybit_positions(raw_positions)
+                logger.info("Orchestrator] Salvat {} poziții în PositionStore", len(raw_positions))
         except Exception as exc:
             logger.error("[Orchestrator] Scan failed: {} — skip", exc)
 
@@ -180,6 +190,16 @@ class WorkflowOrchestrator:
                 temp_report = ScanReport(orphans=ctx.scan_report.orphans)
                 ctx.adoption_results = await adoption.process_report(temp_report)
                 logger.info("[Orchestrator] Adoptie: {} adoptate, {} inchise", ctx.adopted_count, ctx.closed_count)
+
+                # Persistă pozițiile adoptate în PositionStore
+                if self._position_store is not None:
+                    # Re-fetch current positions to get latest state
+                    try:
+                        raw = await self._exchange.fetch_positions()
+                        self._position_store.save_bybit_positions(raw)
+                        logger.info("[Orchestrator] PositionStore actualizat după adopție")
+                    except Exception as e:
+                        logger.warning("[Orchestrator] PositionStore update după adopție failed: {}", e)
             except Exception as exc:
                 logger.error("[Orchestrator] Adoptie failed: {}", exc)
         else:
@@ -271,10 +291,22 @@ class WorkflowOrchestrator:
     async def _build_shared_exchange(self):
         try:
             from execution.exchange_factory import get_order_router
-            return get_order_router(
-                exchange=getattr(self._runner_cfg, "venue", "bybit") if self._runner_cfg else "bybit",
-                mode="paper" if getattr(self._runner_cfg, "dry_run", True) else "live",
+            cfg = self._runner_cfg
+            is_live = cfg is not None and not cfg.dry_run and bool(cfg.api_key and cfg.api_secret)
+            mode = "live" if is_live else "paper"
+            logger.info("[Orchestrator] Construiesc exchange: mode={}", mode)
+            router = get_order_router(
+                exchange=getattr(cfg, "venue", "bybit") if cfg else "bybit",
+                mode=mode,
+                api_key=getattr(cfg, "api_key", "") if cfg else "",
+                api_secret=getattr(cfg, "api_secret", "") if cfg else "",
+                testnet=getattr(cfg, "testnet", False) if cfg else False,
+                dry_run=not is_live,
             )
+            # Pre-warm connection for live mode
+            if is_live and hasattr(router, "connect"):
+                await router.connect()
+            return router
         except Exception as exc:
             logger.warning("[Orchestrator] get_order_router failed: {}", exc)
             return None

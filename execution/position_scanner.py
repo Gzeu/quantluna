@@ -22,7 +22,7 @@ from loguru import logger
 
 @dataclass
 class ExchangePosition:
-    Parsed representation of a single exchange position.
+    """Parsed representation of a single exchange position."""
     symbol: str
     side: str
     qty: float
@@ -36,14 +36,14 @@ class ExchangePosition:
 
     @property
     def pnl_pct(self) -> float:
-        Unrealised PnL as fraction of notional.
+        """Unrealised PnL as fraction of notional."""
         if self.notional_usdt == 0:
             return 0.0
         return self.unrealized_pnl / self.notional_usdt
 
     @property
     def distance_to_liq_pct(self) -> float:
-        Distance from current mark price to liquidation price as fraction.
+        """Distance from current mark price to liquidation price as fraction."""
         if self.mark_price == 0:
             return 1.0
         if self.side == "long":
@@ -54,7 +54,7 @@ class ExchangePosition:
 
 @dataclass
 class ScanReport:
-    Result of a single position scan.
+    """Result of a single position scan."""
     managed: List[ExchangePosition] = field(default_factory=list)
     orphans: List[ExchangePosition] = field(default_factory=list)
     scan_error: Optional[str] = None
@@ -64,26 +64,53 @@ class ScanReport:
         return len(self.orphans) > 0
 
     def summary(self) -> str:
-        Return a summary string of the scan report.
+        """Return a summary string of the scan report."""
         return f"managed={len(self.managed)} orphans={len(self.orphans)}"
 
 
 class PositionScanner:
-    Compares exchange positions against the local checkpoint to find orphans.
+    """Compares exchange positions against the local checkpoint to find orphans.
 
     Parameters
     ----------
     exchange   : async CCXT exchange object (must have fetch_positions)
     checkpoint : checkpoint object with .load(symbol) method
     min_notional: minimum notional value to consider a position valid
+    """
 
     def __init__(self, exchange: Any, checkpoint: Any, min_notional: float = 0.0) -> None:
         self._exchange = exchange
         self._checkpoint = checkpoint
         self._min_notional = min_notional
 
+    @staticmethod
+    def _normalize_symbol(symbol: str) -> str:
+        """Normalizează un simbol la formatul de bază (ex: BTC/USDT:USDT → BTCUSDT)."""
+        return (
+            symbol.upper()
+            .replace("/USDT:USDT", "USDT")
+            .replace("/USDT", "USDT")
+            .replace("/", "")
+            .replace(":", "")
+        )
+
+    @staticmethod
+    def _build_known_symbols(cp_state) -> set:
+        """Construiește un set de simboluri cunoscute din checkpoint.
+        Suportă atât poziții pair (sym_y, sym_x) cât și single-leg."""
+        if cp_state is None:
+            return set()
+        symbols = {PositionScanner._normalize_symbol(cp_state.sym_y)}
+        if cp_state.sym_x and cp_state.sym_x != cp_state.sym_y:
+            symbols.add(PositionScanner._normalize_symbol(cp_state.sym_x))
+        # Suport pentru meta cu lista de simboluri (multi-pair)
+        meta_symbols = cp_state.meta.get("symbols", [])
+        for s in meta_symbols:
+            symbols.add(PositionScanner._normalize_symbol(s))
+        return symbols
+
     async def scan(self) -> ScanReport:
-        Fetch all open positions and classify each one.
+        """Fetch all open positions and classify each one."""
         report = ScanReport()
         try:
             raw_positions = await self._exchange.fetch_positions()
@@ -93,21 +120,23 @@ class PositionScanner:
             return report
 
         cp_state = self._checkpoint.load()
+        known_symbols = self._build_known_symbols(cp_state)
 
         for raw in raw_positions:
             pos = self._parse_position(raw)
             if pos is None:
                 continue
-            if cp_state is not None:
-                is_managed = (pos.symbol == cp_state.sym_y or pos.symbol == cp_state.sym_x)
-            else:
-                is_managed = False
+            norm_sym = self._normalize_symbol(pos.symbol)
+            is_managed = norm_sym in known_symbols
 
             if is_managed:
                 report.managed.append(pos)
             else:
                 report.orphans.append(pos)
-                logger.warning(f"PositionScanner: ORPHAN detected: {pos.symbol} side={pos.side} qty={pos.qty}")
+                logger.warning(
+                    f"PositionScanner: ORPHAN detected: {pos.symbol} "
+                    f"side={pos.side} qty={pos.qty}"
+                )
 
         logger.info(
             f"PositionScanner: managed={len(report.managed)} orphans={len(report.orphans)}"
@@ -115,7 +144,7 @@ class PositionScanner:
         return report
 
     def _parse_position(self, raw: Dict) -> Optional[ExchangePosition]:
-        Parse a raw CCXT position dict into ExchangePosition. Returns None if invalid.
+        """Parse a raw CCXT position dict into ExchangePosition. Returns None if invalid."""
         try:
             qty = float(raw.get("contracts") or raw.get("size") or 0)
             if qty == 0:

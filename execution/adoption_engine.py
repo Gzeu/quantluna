@@ -153,13 +153,12 @@ class AdoptionEngine:
 
         # 4. ADOPT — calculate exits, save checkpoint, place TP/SL
         tp, sl, trail = self._calculate_exits(pos)
-        self._checkpoint.save_open(
+        self._checkpoint.save_open_single(
             symbol=pos.symbol,
             side=pos.side,
             qty=pos.qty,
             entry_price=pos.entry_price,
-            tp_price=tp,
-            sl_price=sl,
+            notional_usdt=pos.notional_usdt,
         )
         logger.info(
             f"AdoptionEngine: ADOPT {pos.symbol} side={pos.side} "
@@ -218,17 +217,21 @@ class AdoptionEngine:
             "notional_usdt",
             position.get("qty", 0.0) * position.get("entry_price", 0.0),
         )
+        qty_f = float(position["qty"])
+        entry_f = float(position["entry_price"])
         pos = ExchangePosition(
             symbol=position["symbol"],
             side=position["side"],
-            qty=float(position["qty"]),
-            entry_price=float(position["entry_price"]),
+            qty=qty_f,
+            entry_price=entry_f,
+            mark_price=float(position.get("mark_price", entry_f)),
+            unrealized_pnl=float(position.get("unrealized_pnl", 0.0)),
+            leverage=float(position.get("leverage", 1)),
             notional_usdt=float(notional),
-            pnl_pct=float(position.get("pnl_pct", 0.0)),
-            distance_to_liq_pct=float(position.get("distance_to_liq_pct", 1.0)),
-            venue=venue,
+            liquidation_price=float(position.get("liquidation_price", 0.0)),
+            margin_used=float(position.get("margin_used", 0.0)),
         )
-        # Temporarily attach venue to position so _place_protection_orders can use it
+        # Attach venue to position so _place_protection_orders can use it
         pos._venue = venue  # type: ignore[attr-defined]
         return await self._process_one(pos)
 

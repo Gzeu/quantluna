@@ -85,7 +85,7 @@ class PositionCheckpoint:
         notional_usdt: float,
         meta: Optional[dict] = None,
     ) -> None:
-        """Apelat imediat după confirmare fill de intrare."""
+        """Apelat imediat după confirmare fill de intrare pentru poziții pair."""
         state = PositionState(
             sym_y=sym_y, sym_x=sym_x,
             side_y=side_y, side_x=side_x,
@@ -109,6 +109,45 @@ class PositionCheckpoint:
             logger.info(f"[Checkpoint] OPEN saved: {sym_y}/{sym_x} {side_y} qty={qty_y:.4f}")
         except Exception as exc:
             logger.error(f"[Checkpoint] save_open failed: {exc}")
+
+    @staticmethod
+    def normalize_symbol(symbol: str) -> str:
+        """Normalizează un simbol la formatul de bază (ex: BTC/USDT:USDT → BTCUSDT).
+
+        Utilitar partajat între PositionScanner, ResumeManager și AdoptionEngine.
+        """
+        return (
+            symbol.upper()
+            .replace("/USDT:USDT", "USDT")
+            .replace("/USDT", "USDT")
+            .replace("/", "")
+            .replace(":", "")
+        )
+
+    def save_open_single(
+        self,
+        symbol: str,
+        side: str,
+        qty: float,
+        entry_price: float,
+        notional_usdt: float = 0.0,
+        meta: Optional[dict] = None,
+    ) -> None:
+        """Salvează o poziție deschisă pe un singur simbol (folosit de AdoptionEngine
+        pentru adoptarea pozițiilor orfane individuale).
+
+        Stochează același simbol în sym_y și sym_x, cu qty_x=0.
+        """
+        sym = self.normalize_symbol(symbol)
+        self.save_open(
+            sym_y=sym, sym_x=sym,
+            side_y=side, side_x="",
+            qty_y=qty, qty_x=0.0,
+            entry_price_y=entry_price, entry_price_x=0.0,
+            entry_zscore=0.0, hedge_ratio=1.0,
+            notional_usdt=notional_usdt,
+            meta={"single_leg": True, **(meta or {})},
+        )
 
     def save_closed(self) -> None:
         """Apelat după confirmare fill de ieşire."""

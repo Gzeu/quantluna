@@ -323,6 +323,7 @@ async def main() -> int:
         notifier_bus=notifier_bus,
         ws_feed=ws_feed,
         skip_health_check=args.skip_health,
+        position_store=position_store,
     )
 
     ctx = await orch.run_startup_workflow()

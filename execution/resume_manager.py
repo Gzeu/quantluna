@@ -54,6 +54,7 @@ class ReconcileResult:
 
 
 class ResumeManager:
+    """
     Reconciliaza starea checkpoint-ului cu pozitia reala de pe exchange
     la fiecare startup.
 
@@ -62,6 +63,7 @@ class ResumeManager:
         exchange:    ccxt async exchange instance (deja autentificat)
         alert_cfg:   AlertConfig pentru notificari (optional)
         qty_tolerance: toleranta relativa la compararea qty (default 5%)
+    """
 
     def __init__(
         self,
@@ -76,7 +78,7 @@ class ResumeManager:
         self._tol = qty_tolerance
 
     async def reconcile_on_startup(self) -> ReconcileResult:
-        Pasul principal de reconciliere la startup.
+        """Pasul principal de reconciliere la startup."""
         saved = self._cp.load()
 
         if saved is None:
@@ -148,7 +150,7 @@ class ResumeManager:
         cooldown_s: float = 10.0,
         alert_msg: Optional[str] = None,
     ) -> None:
-        Apelat de MarketTradeHandler sau AdoptionEngine cand detecteaza ca
+        """Apelat de MarketTradeHandler sau AdoptionEngine cand detecteaza ca
         o pozitie adoptata (sau monitorizata) s-a inchis extern.
 
         Pas:
@@ -160,10 +162,10 @@ class ResumeManager:
         Parameters
         ----------
         symbol           : simbolul pentru care se restarteaza ciclul
-        on_cycle_restart : corutina async(symbol: str) — callback de restart
+        on_cycle_restart : corutina async(symbol: str) - callback de restart
         cooldown_s       : secunde de asteptare inainte de restart (default 10)
         alert_msg        : mesaj custom pentru alerta (optional)
-
+        """
         msg = alert_msg or (
             f"[Resume] Pozitie {symbol} inchisa extern — "
             f"checkpoint curatat, restart ciclu in {cooldown_s}s"
@@ -187,14 +189,26 @@ class ResumeManager:
         except Exception as exc:
             logger.error(f"[Resume] restart_after_external_close: on_cycle_restart failed: {exc}")
 
+    @staticmethod
+    def _normalize_symbol(symbol: str) -> str:
+        """Normalizează un simbol la formatul de bază (ex: BTC/USDT:USDT → BTCUSDT)."""
+        return (
+            symbol.upper()
+            .replace("/USDT:USDT", "USDT")
+            .replace("/USDT", "USDT")
+            .replace("/", "")
+            .replace(":", "")
+        )
+
     async def _fetch_position(self, symbol: str) -> Optional[dict]:
-        Interogheaza pozitia curenta pentru un simbol de pe exchange.
+        """Interogheaza pozitia curenta pentru un simbol de pe exchange."""
         try:
+            norm_target = self._normalize_symbol(symbol)
             positions = await self._exchange.fetch_positions(symbol)
             for p in positions:
-                sym = p.get("symbol", "")
-                clean_symbol = symbol.replace("/USDT:USDT", "").upper()
-                if clean_symbol in sym.upper():
+                sym_raw = p.get("symbol", "")
+                sym_norm = self._normalize_symbol(sym_raw)
+                if sym_norm == norm_target:
                     return p
             return {"contracts": 0}
         except Exception as exc:

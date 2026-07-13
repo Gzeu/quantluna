@@ -131,7 +131,8 @@ class TestAdoptionEngine:
         assert result.decision == AdoptionDecision.ADOPT
         assert result.tp_price is not None
         assert result.sl_price is not None
-        mock_checkpoint.save_open.assert_called_once()
+        # save_open_single e metoda nouă, în loc de save_open
+        mock_checkpoint.save_open_single.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_close_when_loss_exceeds_threshold(self, mock_exchange, mock_checkpoint):
@@ -226,6 +227,7 @@ class TestProfitOptimizer:
         t = self._pos(entry=50000.0, qty=1.0)
         t.ladder = [(0.02, 0.25)]
         t.ladder_executed = 0
+        t.sl_moved_to_be = True  # BE deja executat — testăm doar ladder
         action = opt._evaluate(t, 51500.0)  # +3% > ladder 2%
         assert action.action_type == ActionType.PARTIAL_CLOSE
         assert action.close_qty == pytest.approx(1.0 * 0.25)
@@ -236,6 +238,7 @@ class TestProfitOptimizer:
         t = self._pos(entry=50000.0, trail=0.015)
         t.trailing_activation_pct = 0.02
         t.peak_price = 52000.0  # peak deja setat
+        t.sl_moved_to_be = True  # BE deja executat — testăm doar trailing
         action = opt._evaluate(t, 51200.0)  # < 52000 * (1-0.015) = 51220
         assert action.action_type == ActionType.FULL_CLOSE
         assert 'Trailing' in action.reason

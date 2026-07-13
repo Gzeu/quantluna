@@ -58,8 +58,9 @@ class PositionStore:
         return data
 
     def clear(self) -> None:
-        """Delete all saved positions."""
+        """Delete all saved positions (both generic and Bybit-specific)."""
         self._store.delete("open_positions")
+        self._store.delete("bybit_positions")
         logger.info("PositionStore: cleared all positions")
 
     def save_bybit_positions(self, positions: list[dict]) -> None:
