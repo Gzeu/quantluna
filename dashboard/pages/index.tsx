@@ -10,6 +10,7 @@ import {
   StatsBar,
   MetricsBadge,
   PnlChart,
+  DrawdownChart,
   TradeBreakdown,
   StrategyScores,
   WatchdogPanel,
@@ -64,6 +65,11 @@ const Dashboard: NextPage = () => (
       </section>
       <section>
         <WatchdogPanel />
+      </section>
+
+      {/* 2.5 — Drawdown chart span 2 */}
+      <section style={span2}>
+        <DrawdownChart />
       </section>
 
       {/* 3 — Spread Monitor + Arbitrage Panel */}

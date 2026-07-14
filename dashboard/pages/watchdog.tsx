@@ -8,6 +8,7 @@ import NavBar            from '../components/NavBar';
 import { StatsBar }      from '../components/StatsBar';
 import { MetricsBadge }  from '../components/MetricsBadge';
 import { WatchdogPanel } from '../components/WatchdogPanel';
+import { ThresholdEditor } from '../components/ThresholdEditor';
 
 const WatchdogPage: NextPage = () => (
   <>
@@ -27,6 +28,7 @@ const WatchdogPage: NextPage = () => (
     >
       <MetricsBadge />
       <WatchdogPanel fullPage />
+      <ThresholdEditor fullPage />
     </main>
   </>
 );

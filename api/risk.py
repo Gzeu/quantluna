@@ -104,6 +104,31 @@ async def risk_status() -> JSONResponse:
     })
 
 
+@router.get("/drawdown_history")
+async def drawdown_history(limit: int = 500) -> JSONResponse:
+    """Istoric drawdown pentru chart frontend (S38)."""
+    engine = get_risk_engine()
+    equity_curve = engine.equity_curve
+    
+    # Calculează drawdown history din equity curve
+    drawdown_history = []
+    peak_equity = engine.initial_capital
+    
+    for point in equity_curve[-limit:]:
+        equity = point["equity"]
+        if equity > peak_equity:
+            peak_equity = equity
+        dd = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0.0
+        drawdown_history.append({
+            "ts": point["ts"],
+            "drawdown": round(dd, 6),
+            "equity": round(equity, 4),
+            "peak": round(peak_equity, 4),
+        })
+    
+    return JSONResponse(content={"history": drawdown_history})
+
+
 @router.post("/reset-day")
 async def reset_day() -> JSONResponse:
     """Reseteaza daily PnL manual (ex: dupa rollover manual)."""

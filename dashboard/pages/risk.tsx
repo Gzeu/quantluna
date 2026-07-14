@@ -6,9 +6,7 @@
 import type { NextPage }    from 'next';
 import Head                 from 'next/head';
 import NavBar               from '../components/NavBar';
-import { StatsBar }         from '../components/StatsBar';
-import { MetricsBadge }     from '../components/MetricsBadge';
-import { TradeBreakdown }   from '../components/TradeBreakdown';
+import { StatsBar, MetricsBadge, DrawdownChart, TradeBreakdown } from '../components';
 import { Spinner }          from '../components/ui';
 import { useRiskMetrics }   from '../hooks/useRiskMetrics';
 
@@ -111,6 +109,9 @@ const RiskPage: NextPage = () => {
                 ))}
               </div>
             </div>
+
+            {/* Drawdown chart */}
+            <DrawdownChart />
 
             {/* Per-pair breakdown */}
             <TradeBreakdown />

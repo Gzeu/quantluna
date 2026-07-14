@@ -5,6 +5,8 @@ export { default as NavBar }          from './NavBar';
 export { StatsBar }                   from './StatsBar';
 export { MetricsBadge }               from './MetricsBadge';
 export { PnlChart }                   from './PnlChart';
+export { DrawdownChart }              from './DrawdownChart';
+export { ThresholdEditor }            from './ThresholdEditor';
 export { TradeBreakdown }             from './TradeBreakdown';
 export { StrategyScores }             from './StrategyScores';
 export { WatchdogPanel }              from './WatchdogPanel';

@@ -1,14 +1,20 @@
 /**
- * PnlChart.tsx — S37 polish
+ * PnlChart.tsx — S38 interactivity improvements
  * Migrat la design system: ql-card, ql-btn-ghost, CSS vars.
  * Skeleton shimmer in waiting state (in loc de text gri).
  * Sursa: store -> fallback SSE.
+ * 
+ * S38 improvements:
+ * - Brush zoom (zoom selectiv pe perioadă)
+ * - Pan (drag să deplasezi chart-ul)
+ * - Tooltip îmbunătățit cu mai multe informații
+ * - Data series toggle (equity, PnL, etc.)
  */
 'use client';
 import React, { useState, useMemo } from 'react';
 import {
   ComposedChart, Area, Bar, XAxis, YAxis, CartesianGrid,
-  Tooltip, ResponsiveContainer, ReferenceLine, Legend,
+  Tooltip, ResponsiveContainer, ReferenceLine, Legend, Brush,
 } from 'recharts';
 import { useQuantLunaStore } from '../store/quantlunaStore';
 import { usePnlStream }      from '../hooks/usePnlStream';
@@ -35,7 +41,7 @@ function exportCsv(data: PnlPoint[]) {
 /* Skeleton pentru waiting state */
 function ChartSkeleton({ connected }: { connected: boolean }) {
   return (
-    <div className="h-[260px] flex flex-col gap-3 pt-2">
+    <div className="h-[320px] flex flex-col gap-3 pt-2">
       {/* Y-axis mock */}
       <div className="flex gap-3 h-full">
         <div className="flex flex-col justify-between py-2" style={{ width: 56 }}>
@@ -83,9 +89,12 @@ export function PnlChart({ maxPoints = 200 }: Props) {
   const source               = storeHistory.length > 0 ? 'WS' : 'SSE';
 
   const [zoom, setZoom] = useState<number>(0);
+  const [brushData, setBrushData] = useState<PnlPoint[]>(rawData);
+  const [showPnl, setShowPnl] = useState<boolean>(true);
+  
   const visible = useMemo(
-    () => zoom > 0 ? rawData.slice(-zoom) : rawData,
-    [rawData, zoom]
+    () => zoom > 0 ? rawData.slice(-zoom) : (brushData.length > 0 ? brushData : rawData),
+    [rawData, zoom, brushData]
   );
   const firstEquity = visible[0]?.equity;
 
@@ -107,7 +116,10 @@ export function PnlChart({ maxPoints = 200 }: Props) {
             {ZOOM_OPTIONS.map((z, i) => (
               <button
                 key={z}
-                onClick={() => setZoom(z)}
+                onClick={() => {
+                  setZoom(z);
+                  if (z === 0) setBrushData([]);
+                }}
                 className={`ql-btn rounded-none border-0 px-2.5 py-1 text-xs transition-colors ${
                   zoom === z
                     ? 'bg-[var(--cyan-dim)] text-cyan-200'
@@ -118,6 +130,15 @@ export function PnlChart({ maxPoints = 200 }: Props) {
               </button>
             ))}
           </div>
+          {/* PnL toggle */}
+          <button
+            onClick={() => setShowPnl(!showPnl)}
+            className={`ql-btn ql-btn-ghost px-2 py-1 text-xs ${
+              showPnl ? 'bg-[var(--purple-dim)] text-purple-200' : ''
+            }`}
+          >
+            PnL
+          </button>
           <button
             onClick={() => exportCsv(visible)}
             disabled={visible.length === 0}
@@ -131,7 +152,7 @@ export function PnlChart({ maxPoints = 200 }: Props) {
       {visible.length === 0 ? (
         <ChartSkeleton connected={connected} />
       ) : (
-        <ResponsiveContainer width="100%" height={260}>
+        <ResponsiveContainer width="100%" height={320}>
           <ComposedChart
             data={visible}
             margin={{ top: 4, right: 16, left: 0, bottom: 0 }}
@@ -169,11 +190,22 @@ export function PnlChart({ maxPoints = 200 }: Props) {
                 borderRadius: 'var(--radius-sm)',
                 fontSize: 12,
               }}
-              labelFormatter={(v: number) => new Date(v).toLocaleTimeString()}
-              formatter={(v: number, name: string) => [
-                `$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
-                name === 'equity' ? 'Equity' : 'Net PnL',
-              ]}
+              labelFormatter={(v: number) => new Date(v).toLocaleString()}
+              formatter={(v: number, name: string, props: any) => {
+                if (name === 'equity') {
+                  const point = props.payload;
+                  const pnl = point.net_pnl ?? 0;
+                  return [
+                    `$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
+                    'Equity',
+                    `PnL: $${pnl.toFixed(2)}`,
+                  ];
+                }
+                return [
+                  `$${v.toLocaleString('en-US', { minimumFractionDigits: 2 })}`,
+                  'Net PnL',
+                ];
+              }}
             />
             <Legend
               wrapperStyle={{ fontSize: 11, color: 'var(--text-muted)', paddingTop: 8 }}
@@ -190,10 +222,25 @@ export function PnlChart({ maxPoints = 200 }: Props) {
               stroke="var(--cyan)" strokeWidth={2} fill="url(#pnlGrad)"
               dot={false} isAnimationActive={false}
             />
-            <Bar
-              yAxisId="pnl" dataKey="net_pnl"
-              fill="var(--purple)" opacity={0.45}
-              isAnimationActive={false} radius={[2,2,0,0]}
+            {showPnl && (
+              <Bar
+                yAxisId="pnl" dataKey="net_pnl"
+                fill="var(--purple)" opacity={0.45}
+                isAnimationActive={false} radius={[2,2,0,0]}
+              />
+            )}
+            <Brush
+              dataKey="ts"
+              height={30}
+              stroke="var(--border)"
+              fill="var(--bg-elevated)"
+              travellerWidth={10}
+              onChange={(e: any) => {
+                if (e && e.startIndex !== undefined && e.endIndex !== undefined) {
+                  const sliced = rawData.slice(e.startIndex, e.endIndex + 1);
+                  setBrushData(sliced);
+                }
+              }}
             />
           </ComposedChart>
         </ResponsiveContainer>
