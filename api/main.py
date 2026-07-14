@@ -73,6 +73,9 @@ from api.metrics   import metrics_router, set_metrics_state
 # ─ Router WebSocket live feed ────────────────────────────────────────────────
 from api.ws_routes import ws_router
 
+# ─ Router S47 — AI/ML signal layer ─────────────────────────────────────────
+from api.ml import ml_router, set_ml_state
+
 # ─ Orchestrator ─────────────────────────────────────────────────────────────
 from notifications.alert_dispatcher import AlertDispatcher
 from core.workflow_orchestrator import WorkflowOrchestrator
@@ -190,6 +193,49 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("[lifespan] Could not update RiskDashboardEngine: {}", exc)
 
+    # 5c. S47: injecteaza ML state in ml_router
+    try:
+        from strategy.ml.config import MLConfig
+        from strategy.ml.features import FeatureStore
+        from strategy.ml.models import ModelRegistry
+        from strategy.ml.signal_fusion import SignalFusion
+
+        ml_cfg = MLConfig.from_env()
+        ml_fs = FeatureStore(maxlen=ml_cfg.feature_lookback)
+        ml_reg = ModelRegistry(ml_cfg)
+        # If ML is enabled, register default models
+        if ml_cfg.enabled:
+            from strategy.ml.models import NumpyLinearRegression, NumpyLogisticRegression
+            ml_reg.register_direction(
+                "lr_default", NumpyLogisticRegression(
+                    n_features=30, lr=ml_cfg.lr_learning_rate,
+                    l2_reg=ml_cfg.lr_l2_reg,
+                ),
+            )
+            ml_reg.register_confidence(
+                "lin_default", NumpyLinearRegression(
+                    n_features=30, lr=ml_cfg.linear_learning_rate,
+                    l2_reg=ml_cfg.linear_l2_reg,
+                ),
+            )
+        ml_fusion = SignalFusion(ml_cfg)
+        set_ml_state({
+            "ml_engine": None,          # will be set when runner starts
+            "feature_store": ml_fs,
+            "registry": ml_reg,
+            "fusion": ml_fusion,
+        })
+        logger.info(
+            "[lifespan] ML router wired — enabled=%s features=%d",
+            ml_cfg.enabled, ml_fs.N_FEATURES,
+        )
+    except Exception as exc:
+        logger.warning("[lifespan] ML state injection failed: {}", exc)
+        set_ml_state({
+            "ml_engine": None, "feature_store": None,
+            "registry": None, "fusion": None,
+        })
+
     # 6. Emite SYSTEM_START
     from notifications.event_types import AlertEvent, EventType
     await dispatcher.emit(AlertEvent(
@@ -278,8 +324,11 @@ app.include_router(decision_router,  prefix="/api/decision",  tags=["decision"])
 # ─ Router nou S35 — Prometheus /metrics ─────────────────────────────────────
 app.include_router(metrics_router)
 
-# ─ Router WebSocket live feed ────────────────────────────────────────────────
+# ─ Router WebSocket live feed ──────────────────────────────────────────────
 app.include_router(ws_router)
+
+# ─ Router S47 — AI/ML signal layer ───────────────────────────────────────
+app.include_router(ml_router, prefix="/api/ml", tags=["ml"])
 
 
 @app.get("/", tags=["root"])

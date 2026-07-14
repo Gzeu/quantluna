@@ -66,8 +66,9 @@ class BybitLiveRunner:
 
     async def start(self) -> int:
         """Build, wire and run.  Blocks until stop() is called."""
-        logger.info("BybitLiveRunner: === START === {}/{} dry={}",
-                    self.cfg.symbol_y, self.cfg.symbol_x, self.cfg.dry_run)
+        logger.info("BybitLiveRunner: === START === {}/{} dry={} ml={}",
+                    self.cfg.symbol_y, self.cfg.symbol_x, self.cfg.dry_run,
+                    self.cfg.ml_enabled)
 
         order_router, ws_feed = await self._build_exchange()
         (
@@ -75,10 +76,13 @@ class BybitLiveRunner:
             order_manager, watchdog, notifier_bus,
         ) = await self._build_components(order_router, ws_feed)
 
+        # \u2500\u2500 ML pipeline (S47) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        ml_engine, signal_fusion = self._build_ml_pipeline()
+
         if notifier_bus:
             await notifier_bus.send_alert(
                 f"\u26a1 QuantLuna Start | {self.cfg.symbol_y}/{self.cfg.symbol_x} "
-                f"| dry={self.cfg.dry_run}",
+                f"| dry={self.cfg.dry_run} | ml={self.cfg.ml_enabled}",
                 level="info",
             )
 
@@ -88,6 +92,7 @@ class BybitLiveRunner:
             "order_manager":   order_manager,
             "ws_feed":         ws_feed,
             "watchdog":        watchdog,
+            "ml_engine":       ml_engine,
         })
 
         funding_gate    = FundingGate(sym_y=self.cfg.symbol_y, sym_x=self.cfg.symbol_x)
@@ -108,6 +113,7 @@ class BybitLiveRunner:
             spread_monitor, circuit_breaker, order_manager, watchdog,
             health, notifier_bus,
             funding_gate, decision_engine, executor,
+            ml_engine, signal_fusion,
         )
         logger.info("BybitLiveRunner: stopped")
         return 0
@@ -232,6 +238,75 @@ class BybitLiveRunner:
         return hc
 
     # ------------------------------------------------------------------
+    # ML pipeline (S47)
+    # ------------------------------------------------------------------
+
+    def _build_ml_pipeline(self):
+        """Build ML inference engine + signal fusion (or None if disabled)."""
+        if not self.cfg.ml_enabled:
+            logger.info("BybitLiveRunner: ML pipeline disabled")
+            return None, None
+
+        try:
+            from strategy.ml.config import MLConfig
+            from strategy.ml.features import FeatureStore
+            from strategy.ml.models import (
+                MLInferenceEngine, ModelRegistry,
+                NumpyLinearRegression, NumpyLogisticRegression,
+            )
+            from strategy.ml.signal_fusion import SignalFusion
+
+            ml_cfg = MLConfig.from_env()
+            ml_cfg.enabled = True
+
+            fs = FeatureStore(maxlen=ml_cfg.feature_lookback)
+            reg = ModelRegistry(ml_cfg)
+            # Register default models (30 features each)
+            reg.register_direction(
+                "lr_default",
+                NumpyLogisticRegression(
+                    n_features=30,
+                    lr=ml_cfg.lr_learning_rate,
+                    l2_reg=ml_cfg.lr_l2_reg,
+                ),
+            )
+            reg.register_confidence(
+                "lin_default",
+                NumpyLinearRegression(
+                    n_features=30,
+                    lr=ml_cfg.linear_learning_rate,
+                    l2_reg=ml_cfg.linear_l2_reg,
+                ),
+            )
+
+            # Try to load saved checkpoints
+            try:
+                loaded = reg.load(ml_cfg.model_checkpoint_dir)
+                if loaded > 0:
+                    logger.info("BybitLiveRunner: loaded {} ML model(s) from {}",
+                                loaded, ml_cfg.model_checkpoint_dir)
+            except Exception:
+                pass
+
+            engine = MLInferenceEngine(ml_cfg, reg, fs)
+            fusion = SignalFusion(ml_cfg)
+
+            logger.info(
+                "BybitLiveRunner: ML pipeline ready ({} features, warmup={} bars, "
+                "fusion: trending={:.0%} ranging={:.0%})",
+                fs.N_FEATURES, ml_cfg.model_warmup_bars,
+                ml_cfg.trending_ml_weight, ml_cfg.ranging_ml_weight,
+            )
+            return engine, fusion
+
+        except ImportError as exc:
+            logger.warning("BybitLiveRunner: ML imports failed — disabling: {}", exc)
+            return None, None
+        except Exception as exc:
+            logger.error("BybitLiveRunner: ML pipeline build failed: {}", exc)
+            return None, None
+
+    # ------------------------------------------------------------------
     # Main trading loop
     # ------------------------------------------------------------------
 
@@ -243,6 +318,8 @@ class BybitLiveRunner:
         funding_gate: FundingGate,
         decision_engine: DecisionEngine,
         executor: ActionExecutor,
+        ml_engine=None,
+        signal_fusion=None,
     ) -> None:
         watchdog_task = asyncio.create_task(watchdog.run())
         first_bar = True
@@ -279,7 +356,50 @@ class BybitLiveRunner:
                     logger.info("BybitLiveRunner: funding gate CLOSED")
                     continue
 
-                action = decision_engine.decide(zscore, circuit_breaker, order_manager)
+                # ── ML inference step (S47) ───────────────────────────
+                if ml_engine is not None:
+                    try:
+                        bar_dict = {
+                            "price_y": bar.price_y,
+                            "price_x": bar.price_x,
+                            "volume": getattr(bar, "volume", 0.0),
+                            "high": getattr(bar, "high", bar.price_y),
+                            "low": getattr(bar, "low", bar.price_y),
+                        }
+                        spread_state = {
+                            "spread": spread,
+                            "zscore": zscore,
+                            "beta": getattr(report, "beta", 1.0),
+                            "uncertainty": getattr(report, "kalman_p_diag", 0.0),
+                            "half_life_hours": half_life,
+                            "regime": getattr(report, "regime", "unknown"),
+                            "vol_regime": getattr(report, "vol_regime", "NORMAL"),
+                        }
+                        ml_dir, ml_conf = ml_engine.update(bar_dict, spread_state)
+                        if signal_fusion is not None and ml_engine.is_warm:
+                            fused = signal_fusion.fuse(
+                                ml_direction=ml_dir,
+                                ml_confidence=ml_conf,
+                                zscore=zscore,
+                                zscore_threshold=self.cfg.entry_zscore,
+                                regime=getattr(report, "regime", "unknown"),
+                            )
+                            # Blend ML with Z-score: use fused direction to
+                            # bias the zscore fed to the decision engine
+                            if fused.should_trade and abs(ml_dir) > 0.2:
+                                # ML strongly directional → shift effective zscore
+                                effective_zscore = zscore * (1.0 - fused.ml_contribution) + ml_dir * 3.5 * fused.ml_contribution
+                            else:
+                                effective_zscore = zscore
+                        else:
+                            effective_zscore = zscore
+                    except Exception as exc:
+                        logger.debug("BybitLiveRunner: ML step error: {}", exc)
+                        effective_zscore = zscore
+                else:
+                    effective_zscore = zscore
+
+                action = decision_engine.decide(effective_zscore, circuit_breaker, order_manager)
                 if action:
                     await executor.execute(
                         action, order_router, order_manager, notifier_bus, bar

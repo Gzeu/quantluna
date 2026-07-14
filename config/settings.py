@@ -112,9 +112,16 @@ class QuantLunaConfig:
     risk: RiskConfig = field(default_factory=RiskConfig)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     coint: CointegrationConfig = field(default_factory=CointegrationConfig)
+    ml: "MLConfig" = field(default_factory=lambda: _ml_default())  # noqa: F821
     trading_mode: str = os.getenv("TRADING_MODE", "paper")  # paper | live
     log_level: str = "INFO"
     telegram_alerts: bool = bool(os.getenv("TELEGRAM_BOT_TOKEN"))
+
+
+def _ml_default():
+    """Lazy import to avoid circular dependency at config init."""
+    from strategy.ml.config import MLConfig
+    return MLConfig()
 
 
 # Singleton
