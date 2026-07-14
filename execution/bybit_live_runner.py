@@ -71,8 +71,15 @@ class BybitLiveRunner:
     # Public API
     # ------------------------------------------------------------------
 
-    async def start(self) -> int:
-        """Build, wire and run.  Blocks until stop() is called."""
+    async def start(self, adopted_positions: list = None) -> int:
+        """Build, wire and run.  Blocks until stop() is called.
+
+        Parameters
+        ----------
+        adopted_positions : list of dict, optional
+            Positions adopted at startup (from orchestrator Phase 3).
+            Each dict: {symbol, side, qty, entry_price, mark_price, ...}
+        """
         logger.info("BybitLiveRunner: === START === {}/{} dry={} ml={}",
                     self.cfg.symbol_y, self.cfg.symbol_x, self.cfg.dry_run,
                     self.cfg.ml_enabled)
@@ -86,13 +93,62 @@ class BybitLiveRunner:
         # \u2500\u2500 ML pipeline (S47) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         ml_engine, signal_fusion = self._build_ml_pipeline()
 
-        # \u2500\u2500 S48: Kalman filter + SignalGenerator v4 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        # \u2500\u2500 S48: Kalman filter + SignalGenerator v4 + ProfitGuard \u2500\u2500\u2500\u2500\u2500\u2500
         self._build_signal_pipeline(notifier_bus)
+
+        # \u2500\u2500 S48: Register adopted positions with ProfitGuard \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        adopted_count = 0
+        if adopted_positions and self._profit_guard is not None:
+            for pos in adopted_positions:
+                try:
+                    symbol = pos.get("symbol", "")
+                    side_raw = pos.get("side", "long")
+                    qty = float(pos.get("qty", pos.get("size", 0.0)))
+                    entry_price = float(pos.get("entry_price", pos.get("entryPrice", 0.0)))
+                    mark_price = float(pos.get("mark_price", pos.get("markPrice", entry_price)))
+
+                    if qty <= 0 or entry_price <= 0:
+                        continue
+
+                    # Map side: "Buy"/"buy"/"long" \u2192 "LONG_SPREAD", "Sell"/"sell"/"short" \u2192 "SHORT_SPREAD"
+                    side = "LONG_SPREAD" if side_raw.lower() in ("buy", "long") else "SHORT_SPREAD"
+
+                    # Build pair name
+                    pair = f"{self.cfg.symbol_y}/{self.cfg.symbol_x}"
+
+                    # Estimate entry z-score from price move since entry
+                    # If we don't have Kalman yet, use a proxy:
+                    # entry_zscore = -2.0 if LONG (bought below mean), +2.0 if SHORT (sold above mean)
+                    from execution.profit_guard import GuardedPosition
+                    gpos = GuardedPosition(
+                        pair=pair,
+                        entry_zscore=-2.5 if side == "LONG_SPREAD" else 2.5,
+                        entry_spread=entry_price,
+                        entry_prices=(entry_price, mark_price),
+                        side=side,
+                        qty_y=qty,
+                        qty_x=0.0,
+                    )
+                    self._profit_guard.register(gpos)
+                    adopted_count += 1
+                    logger.info(
+                        "BybitLiveRunner: adopted {} {} qty={} entry={:.2f} mark={:.2f}",
+                        symbol, side, qty, entry_price, mark_price,
+                    )
+                except Exception as exc:
+                    logger.warning("BybitLiveRunner: failed to adopt position {}: {}", pos, exc)
+
+        if adopted_count > 0:
+            logger.info(
+                "BybitLiveRunner: {} adopted positions registered with ProfitGuard",
+                adopted_count,
+            )
 
         if notifier_bus:
             await notifier_bus.send_alert(
                 f"\u26a1 QuantLuna Start | {self.cfg.symbol_y}/{self.cfg.symbol_x} "
-                f"| dry={self.cfg.dry_run} | ml={self.cfg.ml_enabled}",
+                f"| dry={self.cfg.dry_run} | ml={self.cfg.ml_enabled}"
+                f"{' | adopted=' + str(adopted_count) if adopted_count else ''}",
                 level="info",
             )
 
@@ -132,9 +188,9 @@ class BybitLiveRunner:
         """Signal the run loop to exit cleanly."""
         self._stop_event.set()
 
-    async def run(self) -> int:
+    async def run(self, adopted_positions: list = None) -> int:
         """Alias for start() — kept for backward compatibility."""
-        return await self.start()
+        return await self.start(adopted_positions=adopted_positions)
 
     # ------------------------------------------------------------------
     # Build helpers

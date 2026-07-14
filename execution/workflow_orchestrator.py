@@ -336,13 +336,44 @@ class WorkflowOrchestrator:
             logger.error("[Orchestrator] start_runner: context HALT — nu pornesc runner")
             return
         logger.info("[Orchestrator] FAZA 5: Pornire BybitLiveRunner")
-        runner = self._runner or self._build_runner()
-        tasks = [asyncio.create_task(runner.start(), name="bybit_live_runner")]
-        if ctx is not None and ctx.has_adopted_positions and ctx.optimizer:
-            cb = price_feed_callback or self._make_price_callback(
-                [getattr(r, "symbol", "") for r in ctx.adoption_results]
+
+        # ── Extract adopted positions for runner's ProfitGuard ─────────
+        adopted_positions = []
+        if ctx is not None and ctx.has_adopted_positions:
+            for result in ctx.adoption_results:
+                try:
+                    pos = result.position
+                    adopted_positions.append({
+                        "symbol": getattr(pos, "symbol", ""),
+                        "side": getattr(pos, "side", "long"),
+                        "qty": getattr(pos, "qty", getattr(pos, "size", 0.0)),
+                        "entry_price": getattr(pos, "entry_price", getattr(pos, "entryPrice", 0.0)),
+                        "mark_price": getattr(pos, "mark_price", getattr(pos, "markPrice", 0.0)),
+                    })
+                except Exception as exc:
+                    logger.warning("[Orchestrator] Skip adopted pos: {}", exc)
+            logger.info(
+                "[Orchestrator] Pregatite {} pozitii adoptate pentru ProfitGuard",
+                len(adopted_positions),
             )
-            tasks.append(asyncio.create_task(self.run_optimizer_loop(ctx, cb), name="optimizer_loop"))
+
+        runner = self._runner or self._build_runner()
+        tasks = [
+            asyncio.create_task(
+                runner.start(adopted_positions=adopted_positions if adopted_positions else None),
+                name="bybit_live_runner",
+            ),
+        ]
+        # Note: ProfitOptimizer separate loop removed in S48 —
+        # adopted positions are now managed by the runner's ProfitGuard
+        # which provides z-score-based TP, trailing stop, profit ladder,
+        # time decay, and emergency stop — all in one unified system.
+        if ctx is not None and ctx.has_adopted_positions and not adopted_positions:
+            logger.warning(
+                "[Orchestrator] {} pozitii adoptate dar 0 convertite — "
+                "ProfitGuard nu le va gestiona",
+                ctx.adopted_count,
+            )
         try:
             await asyncio.gather(*tasks)
         except asyncio.CancelledError:
