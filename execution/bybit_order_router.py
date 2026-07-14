@@ -149,6 +149,21 @@ class _InstrumentInfo:
 
 
 # =============================================================================
+# BybitOrderRouterConfig — dataclass folosit de WorkflowOrchestrator / runner_config
+# =============================================================================
+
+@dataclass
+class BybitOrderRouterConfig:
+    """Config object for BybitOrderRouter — compatibil cu ExchangeFactory."""
+    api_key:    str  = ""
+    api_secret: str  = ""
+    testnet:    bool = False
+    category:   str  = "linear"
+    mode:       str  = ""
+    dry_run:    bool = False  # alternativ pentru mode
+
+
+# =============================================================================
 # BybitOrderRouter
 # =============================================================================
 
@@ -163,19 +178,48 @@ class BybitOrderRouter:
 
     def __init__(
         self,
-        api_key: str = "",
+        api_key: str | BybitOrderRouterConfig = "",
         api_secret: str = "",
         testnet: bool = False,
         category: str = "linear",
         mode: str = "",
     ) -> None:
-        self.api_key = api_key or os.getenv("BYBIT_API_KEY", "")
-        self.api_secret = api_secret or os.getenv("BYBIT_API_SECRET", "")
-        self.testnet = testnet or os.getenv("BYBIT_TESTNET", "false").lower() == "true"
-        self.category = category or os.getenv("BYBIT_CATEGORY", "linear")
-        self.mode = mode or os.getenv("EXCHANGE_MODE", "paper")
+        # Acceptă atât BybitOrderRouterConfig cât și parametri plați
+        if isinstance(api_key, BybitOrderRouterConfig):
+            cfg = api_key
+            self.api_key    = cfg.api_key    or os.getenv("BYBIT_API_KEY", "")
+            self.api_secret = cfg.api_secret or os.getenv("BYBIT_API_SECRET", "")
+            self.testnet    = cfg.testnet    or os.getenv("BYBIT_TESTNET", "false").lower() == "true"
+            self.category   = cfg.category   or os.getenv("BYBIT_CATEGORY", "linear")
+            self.mode       = cfg.mode       or os.getenv("EXCHANGE_MODE", "paper")
+            if cfg.dry_run and not self.mode:
+                self.mode = "paper"
+        else:
+            self.api_key    = api_key    or os.getenv("BYBIT_API_KEY", "")
+            self.api_secret = api_secret or os.getenv("BYBIT_API_SECRET", "")
+            self.testnet    = testnet    or os.getenv("BYBIT_TESTNET", "false").lower() == "true"
+            self.category   = category   or os.getenv("BYBIT_CATEGORY", "linear")
+            self.mode       = mode       or os.getenv("EXCHANGE_MODE", "paper")
         self._client = None
         self._instrument_cache: dict[str, _InstrumentInfo] = {}
+
+    # -------------------------------------------------------------------------
+    # from_config — constructie din config object
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def from_config(cls, cfg: "BybitOrderRouterConfig") -> "BybitOrderRouter":
+        """Construieste routerul dintr-un BybitOrderRouterConfig."""
+        mode = cfg.mode
+        if cfg.dry_run and not mode:
+            mode = "paper"
+        return cls(
+            api_key=cfg.api_key,
+            api_secret=cfg.api_secret,
+            testnet=cfg.testnet,
+            category=cfg.category,
+            mode=mode,
+        )
 
     # -------------------------------------------------------------------------
     # v3.5-compat: connect()
@@ -440,6 +484,23 @@ class BybitOrderRouter:
         except Exception as e:
             logger.error(f"fetch_funding_rate failed for {symbol}: {e}")
             return None
+
+    async def get_wallet_balance(self, account_type: str = "UNIFIED") -> float:
+        """
+        Fetch wallet balance from Bybit. Used by runner_config for capital auto-detection.
+        Returns total equity in USDT.
+        """
+        if self.mode != "live":
+            return 0.0
+        try:
+            client = self._get_client()
+            resp = client.get_wallet_balance(accountType=account_type)
+            if resp.get("retCode") == 0 and resp.get("result", {}).get("list"):
+                balance = resp["result"]["list"][0]
+                return float(balance.get("totalEquity", 0))
+        except Exception as e:
+            logger.error(f"get_wallet_balance failed: {e}")
+        return 0.0
 
     # -------------------------------------------------------------------------
     # Internal

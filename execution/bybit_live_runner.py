@@ -209,6 +209,9 @@ class BybitLiveRunner:
             exchange=self.cfg.venue,
             sym_y=self.cfg.symbol_y,
             sym_x=self.cfg.symbol_x,
+            api_key=self.cfg.api_key,
+            api_secret=self.cfg.api_secret,
+            health_port=self.cfg.health_port,
         ))
         try:
             await hc.start_http_server()

@@ -13,6 +13,16 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from pathlib import Path
+
+# Load .env so os.getenv returns correct values
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
+    if _env_path.exists():
+        load_dotenv(_env_path)
+except ImportError:
+    pass
 
 
 @dataclass
@@ -138,3 +148,34 @@ class BybitLiveRunnerConfig:
     def from_env(cls) -> "BybitLiveRunnerConfig":
         """Construct config purely from environment variables."""
         return cls()
+
+    @classmethod
+    async def resolve_initial_capital(cls, cfg: "BybitLiveRunnerConfig") -> float:
+        """Fetch live wallet balance from Bybit and override initial_capital.
+        
+        Priority: MANUAL env override > LIVE wallet balance > fallback 10000 USDT
+        """
+        from loguru import logger
+        
+        env_val = os.getenv("INITIAL_CAPITAL")
+        if env_val:
+            logger.info("Using manual INITIAL_CAPITAL override: {} USDT", env_val)
+            return float(env_val)
+        
+        try:
+            from execution.bybit_order_router import BybitOrderRouter, BybitOrderRouterConfig
+            router = BybitOrderRouter(BybitOrderRouterConfig(
+                api_key=cfg.api_key,
+                api_secret=cfg.api_secret,
+                testnet=cfg.testnet,
+                dry_run=False,  # must be real to read balance
+            ))
+            balance = await router.get_wallet_balance()
+            logger.info("Auto-detected capital from Bybit: {:.2f} USDT", balance)
+            return float(balance)
+        except Exception as exc:
+            logger.warning(
+                "Failed to read Bybit balance — falling back to 10000 USDT. Error: {}",
+                exc
+            )
+            return 10000.0

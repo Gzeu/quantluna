@@ -25,7 +25,7 @@ except ImportError:
 
 from api.risk     import router as risk_router
 from api.pnl      import router as pnl_router
-from api.services import router as services_router
+from api.services import services_router
 
 
 def build_api(title: str = "QuantLuna API", version: str = "0.37.0") -> FastAPI:

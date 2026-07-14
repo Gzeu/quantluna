@@ -16,7 +16,7 @@ try:
 except ImportError:
     raise ImportError("fastapi necesar")
 
-router = APIRouter(prefix="/api/services", tags=["services"])
+services_router = APIRouter(tags=["services"])
 
 # Procesele asteptate sa ruleze in productie
 _EXPECTED_PROCESSES = [
@@ -90,7 +90,7 @@ def _get_services_static() -> List[Dict[str, Any]]:
     ]
 
 
-@router.get("/list")
+@services_router.get("/list")
 async def list_services() -> JSONResponse:
     """Returneaza statusul tuturor serviciilor QuantLuna."""
     try:

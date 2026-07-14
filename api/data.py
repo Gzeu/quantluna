@@ -42,10 +42,10 @@ class PrefetchRequest(BaseModel):
 
 @router.get("/ohlcv")
 def get_ohlcv(
-    symbol:        str   = Query(..., example="BTCUSDT"),
+    symbol:        str   = Query(..., examples=["BTCUSDT"]),
     interval:      str   = Query("1h"),
-    start:         Optional[str] = Query(None, example="2024-01-01"),
-    end:           Optional[str] = Query(None, example="2024-06-30"),
+    start:         Optional[str] = Query(None, examples=["2024-01-01"]),
+    end:           Optional[str] = Query(None, examples=["2024-06-30"]),
     force_refresh: bool  = Query(False),
     max_rows:      int   = Query(5000, le=50000),
 ):
@@ -75,8 +75,8 @@ def get_ohlcv(
 
 @router.get("/pair")
 def get_pair(
-    sym_y:         str  = Query(..., example="BTCUSDT"),
-    sym_x:         str  = Query(..., example="ETHUSDT"),
+    sym_y:         str  = Query(..., examples=["BTCUSDT"]),
+    sym_x:         str  = Query(..., examples=["ETHUSDT"]),
     interval:      str  = Query("1h"),
     start:         Optional[str] = Query(None),
     end:           Optional[str] = Query(None),

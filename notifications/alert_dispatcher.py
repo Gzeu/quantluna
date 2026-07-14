@@ -98,6 +98,24 @@ class AlertDispatcher:
         logger.info("AlertDispatcher stopped. sent=%d failed=%d",
                     self._sent_count, self._failed_count)
 
+    async def send_alert(self, message: str, level: str = "info") -> bool:
+        """
+        Compatibilitate NotifierBus — trimite o alertă text direct.
+        Folosit de BybitLiveRunner, WorkflowOrchestrator, etc.
+        """
+        from notifications.event_types import AlertEvent, EventType, Severity
+
+        level_map = {
+            "error":   EventType.SYSTEM_ERROR,
+            "warning": EventType.DD_ALERT,
+            "info":    EventType.SYSTEM_START,
+        }
+        event = AlertEvent(
+            event_type=level_map.get(level, EventType.SYSTEM_START),
+            payload={"message": message},
+        )
+        return await self.emit(event)
+
     async def emit(self, event: AlertEvent) -> bool:
         """
         Pune eveniment in queue. Non-blocking.

@@ -32,6 +32,15 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
+
+# Load .env before any other imports that read from os.environ
+try:
+    from dotenv import load_dotenv
+    _env_path = Path(__file__).resolve().parent.parent / ".env"
+    load_dotenv(_env_path)
+except ImportError:
+    pass
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,6 +54,7 @@ from api.notifications import router as notifications_router
 from api.notifications import set_dispatcher
 from api.optimize      import router as optimize_router
 from api.pairs         import router as pairs_router
+from api.pnl           import router as pnl_router
 from api.risk          import router as risk_router
 from api.sizing        import router as sizing_router, set_sizing_state
 from api.strategy      import router as strategy_router
@@ -60,6 +70,9 @@ from api.decision  import decision_router, set_decision_state
 # ─ Router nou S35 — Prometheus /metrics ─────────────────────────────────────
 from api.metrics   import metrics_router, set_metrics_state
 
+# ─ Router WebSocket live feed ────────────────────────────────────────────────
+from api.ws_routes import ws_router
+
 # ─ Orchestrator ─────────────────────────────────────────────────────────────
 from notifications.alert_dispatcher import AlertDispatcher
 from core.workflow_orchestrator import WorkflowOrchestrator
@@ -71,6 +84,18 @@ _START_TIME = time.time()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("QuantLuna API v0.32.0 starting up...")
+
+    # 0. Read real Bybit balance for dashboard
+    real_equity = 10000.0
+    try:
+        from execution.bybit_order_router import BybitOrderRouter
+        router = BybitOrderRouter()
+        bal = await router.get_wallet_balance()
+        if bal > 0:
+            real_equity = bal
+            logger.info("Real Bybit balance detected: ${:.2f}", real_equity)
+    except Exception as e:
+        logger.warning("Could not read Bybit balance: {}", e)
 
     # 1. AlertDispatcher
     dispatcher = AlertDispatcher()
@@ -156,6 +181,15 @@ async def lifespan(app: FastAPI):
         type(decision_engine).__name__ if decision_engine else None,
     )
 
+    # 5b. Update RiskDashboardEngine with real Bybit balance
+    try:
+        from api.risk import get_risk_engine
+        risk_eng = get_risk_engine()
+        risk_eng.update_equity(real_equity)
+        logger.info("[lifespan] RiskDashboardEngine equity set to ${:.2f}", real_equity)
+    except Exception as exc:
+        logger.warning("[lifespan] Could not update RiskDashboardEngine: {}", exc)
+
     # 6. Emite SYSTEM_START
     from notifications.event_types import AlertEvent, EventType
     await dispatcher.emit(AlertEvent(
@@ -228,6 +262,7 @@ app.include_router(optimize_router)
 app.include_router(data_router)
 app.include_router(risk_router)
 app.include_router(pairs_router)
+app.include_router(pnl_router)
 app.include_router(sizing_router)
 app.include_router(notifications_router)
 app.include_router(health_router)
@@ -242,6 +277,9 @@ app.include_router(decision_router,  prefix="/api/decision",  tags=["decision"])
 
 # ─ Router nou S35 — Prometheus /metrics ─────────────────────────────────────
 app.include_router(metrics_router)
+
+# ─ Router WebSocket live feed ────────────────────────────────────────────────
+app.include_router(ws_router)
 
 
 @app.get("/", tags=["root"])

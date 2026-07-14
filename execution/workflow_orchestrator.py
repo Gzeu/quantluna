@@ -117,6 +117,112 @@ class WorkflowOrchestrator:
             position_store=position_store,
         )
 
+    @classmethod
+    def from_env(cls, dispatcher=None):
+        """
+        Construiește orchestratorul din variabile de mediu — folosit de API server.
+        """
+        # Build a minimal runner config from env
+        try:
+            from execution.bybit_live_runner import BybitLiveRunnerConfig
+            cfg = BybitLiveRunnerConfig.from_env()
+        except Exception:
+            # Fallback: build config manually from env vars
+            from execution.bybit_live_runner import BybitLiveRunnerConfig
+            cfg = BybitLiveRunnerConfig()
+            cfg.symbol_y        = os.getenv("SYMBOL_Y", "BTCUSDT")
+            cfg.symbol_x        = os.getenv("SYMBOL_X", "ETHUSDT")
+            cfg.interval        = os.getenv("INTERVAL", "5")
+            cfg.dry_run         = os.getenv("DRY_RUN", "false").lower() != "true"
+            cfg.checkpoint_path = os.getenv("CHECKPOINT_PATH", "state/position_checkpoint.db")
+
+        orch = cls(
+            exchange=None,
+            checkpoint_path=getattr(cfg, "checkpoint_path", "state/position_checkpoint.db"),
+            notifier_bus=dispatcher,
+            runner_cfg=cfg,
+            skip_health_check=True,  # API server skips health check on its own startup
+        )
+        # Store additional state the API router needs
+        orch.pairs        = [f"{cfg.symbol_y}/{cfg.symbol_x}"]
+        orch.reoptimizer  = None
+        orch.watchdog     = None
+        orch.context       = None
+        return orch
+
+    async def build_context(self) -> None:
+        """Construiește contextul runtime — inițializează watchdog, reoptimizer, etc."""
+        from dataclasses import dataclass
+
+        @dataclass
+        class _ApiContext:
+            sizing_engine: object = None
+            decision_engine: object = None
+            should_halt: bool = False
+            halt_reason: str = ""
+
+        self.context = _ApiContext()
+
+        # Try to build the exchange connection
+        if self._exchange is None:
+            self._exchange = await self._build_shared_exchange()
+
+        # Try to wire up the watchdog
+        try:
+            from core.monitoring_watchdog import MonitoringWatchdog
+            self.watchdog = MonitoringWatchdog.from_env(
+                pairs=self.pairs,
+                metrics_provider=None,
+                dispatcher=self._bus,
+            )
+            logger.info("[Orchestrator] MonitoringWatchdog initializat din env")
+        except Exception as exc:
+            logger.warning("[Orchestrator] MonitoringWatchdog init failed: {}", exc)
+            self.watchdog = None
+
+        # Try to wire up the reoptimizer
+        try:
+            from backtest.auto_reoptimizer import AutoReoptimizer
+            self.reoptimizer = AutoReoptimizer.from_env()
+            logger.info("[Orchestrator] AutoReoptimizer initializat din env")
+        except Exception as exc:
+            logger.warning("[Orchestrator] AutoReoptimizer init failed: {}", exc)
+            self.reoptimizer = None
+
+        # Try to build sizing engine
+        try:
+            from risk.bybit_position_sizer import BybitPositionSizer
+            from risk.sizing_engine import SizingEngine
+            sizer = BybitPositionSizer(
+                capital_usdt=float(os.getenv("INITIAL_CAPITAL_USD", "10000")),
+                max_leverage=float(os.getenv("MAX_LEVERAGE", "3.0")),
+                kelly_fraction=os.getenv("KELLY_FRACTION", "half"),
+                max_position_pct=float(os.getenv("MAX_POSITION_PCT", "0.25")),
+            )
+            self.context.sizing_engine = SizingEngine(sizer=sizer)
+            logger.info("[Orchestrator] SizingEngine initializat")
+        except Exception as exc:
+            logger.warning("[Orchestrator] SizingEngine init failed: {}", exc)
+
+        logger.info("[Orchestrator] build_context complete")
+
+    async def stop_runner(self) -> None:
+        """Oprește runner-ul și curăță resursele."""
+        runner = self._runner
+        if runner is not None and hasattr(runner, "stop"):
+            try:
+                await runner.stop()
+                logger.info("[Orchestrator] Runner stopped")
+            except Exception as exc:
+                logger.warning("[Orchestrator] Runner stop error: {}", exc)
+
+        if self.watchdog is not None and hasattr(self.watchdog, "stop"):
+            try:
+                await self.watchdog.stop()
+                logger.info("[Orchestrator] Watchdog stopped")
+            except Exception as exc:
+                logger.warning("[Orchestrator] Watchdog stop error: {}", exc)
+
     async def run_startup_workflow(self) -> StartupContext:
         ctx = StartupContext()
         sep = "=" * 60
@@ -225,14 +331,14 @@ class WorkflowOrchestrator:
         logger.info(sep)
         return ctx
 
-    async def start_runner(self, ctx, price_feed_callback=None) -> None:
-        if ctx.should_halt:
+    async def start_runner(self, ctx=None, price_feed_callback=None) -> None:
+        if ctx is not None and ctx.should_halt:
             logger.error("[Orchestrator] start_runner: context HALT — nu pornesc runner")
             return
         logger.info("[Orchestrator] FAZA 5: Pornire BybitLiveRunner")
         runner = self._runner or self._build_runner()
         tasks = [asyncio.create_task(runner.start(), name="bybit_live_runner")]
-        if ctx.has_adopted_positions and ctx.optimizer:
+        if ctx is not None and ctx.has_adopted_positions and ctx.optimizer:
             cb = price_feed_callback or self._make_price_callback(
                 [getattr(r, "symbol", "") for r in ctx.adoption_results]
             )

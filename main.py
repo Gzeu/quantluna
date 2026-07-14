@@ -51,6 +51,17 @@ import asyncio
 import os
 import signal
 import sys
+from pathlib import Path
+
+# Load .env before configuration reads env vars
+try:
+    from dotenv import load_dotenv
+    _env_dir = Path(__file__).resolve().parent
+    _env_file = _env_dir / ".env"
+    if _env_file.exists():
+        load_dotenv(_env_file)
+except ImportError:
+    pass
 
 from loguru import logger
 
@@ -154,7 +165,7 @@ def _validate_config(cfg, mode: str) -> None:
                 sys.exit(1)
             else:
                 logger.warning(
-                    "main: {} config error(s) detected in {} mode — continuand "
+                    "main: {} config error(s) detected in {} mode — continuing "
                     "(dry_run=True protects from real orders).",
                     len(all_errors), mode,
                 )
@@ -238,10 +249,10 @@ async def _build_ws_feed(cfg):
         feed_cfg = BybitWsFeedConfig(
             symbol_y=cfg.symbol_y,
             symbol_x=cfg.symbol_x,
-            interval=cfg.interval,
+            interval=str(cfg.interval),
             testnet=os.getenv("BYBIT_TESTNET", "false").lower() == "true",
         )
-        feed = BybitWsFeed(feed_cfg)
+        feed = BybitWsFeed.from_config(feed_cfg)
         logger.info(
             "main: BybitWsFeed built ({}/{} {}m)",
             cfg.symbol_y, cfg.symbol_x, cfg.interval,
@@ -294,6 +305,9 @@ async def main() -> int:
             return 1
     if args.interval:
         cfg.interval = args.interval
+
+    # Auto-detect initial capital from Bybit unless manually set
+    cfg.initial_capital = await BybitLiveRunnerConfig.resolve_initial_capital(cfg)
 
     logger.info(
         "QuantLuna starting — {}/{} interval={}m dry_run={} log_dir={} state_dir={}",

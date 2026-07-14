@@ -60,7 +60,7 @@ export function useQuantLunaWS() {
   const connect = useCallback((endpoint: string, url: string) => {
     try {
       const ws = new WebSocket(url)
-      ws.onopen    = () => { retries.current[endpoint] = 0 }
+      ws.onopen = () => { retries.current[endpoint] = 0 }
       ws.onmessage = ({ data }) => {
         try {
           const msg = JSON.parse(data)
@@ -77,9 +77,17 @@ export function useQuantLunaWS() {
         } catch {}
       }
       ws.onerror = () => {}
-      ws.onclose = () => {
-        const delay = Math.min(1000 * 2 ** (retries.current[endpoint] ?? 0), 30_000)
-        retries.current[endpoint] = (retries.current[endpoint] ?? 0) + 1
+      ws.onclose = (event) => {
+        // Don't retry if server rejected the connection (no endpoint)
+        // or if we've already tried too many times
+        const retryCount = retries.current[endpoint] ?? 0
+        if (retryCount >= 3 || event.code === 1006 || event.code === 1002) {
+          // Endpoint doesn't exist or auth failed — stop retrying
+          wsRefs.current[endpoint] = null
+          return
+        }
+        const delay = Math.min(1000 * 2 ** retryCount, 30_000)
+        retries.current[endpoint] = retryCount + 1
         setTimeout(() => connect(endpoint, url), delay)
       }
       wsRefs.current[endpoint] = ws
@@ -252,36 +260,61 @@ export function useQuantLunaWS() {
     connect('regime', `${WS_BASE}/ws/regime`)
     connect('orders', `${WS_BASE}/ws/orders`)
 
-    // Simulation @ 4Hz (DISABLED to show real backend/exchange data)
-    // simRef.current = setInterval(() => {
-    //   if (!isPaused()) simulateTick()
-    // }, 250)
+    // Fetch initial data immediately so charts are never empty
+    fetch(`${API_BASE}/risk/dashboard`).then(r => r.json()).then(rd => {
+      if (rd.equity_usd > 0) {
+        store.setPnl({
+          total: rd.equity_usd, available: rd.equity_usd * 0.95,
+          margin: rd.exposure_usd ?? 0, unrealized: rd.unrealized_pnl ?? 0,
+          dailyPnl: rd.daily_pnl ?? 0, dailyPct: rd.daily_pct ?? 0,
+          wins: rd.wins ?? 0, losses: rd.losses ?? 0,
+          totalTrades: rd.total_trades ?? 0,
+          equityHistory: [{ t: Date.now(), v: rd.equity_usd }],
+        })
+      }
+    }).catch(() => {})
 
-    // REST polling — prefer real backend data
+    // Build equity history from REST polling over time
+    const equityHistory: Array<{t: number, v: number}> = []
     pollRef.current = setInterval(async () => {
       if (isPaused()) return
       try {
-        const [pnlRes, riskRes] = await Promise.all([
-          fetch(`${API_BASE}/api/pnl`).catch(() => null),
-          fetch(`${API_BASE}/risk/dashboard`).catch(() => null),
-        ])
-        if (pnlRes?.ok) store.setPnl(await pnlRes.json())
+        const riskRes = await fetch(`${API_BASE}/risk/dashboard`).catch(() => null)
         if (riskRes?.ok) {
           const rd = await riskRes.json()
-          store.setTradeStats({
-            wins:                   rd.wins   ?? 0,
-            losses:                 rd.losses ?? 0,
-            total_trades:           rd.total_trades ?? 0,
-            win_rate:               rd.win_rate ?? 0,
-            avg_win_usd:            rd.avg_win_usd ?? 0,
-            avg_loss_usd:           rd.avg_loss_usd ?? 0,
-            profit_factor:          rd.profit_factor ?? 0,
-            max_drawdown:           rd.max_drawdown ?? 0,
-            max_consecutive_wins:   rd.max_consecutive_wins ?? 0,
-            max_consecutive_losses: rd.max_consecutive_losses ?? 0,
-            current_streak:         rd.current_streak ?? 0,
-            pair_breakdown:         rd.pair_breakdown ?? [],
-          })
+          if (rd.total_trades > 0 || rd.rolling_sharpe !== 0) {
+            store.setTradeStats({
+              wins: rd.wins ?? 0, losses: rd.losses ?? 0,
+              total_trades: rd.total_trades ?? 0,
+              win_rate: rd.win_rate ?? 0,
+              avg_win_usd: rd.avg_win_usd ?? 0,
+              avg_loss_usd: rd.avg_loss_usd ?? 0,
+              profit_factor: rd.profit_factor ?? 0,
+              max_drawdown: rd.max_drawdown ?? 0,
+              max_consecutive_wins: rd.max_consecutive_wins ?? 0,
+              max_consecutive_losses: rd.max_consecutive_losses ?? 0,
+              current_streak: rd.current_streak ?? 0,
+              pair_breakdown: rd.pair_breakdown ?? [],
+            })
+          }
+          if (rd.equity_usd > 0) {
+            const now = Date.now()
+            equityHistory.push({ t: now, v: rd.equity_usd })
+            // Keep last 500 points
+            if (equityHistory.length > 500) equityHistory.shift()
+            store.setPnl({
+              total:      rd.equity_usd,
+              available:  rd.equity_usd * 0.95,
+              margin:     rd.exposure_usd ?? 0,
+              unrealized: rd.unrealized_pnl ?? 0,
+              dailyPnl:   rd.daily_pnl ?? 0,
+              dailyPct:   rd.daily_pct ?? 0,
+              wins:       rd.wins ?? 0,
+              losses:     rd.losses ?? 0,
+              totalTrades: rd.total_trades ?? 0,
+              equityHistory: equityHistory.map(p => ({ t: p.t, v: p.v })),
+            })
+          }
         }
       } catch {}
     }, 5_000)

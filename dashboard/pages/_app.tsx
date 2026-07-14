@@ -38,14 +38,16 @@ function AppInner({ Component, pageProps }: AppProps) {
   const [help, setHelp]             = useState(false);
   const [transitioning, setTrans]   = useState(false);
 
-  /* Page transition */
+  /* Page transition — with safety timeout */
   useEffect(() => {
-    const start = () => setTrans(true);
-    const done  = () => setTrans(false);
+    let timer: ReturnType<typeof setTimeout>;
+    const start = () => { setTrans(true); timer = setTimeout(() => setTrans(false), 3000); };
+    const done  = () => { setTrans(false); clearTimeout(timer); };
     router.events.on('routeChangeStart',    start);
     router.events.on('routeChangeComplete', done);
     router.events.on('routeChangeError',    done);
     return () => {
+      clearTimeout(timer);
       router.events.off('routeChangeStart',    start);
       router.events.off('routeChangeComplete', done);
       router.events.off('routeChangeError',    done);
@@ -82,9 +84,8 @@ function AppInner({ Component, pageProps }: AppProps) {
       <ShortcutsModal open={help} onClose={() => setHelp(false)} />
       <div
         style={{
-          opacity: transitioning ? 0 : 1,
+          opacity: transitioning ? 0.3 : 1,
           transition: 'opacity 150ms ease',
-          pointerEvents: transitioning ? 'none' : undefined,
         }}
       >
         <Component {...pageProps} />

@@ -122,7 +122,6 @@ class RiskDashboardEngine:
         self._day_start_ts:  float = self._today_start()
         self._day_start_eq:  float = initial_capital
 
-        # Aggregate trade counters
         self._total_trades:  int   = 0
         self._total_wins:    int   = 0
         self._total_losses:  int   = 0
@@ -130,17 +129,22 @@ class RiskDashboardEngine:
         self._total_fees:    float = 0.0
         self._max_dd:        float = 0.0
 
-        # Profit factor accumulators
-        self._gross_profit:  float = 0.0   # suma PnL net trade-uri castigatoare
-        self._gross_loss:    float = 0.0   # suma ABS PnL net trade-uri pierzatoare
+        self._gross_profit:  float = 0.0
+        self._gross_loss:    float = 0.0
 
-        # Consecutive streak
-        self._current_streak:          int = 0   # +N wins / -N losses
+        self._current_streak:          int = 0
         self._max_consecutive_wins:    int = 0
         self._max_consecutive_losses:  int = 0
 
-        # Unrealized PnL (set din exterior)
         self._unrealized_pnl: float = 0.0
+
+    def update_equity(self, new_equity: float) -> None:
+        """Update the equity baseline to match real exchange balance."""
+        self.initial_capital = new_equity
+        self._equity         = new_equity
+        self._peak_equity    = new_equity
+        self._day_start_eq   = new_equity
+        self._equity_curve   = [{"ts": time.time(), "equity": new_equity}]
 
     # ------------------------------------------------------------------
     # Helpers

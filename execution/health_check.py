@@ -103,6 +103,8 @@ class HealthConfig:
     cache_dir: Optional[str] = None
     check_cache_freshness: bool = True
     cache_stale_h: float = 6.0
+    # HTTP health server
+    health_port: int = 8081
 
 
 # Alias for backward compatibility
@@ -123,6 +125,36 @@ class HealthCheck:
             sym_x=config.sym_x,
             ts=pd.Timestamp.now(tz="UTC").isoformat(),
         )
+
+    async def start_http_server(self) -> None:
+        """Pornește un server HTTP minimalist pentru health check (/api/health)."""
+        try:
+            from aiohttp import web
+
+            app = web.Application()
+
+            async def _health_handler(request: web.Request) -> web.Response:
+                report = await self.run()
+                return web.json_response({
+                    "status": "ok" if report.all_passed else "degraded",
+                    "checks": [
+                        {"name": c.name, "passed": c.passed, "message": c.message}
+                        for c in report.checks
+                    ],
+                    "exchange": self.cfg.exchange,
+                    "ts": report.ts,
+                })
+
+            app.router.add_get("/api/health", _health_handler)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            await web.TCPSite(runner, port=self.cfg.health_port).start()
+            logger.info(
+                "HealthCheck HTTP server started on :{}", self.cfg.health_port
+            )
+        except ImportError:
+            # aiohttp not available — fail gracefully, caller will use fallback
+            raise RuntimeError("aiohttp not installed — cannot start health HTTP server")
 
     async def run(self) -> HealthReport:
         """Run all health checks and return HealthReport."""

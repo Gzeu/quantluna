@@ -63,6 +63,37 @@ BarData = namedtuple(
 )
 
 
+# =============================================================================
+# BybitWsFeedConfig — dataclass folosit de main.py / WorkflowOrchestrator
+# =============================================================================
+
+class BybitWsFeedConfig:
+    """Config object for BybitWsFeed — compatibil cu main.py și bybit_live_runner."""
+
+    def __init__(
+        self,
+        symbol_y:   str      = "",
+        symbol_x:   str      = "",
+        symbol:     str      = "",
+        interval:   str      = "1",
+        testnet:    bool     = False,
+        category:   str      = "",
+        api_key:    str      = "",
+        api_secret: str      = "",
+        ws_max_reconnects: int = 20,
+    ) -> None:
+        # symbol_y e folosit ca primary; symbol ca fallback
+        self.symbol           = symbol_y or symbol
+        self.symbol_y         = symbol_y or symbol
+        self.symbol_x         = symbol_x
+        self.interval         = interval
+        self.testnet          = testnet
+        self.category         = category
+        self.api_key          = api_key
+        self.api_secret       = api_secret
+        self.ws_max_reconnects = ws_max_reconnects
+
+
 class BybitWsFeed:
     """
     Async WebSocket feed for Bybit v5.
@@ -99,6 +130,23 @@ class BybitWsFeed:
         # Separate queues for kline bars and orderbook updates
         self._bar_queue:   asyncio.Queue = asyncio.Queue(maxsize=500)
         self._ob_queue:    asyncio.Queue = asyncio.Queue(maxsize=500)
+
+    # ------------------------------------------------------------------
+    # from_config — constructie din config object
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_config(cls, cfg: "BybitWsFeedConfig") -> "BybitWsFeed":
+        """Construiește feed-ul dintr-un BybitWsFeedConfig."""
+        return cls(
+            symbol=cfg.symbol,
+            interval=cfg.interval,
+            category=cfg.category,
+            testnet=cfg.testnet,
+            api_key=cfg.api_key,
+            api_secret=cfg.api_secret,
+            ws_max_reconnects=cfg.ws_max_reconnects,
+        )
 
     async def start(self) -> None:
         self._running = True

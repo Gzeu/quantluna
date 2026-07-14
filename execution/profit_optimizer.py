@@ -119,6 +119,10 @@ class ProfitOptimizer:
     def active_count(self) -> int:
         return len(self._positions)
 
+    async def on_price_tick(self, prices: Dict[str, float]) -> List[OptAction]:
+        """Alias for tick() — used by WorkflowOrchestrator optimizer loop."""
+        return await self.tick(prices)
+
     async def tick(self, prices: Dict[str, float]) -> List[OptAction]:
         """
         Evaluate all tracked positions against current prices.

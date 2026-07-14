@@ -136,3 +136,26 @@ async def reset_day() -> JSONResponse:
     engine._day_start_eq  = engine._equity
     engine._day_start_ts  = engine._today_start()
     return JSONResponse(content={"ok": True, "equity_usd": engine._equity})
+
+
+@router.get("/stream")
+async def risk_stream():
+    """SSE endpoint — streams equity updates every 2 seconds."""
+    async def event_stream():
+        while True:
+            try:
+                engine = get_risk_engine()
+                snap = engine.snapshot()
+                payload = json.dumps({
+                    "equity": snap["equity_usd"],
+                    "pnl": snap["pnl_usd"],
+                    "daily_pnl": snap["daily_pnl"],
+                    "drawdown": snap["drawdown_current"],
+                    "trades": snap["total_trades"],
+                    "ts": snap["ts"],
+                })
+                yield f"data: {payload}\n\n"
+            except Exception:
+                yield f"data: {json.dumps({'equity': 0, 'ts': time.time()})}\n\n"
+            await asyncio.sleep(2)
+    return StreamingResponse(event_stream(), media_type="text/event-stream")

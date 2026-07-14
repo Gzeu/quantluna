@@ -1,43 +1,59 @@
 /**
- * pages/index.tsx — S37 polish
- * Dashboard complet — toate componentele existente in grid masonry.
- * NavBar inclus + RiskMetricsLoader + toate paneluri.
+ * pages/index.tsx — v4.0 CyberDark Pro Dashboard
+ * Glassmorphism grid • Live pulse indicators • Sparklines • Staggered animation
  */
 import type { NextPage } from 'next';
-import Head              from 'next/head';
-import NavBar            from '../components/NavBar';
+import Head from 'next/head';
+import NavBar from '../components/NavBar';
 import {
-  StatsBar,
-  MetricsBadge,
-  PnlChart,
-  DrawdownChart,
-  TradeBreakdown,
-  StrategyScores,
-  WatchdogPanel,
-  BalanceTracker,
-  ArbitragePanel,
-  SpreadMonitorPanel,
-  ExecutionLog,
-  MarketHeatmap,
-  CandlestickChart
+  StatsBar, MetricsBadge, PnlChart, DrawdownChart,
+  TradeBreakdown, StrategyScores, WatchdogPanel,
+  BalanceTracker, ArbitragePanel, SpreadMonitorPanel,
+  ExecutionLog, MarketHeatmap, CandlestickChart
 } from '../components';
-import { useRiskMetrics }    from '../hooks/useRiskMetrics';
+import { useRiskMetrics } from '../hooks/useRiskMetrics';
 
 function RiskMetricsLoader() {
   useRiskMetrics();
   return null;
 }
 
-const grid = {
-  display: 'grid',
-  gridTemplateColumns: 'repeat(auto-fill, minmax(340px, 1fr))',
-  gridAutoRows: 'min-content',
-  gap: 16,
-  alignItems: 'start',
-} as const;
+/* ── CSS-in-JS grid system ──────────────────────────────────────── */
+const S = {
+  grid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fit, minmax(360px, 1fr))',
+    gridAutoRows: 'min-content',
+    gap: 18,
+    alignItems: 'start',
+  } as const,
+  full:  { gridColumn: '1 / -1' } as const,
+  span2: { gridColumn: 'span 2' } as const,
+  hero: {
+    gridColumn: '1 / -1',
+    background: 'var(--grad-brand-subtle)',
+    border: '1px solid var(--border-glow)',
+    borderRadius: 'var(--radius-lg)',
+    padding: '24px 28px',
+    boxShadow: 'var(--shadow-glow-purple)',
+    position: 'relative',
+    overflow: 'hidden',
+  } as const,
+};
 
-const full  = { gridColumn: '1/-1' } as const;
-const span2 = { gridColumn: 'span 2' } as const;
+const GlassRow = ({ children, style }: { children: React.ReactNode; style?: object }) => (
+  <section
+    className="ql-card-glass animate-fade-up"
+    style={{
+      padding: '20px 24px',
+      minHeight: 200,
+      display: 'flex', flexDirection: 'column',
+      ...style,
+    }}
+  >
+    {children}
+  </section>
+);
 
 const Dashboard: NextPage = () => (
   <>
@@ -45,67 +61,92 @@ const Dashboard: NextPage = () => (
     <RiskMetricsLoader />
     <NavBar />
     <StatsBar />
+
     <main
-      className="animate-fade-in"
+      className="animate-fade-in stagger"
       style={{
         background: 'var(--bg-body)',
         minHeight: 'calc(100vh - var(--nav-h) - var(--stats-h))',
-        padding: '16px 20px 40px',
-        ...grid,
+        padding: '20px 28px 48px',
+        ...S.grid,
       }}
     >
-      {/* 1 — MetricsBadge full-width */}
-      <section style={full}>
+      {/* ── Hero metrics bar ────────────────────────────────── */}
+      <section style={S.hero}>
+        <div className="flex items-center gap-3 mb-2">
+          <span className="live-dot active" />
+          <span className="text-xs font-bold uppercase tracking-widest text-purple-bright">Live Trading Dashboard</span>
+          <span className="ql-pill ql-pill-green text-[9px]">● Paper Mode</span>
+        </div>
         <MetricsBadge />
       </section>
 
-      {/* 2 — PnL chart span 2 + Watchdog */}
-      <section style={span2}>
+      {/* ── Row 1: PnL Chart (2x) + Watchdog ───────────────── */}
+      <GlassRow style={S.span2}>
+        <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-muted)] mb-3">PnL Performance</span>
         <PnlChart />
-      </section>
-      <section>
+      </GlassRow>
+      <GlassRow>
+        <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-muted)] mb-3">Watchdog Status</span>
         <WatchdogPanel />
-      </section>
+      </GlassRow>
 
-      {/* 2.5 — Drawdown chart span 2 */}
-      <section style={span2}>
+      {/* ── Row 2: Drawdown Chart (2x) ─────────────────────── */}
+      <GlassRow style={S.span2}>
+        <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-muted)] mb-3">Drawdown Profile</span>
         <DrawdownChart />
-      </section>
+      </GlassRow>
 
-      {/* 3 — Spread Monitor + Arbitrage Panel */}
-      <section>
+      {/* ── Row 3: Spread + Arbitrage ──────────────────────── */}
+      <GlassRow>
+        <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-muted)] mb-3">Spread Monitor</span>
         <SpreadMonitorPanel />
-      </section>
-      <section>
+      </GlassRow>
+      <GlassRow>
+        <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-muted)] mb-3">Arbitrage Signals</span>
         <ArbitragePanel />
+      </GlassRow>
+
+      {/* ── Row 4: Trade Breakdown (full) ──────────────────── */}
+      <section style={S.full} className="ql-card animate-fade-up" >
+        <div style={{ padding: '20px 24px' }}>
+          <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-muted)]">Trade Breakdown</span>
+          <TradeBreakdown />
+        </div>
       </section>
 
-      {/* 4 — TradeBreakdown full-width */}
-      <section style={full}>
-        <TradeBreakdown />
+      {/* ── Row 5: Strategy Scores (full) ──────────────────── */}
+      <section style={S.full} className="ql-card animate-fade-up" >
+        <div style={{ padding: '20px 24px' }}>
+          <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-muted)]">Strategy Scores</span>
+          <StrategyScores />
+        </div>
       </section>
 
-      {/* 5 — StrategyScores full-width */}
-      <section style={full}>
-        <StrategyScores />
-      </section>
-
-      {/* 6 — Candlestick span2 + MarketHeatmap */}
-      <section style={span2}>
+      {/* ── Row 6: Candlestick (2x) + Heatmap ──────────────── */}
+      <GlassRow style={S.span2}>
+        <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-muted)] mb-3">Candlestick Chart</span>
         <CandlestickChart />
-      </section>
-      <section>
+      </GlassRow>
+      <GlassRow>
+        <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-muted)] mb-3">Market Heatmap</span>
         <MarketHeatmap />
+      </GlassRow>
+
+      {/* ── Row 7: Execution Log (full) ────────────────────── */}
+      <section style={S.full} className="ql-card animate-fade-up" >
+        <div style={{ padding: '20px 24px' }}>
+          <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-muted)]">Execution Log</span>
+          <ExecutionLog />
+        </div>
       </section>
 
-      {/* 7 — ExecutionLog full-width */}
-      <section style={full}>
-        <ExecutionLog />
-      </section>
-
-      {/* 8 — BalanceTracker full-width */}
-      <section style={full}>
-        <BalanceTracker />
+      {/* ── Row 8: Balance Tracker (full) ──────────────────── */}
+      <section style={S.full} className="ql-card animate-fade-up" >
+        <div style={{ padding: '20px 24px' }}>
+          <span className="text-[10px] font-bold uppercase tracking-wider text-[var(--text-muted)]">Balance Tracker</span>
+          <BalanceTracker />
+        </div>
       </section>
     </main>
   </>

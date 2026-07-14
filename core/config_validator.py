@@ -101,8 +101,8 @@ class ConfigValidator:
                 elif len(val) < 10:
                     errors.append(f"{key} pare invalid (prea scurt)")
 
-        if self._capital < 100:
-            errors.append(f"capital_usdt={self._capital} prea mic (minim recomandat: 100 USDT)")
+        if self._capital < 1:
+            errors.append(f"capital_usdt={self._capital} prea mic (minim recomandat: 1 USDT)")
         elif self._capital < 500:
             warnings.append(f"capital_usdt={self._capital} este mic, risc ridicat de slippage relativ")
 

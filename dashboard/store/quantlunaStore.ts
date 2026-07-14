@@ -112,7 +112,10 @@ let _logIdCounter = 0
 
 export const useQuantLunaStore = create<QuantLunaState>()(
   subscribeWithSelector((set) => ({
-    spread: null, regime: null, pnl: null, tradeStats: null,
+    spread: { z: 0, spread: 0, halfLife: 0, kalmanP: 0, health: 'WARMUP', timestamp: Date.now() },
+    regime: { regime: 'LOADING', cbOpen: false, cbCountdown: 0, wsOk: true, bybitOk: true, binanceOk: false, okxOk: false, latencyMs: 0 },
+    pnl: { total: 0, available: 0, margin: 0, unrealized: 0, dailyPnl: 0, dailyPct: 0, wins: 0, losses: 0, totalTrades: 0, equityHistory: [] },
+    tradeStats: { wins: 0, losses: 0, total_trades: 0, win_rate: 0, avg_win_usd: 0, avg_loss_usd: 0, profit_factor: 0, max_drawdown: 0, max_consecutive_wins: 0, max_consecutive_losses: 0, current_streak: 0, pair_breakdown: [] },
     pairs: [], arb: [], markets: [], logs: [], pnlSeries: {},
     candleSymbol: 'BTC/USDT',
     isLive: false, isPaused: false, activeModal: null,
