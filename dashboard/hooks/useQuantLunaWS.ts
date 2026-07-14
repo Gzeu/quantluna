@@ -55,7 +55,6 @@ export function useQuantLunaWS() {
   const simStreak  = useRef(0)   // pozitiv = wins, negativ = losses
   const lastTradeTs= useRef(0)
 
-  const store = useQuantLunaStore()
 
   const connect = useCallback((endpoint: string, url: string) => {
     try {
@@ -64,10 +63,11 @@ export function useQuantLunaWS() {
       ws.onmessage = ({ data }) => {
         try {
           const msg = JSON.parse(data)
-          if (endpoint === 'spread') store.setSpread(msg)
-          if (endpoint === 'regime') store.setRegime(msg)
+          const st = useQuantLunaStore.getState()
+          if (endpoint === 'spread') st.setSpread(msg)
+          if (endpoint === 'regime') st.setRegime(msg)
           if (endpoint === 'orders') {
-            store.addLog({
+            st.addLog({
               ts: new Date().toISOString().slice(11, 23),
               level: (msg.level ?? 'INFO') as LogLevel,
               module: msg.module ?? 'ORDER',
@@ -92,9 +92,10 @@ export function useQuantLunaWS() {
       }
       wsRefs.current[endpoint] = ws
     } catch {}
-  }, [store])
+  }, []) // stabil — nu depinde de store
 
   const simulateTick = useCallback(() => {
+    const s   = useQuantLunaStore.getState()
     const t   = ++tickRef.current
     const prices = pricesRef.current
 
@@ -105,14 +106,14 @@ export function useQuantLunaWS() {
     const hl     = parseFloat((18.3 + (Math.random() - 0.5)).toFixed(1))
     const kp     = parseFloat(Math.max(0.0001, 0.00124 + (Math.random() - 0.5) * 0.0002).toFixed(6))
 
-    store.setSpread({
+    s.setSpread({
       z, spread, halfLife: hl, kalmanP: kp,
       health: Math.abs(z) < 3 ? 'HEALTHY' : Math.abs(z) < 4 ? 'DEGRADED' : 'STALE',
       timestamp: Date.now(),
     })
 
     const regimes = ['LOW','NORMAL','NORMAL','NORMAL','HIGH','EXTREME'] as const
-    store.setRegime({
+    s.setRegime({
       regime:     regimes[Math.floor(t / 120) % regimes.length],
       cbOpen:     Math.abs(z) > 3.8,
       cbCountdown:Math.abs(z) > 3.8 ? Math.max(0, 30 - (t % 30)) : 0,
@@ -130,7 +131,7 @@ export function useQuantLunaWS() {
       change24Ref.current[sym] += (Math.random() - 0.5) * 0.1
       change24Ref.current[sym]  = Math.max(-10, Math.min(10, change24Ref.current[sym]))
     })
-    store.setMarkets(SYMBOLS.map(sym => ({
+    s.setMarkets(SYMBOLS.map(sym => ({
       symbol:    sym,
       price:     parseFloat(prices[sym].toFixed(4)),
       change24h: parseFloat((change24Ref.current[sym] ?? 0).toFixed(2)),
@@ -152,7 +153,7 @@ export function useQuantLunaWS() {
       }
       // Sync to store tradeStats (sim values until backend responds)
       const total = simWins.current + simLosses.current
-      store.setTradeStats({
+      s.setTradeStats({
         wins:   simWins.current,
         losses: simLosses.current,
         total_trades:           total,
@@ -162,11 +163,11 @@ export function useQuantLunaWS() {
         profit_factor:          total > 0 ? 1.6  + Math.random() * 0.4 : 0,
         max_drawdown:           0.04 + Math.random() * 0.03,
         max_consecutive_wins:   Math.max(simStreak.current > 0 ? simStreak.current : 0,
-                                         store.tradeStats?.max_consecutive_wins ?? 0),
+                                         s.tradeStats?.max_consecutive_wins ?? 0),
         max_consecutive_losses: Math.max(simStreak.current < 0 ? -simStreak.current : 0,
-                                         store.tradeStats?.max_consecutive_losses ?? 0),
+                                         s.tradeStats?.max_consecutive_losses ?? 0),
         current_streak:         simStreak.current,
-        pair_breakdown:         store.tradeStats?.pair_breakdown ?? [
+        pair_breakdown:         s.tradeStats?.pair_breakdown ?? [
           { pair:'BTC/ETH', wins: Math.floor(simWins.current*0.6),
             losses: Math.floor(simLosses.current*0.6),
             total_trades: Math.floor(total*0.6),
@@ -192,7 +193,7 @@ export function useQuantLunaWS() {
     const total   = parseFloat(balanceRef.current.toFixed(2))
     const dpnl    = parseFloat(pnlRef.current.toFixed(2))
     const allTrades = simWins.current + simLosses.current
-    store.setPnl({
+    s.setPnl({
       total,
       available:   parseFloat((total * 0.79).toFixed(2)),
       margin:      parseFloat((total * 0.21).toFixed(2)),
@@ -204,11 +205,11 @@ export function useQuantLunaWS() {
       totalTrades: allTrades,
       equityHistory: [],
     })
-    store.pushPnlPoint('BTC/ETH', dpnl, Date.now())
-    store.pushPnlPoint('SOL/BNB', dpnl * (0.3 + Math.random() * 0.4), Date.now())
+    s.pushPnlPoint('BTC/ETH', dpnl, Date.now())
+    s.pushPnlPoint('SOL/BNB', dpnl * (0.3 + Math.random() * 0.4), Date.now())
 
     // Pairs
-    store.setPairs([
+    s.setPairs([
       { pair:'BTC/ETH', z, halfLife:hl, spread, spreadDelta:parseFloat(((Math.random()-0.5)*0.002).toFixed(5)),
         pnl:parseFloat((pnlRef.current*0.6).toFixed(2)), position: z > 1 ? 'LONG' : z < -1 ? 'SHORT' : 'FLAT' },
       { pair:'SOL/BNB', z:z*0.7, halfLife:22.1, spread:0.0185, spreadDelta:-0.0003,
@@ -230,7 +231,7 @@ export function useQuantLunaWS() {
         ttl:4+Math.floor(Math.random()*22), ttlMax:25, detectedAt:Date.now(),
       })
     })
-    store.setArb(newArb)
+    s.setArb(newArb)
 
     // Execution log
     if (t % 4 === 0) {
@@ -246,12 +247,12 @@ export function useQuantLunaWS() {
       ]
       const [level, module, msg] = entries[Math.floor(Math.random() * entries.length)]
       const d = new Date()
-      store.addLog({
+      s.addLog({
         ts: `${d.toISOString().slice(11,19)}.${String(d.getMilliseconds()).padStart(3,'0')}`,
         level, module, msg,
       })
     }
-  }, [store])
+  }, []) // stabil — acceseaza store prin getState()
 
   useEffect(() => {
     const isPaused = () => useQuantLunaStore.getState().isPaused
@@ -260,10 +261,16 @@ export function useQuantLunaWS() {
     connect('regime', `${WS_BASE}/ws/regime`)
     connect('orders', `${WS_BASE}/ws/orders`)
 
+    // 🔴 FIX: Porneste simulatorul la 4Hz (era oprit — graficele ramaneau goale)
+    simRef.current = setInterval(() => {
+      if (!isPaused()) simulateTick()
+    }, 250)
+
     // Fetch initial data immediately so charts are never empty
     fetch(`${API_BASE}/risk/dashboard`).then(r => r.json()).then(rd => {
       if (rd.equity_usd > 0) {
-        store.setPnl({
+        const st = useQuantLunaStore.getState()
+        st.setPnl({
           total: rd.equity_usd, available: rd.equity_usd * 0.95,
           margin: rd.exposure_usd ?? 0, unrealized: rd.unrealized_pnl ?? 0,
           dailyPnl: rd.daily_pnl ?? 0, dailyPct: rd.daily_pct ?? 0,
@@ -282,8 +289,9 @@ export function useQuantLunaWS() {
         const riskRes = await fetch(`${API_BASE}/risk/dashboard`).catch(() => null)
         if (riskRes?.ok) {
           const rd = await riskRes.json()
+          const st = useQuantLunaStore.getState()
           if (rd.total_trades > 0 || rd.rolling_sharpe !== 0) {
-            store.setTradeStats({
+            st.setTradeStats({
               wins: rd.wins ?? 0, losses: rd.losses ?? 0,
               total_trades: rd.total_trades ?? 0,
               win_rate: rd.win_rate ?? 0,
@@ -302,7 +310,7 @@ export function useQuantLunaWS() {
             equityHistory.push({ t: now, v: rd.equity_usd })
             // Keep last 500 points
             if (equityHistory.length > 500) equityHistory.shift()
-            store.setPnl({
+            st.setPnl({
               total:      rd.equity_usd,
               available:  rd.equity_usd * 0.95,
               margin:     rd.exposure_usd ?? 0,
@@ -324,5 +332,5 @@ export function useQuantLunaWS() {
       if (simRef.current)  clearInterval(simRef.current)
       if (pollRef.current) clearInterval(pollRef.current)
     }
-  }, [connect, simulateTick, store])
+  }, [connect]) // nu mai depinde de simulateTick — e apelat prin ref
 }

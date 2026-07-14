@@ -15,6 +15,7 @@ import { ErrorBoundary }            from '../components/ErrorBoundary';
 import { ToastContainer, useToast } from '../components/Toast';
 import { useQuantLunaWS }           from '../hooks/useQuantLunaWS';
 import { ShortcutsModal }           from '../components/modals';
+import ModalsHost                   from '../components/modals/ModalsHost';
 
 /* ── Nav map: G + key → route ────────────────────────────────── */
 const NAV: Record<string, string> = {
@@ -82,6 +83,7 @@ function AppInner({ Component, pageProps }: AppProps) {
   return (
     <>
       <ShortcutsModal open={help} onClose={() => setHelp(false)} />
+      <ModalsHost />
       <div
         style={{
           opacity: transitioning ? 0.3 : 1,
