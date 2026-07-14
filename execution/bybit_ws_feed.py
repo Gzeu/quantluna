@@ -326,6 +326,11 @@ class BybitWsFeed:
 
         logger.info(f"BybitWsFeed {self.symbol}: WS connected")
 
+        # Mark feed as alive right after subscription so the dead-feed
+        # detector doesn't kill the connection before data starts arriving.
+        self._last_msg_ts = time.time()
+        self._dead_count = 0
+
         try:
             while self._running:
                 # --- process bar queue ---

@@ -96,8 +96,16 @@ class BybitWsBarsAdapter:
             self._running = True
 
         try:
-            bar = await asyncio.wait_for(self._bar_queue.get(), timeout=timeout)
-            return bar
+            updated_symbol = await asyncio.wait_for(self._bar_queue.get(), timeout=timeout)
+            if self._symbol_y in self._prices and self._symbol_x in self._prices:
+                return BarData(
+                    symbol_y  = self._symbol_y,
+                    symbol_x  = self._symbol_x,
+                    price_y   = self._prices[self._symbol_y],
+                    price_x   = self._prices[self._symbol_x],
+                    timestamp = time.time(),
+                )
+            return None
         except asyncio.TimeoutError:
             return None
         except asyncio.CancelledError:

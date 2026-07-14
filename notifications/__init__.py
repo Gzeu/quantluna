@@ -4,7 +4,7 @@ notifications package — public exports
 from notifications.slack_notifier import SlackNotifier, SlackConfig
 
 try:
-    from notifications.telegram import TelegramNotifier  # type: ignore[attr-defined]
+    from notifications.telegram_notifier import TelegramNotifier  # type: ignore[attr-defined]
 except Exception:
     TelegramNotifier = None  # type: ignore[assignment]
 

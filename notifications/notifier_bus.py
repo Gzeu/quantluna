@@ -156,3 +156,26 @@ class NotifierBus:
 
     async def send_raw(self, text: str, level: str = "info") -> None:
         await self._fan_out("send_raw", text=text, level=level)
+
+    # ------------------------------------------------------------------
+    # AlertDispatcher-compatible interface (used by API endpoints)
+    # ------------------------------------------------------------------
+
+    async def emit(self, event) -> None:
+        """Compatibility shim: AlertDispatcher.emit() → NotifierBus.send_raw()."""
+        text = event.payload.get("text", str(event.payload)) if hasattr(event, "payload") else str(event)
+        await self._fan_out("send_raw", text=text, level="info")
+
+    async def emit_sync(self, event) -> bool:
+        """Compatibility shim: AlertDispatcher.emit_sync() → NotifierBus.send_raw()."""
+        text = event.payload.get("text", str(event.payload)) if hasattr(event, "payload") else str(event)
+        await self._fan_out("send_raw", text=text, level="info")
+        return True
+
+    def status(self) -> dict:
+        """Compatibility shim: AlertDispatcher.status() → report active notifiers."""
+        return {
+            "status": "operational",
+            "notifiers": list(self._notifiers.keys()),
+            "enabled": {name: self._enabled.get(name, False) for name in self._notifiers},
+        }

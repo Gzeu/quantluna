@@ -26,9 +26,12 @@ def wire_dashboard_engine(cfg, state_bus) -> None:
     """
     try:
         from risk.dashboard_engine import RiskDashboardEngine
+        raw_cfg = getattr(cfg, "initial_capital", None)
         initial_capital = float(
-            getattr(cfg, "initial_capital", None)
-            or os.getenv("INITIAL_CAPITAL", "10000")
+            os.getenv("INITIAL_CAPITAL_USD")      # primary env var
+            or os.getenv("INITIAL_CAPITAL")        # fallback env var
+            or (str(raw_cfg) if raw_cfg is not None else None)
+            or "10000"                             # final default
         )
         engine = RiskDashboardEngine(initial_capital=initial_capital)
         state_bus.set_risk_engine(engine)
@@ -61,10 +64,10 @@ async def build_notifier_bus(cfg) -> Optional[Any]:
         bus = NotifierBus(fail_silent=True)
         if cfg.telegram_bot_token and cfg.telegram_chat_id:
             try:
-                from notifications.telegram import TelegramNotifier
+                from notifications.telegram_notifier import TelegramNotifier
                 bus.register("telegram", TelegramNotifier(
                     token=cfg.telegram_bot_token,
-                    chat_id=cfg.telegram_chat_id,
+                    chat_ids=[cfg.telegram_chat_id],
                 ))
                 logger.info("main: Telegram notifier registered")
             except Exception as exc:
@@ -85,24 +88,38 @@ async def build_notifier_bus(cfg) -> Optional[Any]:
 
 
 async def build_ws_feed(cfg) -> Optional[Any]:
-    """Build BybitWsFeed. Failure is WARNING-logged; runner may fall back to REST polling."""
+    """Build dual-symbol WS feed (BybitWsBarsAdapter) for pair trading.
+
+    Falls back to single-symbol BybitWsFeed if symbol_x is missing.
+    Failure is WARNING-logged; runner may fall back to REST polling.
+    """
     try:
-        from execution.bybit_ws_feed import BybitWsFeed, BybitWsFeedConfig
-        feed_cfg = BybitWsFeedConfig(
-            symbol_y=cfg.symbol_y,
-            symbol_x=cfg.symbol_x,
-            interval=str(cfg.interval),
-            testnet=os.getenv("BYBIT_TESTNET", "false").lower() == "true",
-        )
-        feed = BybitWsFeed.from_config(feed_cfg)
-        logger.info(
-            "main: BybitWsFeed built ({}/{} {}m)",
-            cfg.symbol_y, cfg.symbol_x, cfg.interval,
-        )
+        from execution.exchange_factory import get_dual_ws_feed, get_ws_feed
+
+        symbol_y = getattr(cfg, "symbol_y", None) or os.getenv("SYMBOL_Y", "")
+        symbol_x = getattr(cfg, "symbol_x", None) or os.getenv("SYMBOL_X", "")
+        interval = str(getattr(cfg, "interval", 5))
+
+        if symbol_y and symbol_x:
+            feed = get_dual_ws_feed(
+                symbol_y=symbol_y,
+                symbol_x=symbol_x,
+                interval=interval,
+            )
+            logger.info(
+                "main: Dual WS feed built ({}/{} {}m)",
+                symbol_y, symbol_x, interval,
+            )
+        else:
+            feed = get_ws_feed(symbol=symbol_y or symbol_x, interval=interval)
+            logger.info(
+                "main: Single WS feed built ({} {}m)",
+                symbol_y or symbol_x, interval,
+            )
         return feed
     except Exception as exc:
         logger.warning(
-            "main: BybitWsFeed build failed — runner will use REST fallback: {}", exc
+            "main: WS feed build failed — runner will use REST fallback: {}", exc
         )
         return None
 
