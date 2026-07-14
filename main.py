@@ -51,6 +51,7 @@ import asyncio
 import os
 import signal
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Load .env before configuration reads env vars
@@ -314,6 +315,36 @@ async def main() -> int:
 
     runner_task = asyncio.create_task(orch.start_runner(ctx))
 
+    # ── Daily summary reporter ─────────────────────────────────────────
+    async def _daily_summary_loop():
+        """Trimite un raport zilnic la ora ~00:05 UTC."""
+        while True:
+            now = datetime.now(timezone.utc)
+            midnight = now.replace(hour=0, minute=5, second=0, microsecond=0)
+            if now >= midnight:
+                midnight += timedelta(days=1)
+            wait_s = (midnight - now).total_seconds()
+            await asyncio.sleep(wait_s)
+            try:
+                if notifier_bus:
+                    # Gather stats from state bus
+                    try:
+                        from core.state_bus import bus as sb
+                        eng = sb.risk_engine
+                        snap = eng.snapshot() if eng else {}
+                    except Exception:
+                        snap = {}
+                    await notifier_bus.send_daily_summary(
+                        trades=snap.get("total_trades", 0),
+                        total_pnl=snap.get("total_pnl_usd", 0),
+                        win_rate=snap.get("win_rate", 0),
+                    )
+                    logger.info("main: daily summary sent")
+            except Exception as exc:
+                logger.warning("main: daily summary failed: {}", exc)
+
+    daily_task = asyncio.create_task(_daily_summary_loop(), name="daily_summary")
+
     # ── S48: Start API server alongside the runner ────────────────────
     api_port = int(os.getenv("API_PORT", "8000"))
     api_host = os.getenv("API_HOST", "0.0.0.0")
@@ -337,7 +368,7 @@ async def main() -> int:
 
     shutdown_task = asyncio.create_task(shutdown_event.wait())
 
-    tasks = [runner_task, shutdown_task]
+    tasks = [runner_task, shutdown_task, daily_task]
     if api_task is not None:
         tasks.append(api_task)
 

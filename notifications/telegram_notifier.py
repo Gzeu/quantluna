@@ -39,7 +39,7 @@ _RETRY_DELAY = 2.0
 class TelegramNotifier:
     """
     Notifier pentru Telegram Bot API.
-    Folosit intern de AlertDispatcher.
+    Folosit intern de AlertDispatcher și NotifierBus.
     """
 
     def __init__(
@@ -53,6 +53,133 @@ class TelegramNotifier:
         self.chat_ids = chat_ids or [cid.strip() for cid in raw_ids.split(",") if cid.strip()]
         self.enabled  = enabled and os.getenv("TELEGRAM_ENABLED", "true").lower() == "true"
         self._client  = httpx.AsyncClient(timeout=10.0)
+
+    # ------------------------------------------------------------------
+    # NotifierBus-compatible API (dispatched via _fan_out)
+    # ------------------------------------------------------------------
+
+    async def send_alert(
+        self,
+        title: str,
+        detail: str = "",
+        level: str = "warning",
+    ) -> None:
+        """Generic alert — wrapped into AlertEvent and sent via Telegram."""
+        severity = Severity.CRITICAL if level == "critical" else Severity.WARNING if level == "warning" else Severity.INFO
+        ev_type = EventType.SYSTEM_ERROR if level == "critical" else EventType.SYSTEM_START
+        event = AlertEvent(
+            event_type=ev_type,
+            payload={"title": title, "detail": detail, "text": f"{title}\n{detail}" if detail else title},
+            severity=severity,
+            source="telegram_notifier",
+        )
+        await self.send(event)
+
+    async def send_entry_signal(
+        self,
+        symbol: str,
+        side: str,
+        zscore: float,
+        confidence: float = 0.0,
+        venue: str = "",
+    ) -> None:
+        """Notify about a new trade entry."""
+        event = AlertEvent(
+            event_type=EventType.TRADE_OPEN,
+            payload={
+                "pair": symbol,
+                "side": side,
+                "side_y": side,
+                "zscore": zscore,
+                "confidence": confidence,
+                "venue": venue,
+                "notional_usdt": 0,
+                "text": f"🟢 ENTRY {symbol} | Side: {side} | Z-score: {zscore:.3f} | Conf: {confidence:.1%}",
+            },
+            severity=Severity.WARNING,
+            source="telegram_notifier",
+        )
+        await self.send(event)
+
+    async def send_exit_signal(
+        self,
+        symbol: str,
+        reason: str,
+        pnl: float | None = None,
+    ) -> None:
+        """Notify about a trade exit."""
+        pnl_str = f" | PnL: {pnl:+.4f}" if pnl is not None else ""
+        event = AlertEvent(
+            event_type=EventType.TRADE_CLOSE,
+            payload={
+                "pair": symbol,
+                "pnl_usdt": pnl or 0,
+                "reason": reason,
+                "text": f"🔴 EXIT {symbol} | Reason: {reason}{pnl_str}",
+            },
+            severity=Severity.INFO,
+            source="telegram_notifier",
+        )
+        await self.send(event)
+
+    async def send_circuit_breaker_trip(
+        self,
+        reason: str,
+        detail: str,
+        cooldown_s: float = 0.0,
+    ) -> None:
+        """Notify about a circuit breaker trip."""
+        cooldown_str = f" | Cooldown: {cooldown_s:.0f}s" if cooldown_s > 0 else ""
+        event = AlertEvent(
+            event_type=EventType.HALT_CASCADE,
+            payload={
+                "text": f"⚡ CIRCUIT BREAKER TRIP\nReason: {reason}\nDetail: {detail}{cooldown_str}",
+                "reason": reason,
+                "detail": detail,
+            },
+            severity=Severity.CRITICAL,
+            source="telegram_notifier",
+        )
+        await self.send(event)
+
+    async def send_daily_summary(
+        self,
+        trades: int = 0,
+        total_pnl: float = 0.0,
+        win_rate: float = 0.0,
+        sharpe: float | None = None,
+    ) -> None:
+        """Daily performance summary (compatible with NotifierBus fan-out)."""
+        emoji = "🟢" if total_pnl >= 0 else "🔴"
+        sharpe_str = f" | Sharpe: {sharpe:.2f}" if sharpe is not None else ""
+        event = AlertEvent(
+            event_type=EventType.SYSTEM_START,
+            payload={
+                "text": (
+                    f"📊 Daily Summary\n"
+                    f"{emoji} PnL: {total_pnl:+.2f} USDT\n"
+                    f"📋 Trades: {trades}\n"
+                    f"📈 Win Rate: {win_rate:.1%}{sharpe_str}"
+                ),
+                "realized_pnl": total_pnl,
+                "trade_count": trades,
+                "win_rate": win_rate,
+            },
+            severity=Severity.INFO,
+            source="telegram_notifier",
+        )
+        await self.send(event)
+
+    async def send_raw(self, text: str, level: str = "info") -> None:
+        """Send a raw text message."""
+        severity = Severity.CRITICAL if level == "critical" else Severity.WARNING if level == "warning" else Severity.INFO
+        event = AlertEvent(
+            event_type=EventType.TEST,
+            payload={"text": text},
+            severity=severity,
+            source="telegram_notifier",
+        )
+        await self.send(event)
 
     async def send(self, event: AlertEvent) -> bool:
         """Trimite alertă la toate chat_ids configurate."""
