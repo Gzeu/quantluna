@@ -91,6 +91,10 @@ def _parse_args() -> argparse.Namespace:
         help="Skip pre-flight health check. Use only in CI or isolated tests.",
     )
     parser.add_argument(
+        "--force", action="store_true", default=False,
+        help="Force singleton lock takeover if another runner is active.",
+    )
+    parser.add_argument(
         "--log-level", type=str, default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
@@ -380,6 +384,31 @@ async def main() -> int:
     mode = "live" if not cfg.dry_run else "paper"
     _validate_config(cfg, mode)
 
+    # ── S48 P0: Singleton lock — prevent duplicate runners ────────────
+    from core.singleton_lock import SingletonLock
+    singleton_lock = SingletonLock("state/quantluna.lock")
+    force_takeover = getattr(args, "force", False)
+    if not singleton_lock.acquire(app_version="0.33.0", mode=mode, force=force_takeover):
+        logger.error("Another QuantLuna runner is already active. Exiting.")
+        return 1
+
+    # ── S48 P0: Centralized Bybit traffic controller ──────────────────
+    from core.bybit_traffic_controller import (
+        BybitTrafficController, TrafficConfig, get_traffic_controller, set_traffic_controller,
+    )
+    traffic_cfg = TrafficConfig()
+    traffic_ctrl = BybitTrafficController(traffic_cfg)
+    set_traffic_controller(traffic_ctrl)
+    logger.info(
+        "main: Traffic controller ready ({} RPM, {} concurrent, circuit={})",
+        traffic_cfg.max_rest_rpm, traffic_cfg.max_concurrent,
+        traffic_cfg.circuit_breaker_enabled,
+    )
+
+    # Inject traffic controller into diagnostics API
+    from api.diagnostics import set_traffic_state
+    set_traffic_state({"controller": traffic_ctrl, "lock": singleton_lock})
+
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
     _install_signal_handlers(loop, shutdown_event)
@@ -475,6 +504,9 @@ async def main() -> int:
         except asyncio.CancelledError:
             logger.info("main: runner cancelled cleanly")
 
+    # Release singleton lock
+    singleton_lock.release()
+    logger.info("main: shutdown complete")
     return 0
 
 

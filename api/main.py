@@ -76,6 +76,9 @@ from api.ws_routes import ws_router
 # ─ Router S47 — AI/ML signal layer ─────────────────────────────────────────
 from api.ml import ml_router, set_ml_state
 
+# ─ Router S48 — Diagnostics ──────────────────────────────────────────────
+from api.diagnostics import diagnostics_router, set_traffic_state
+
 # ─ Orchestrator ─────────────────────────────────────────────────────────────
 from notifications.alert_dispatcher import AlertDispatcher
 from core.workflow_orchestrator import WorkflowOrchestrator
@@ -329,6 +332,9 @@ app.include_router(ws_router)
 
 # ─ Router S47 — AI/ML signal layer ───────────────────────────────────────
 app.include_router(ml_router, prefix="/api/ml", tags=["ml"])
+
+# ─ Router S48 P0 — Diagnostics ───────────────────────────────────────────
+app.include_router(diagnostics_router)
 
 
 @app.get("/", tags=["root"])
