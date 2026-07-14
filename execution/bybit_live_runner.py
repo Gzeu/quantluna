@@ -413,7 +413,7 @@ class BybitLiveRunner:
             sig_cfg = SignalConfig()
             self._signal_generator = SignalGenerator(
                 spread_engine=self._spread_engine,
-                config=sig_cfg,
+                cfg=sig_cfg,
                 cooldown_bars=getattr(self.cfg, "cooldown_seconds", 300) // max(
                     self.cfg.interval * 60, 60
                 ),
