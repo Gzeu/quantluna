@@ -36,7 +36,7 @@ from fastapi.staticfiles import StaticFiles
 try:
     from core.state_bus import bus
 except ImportError:
-    from state_bus import bus  # legacy fallback
+    from core.state_bus import bus  # canonical
 
 from core.metrics import (
     active_positions,

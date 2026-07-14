@@ -326,7 +326,7 @@ class LiveTrader:
         signal, active_name = self.selector.generate_one(ctx)
 
         try:
-            from state_bus import publish
+            from core.state_bus import publish
             publish("live_bar", {
                 "ts": bar_y.timestamp.isoformat(), "spread": round(spread, 6),
                 "zscore": round(zscore, 4), "regime": regime,

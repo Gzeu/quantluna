@@ -1,44 +1,44 @@
-# QuantLuna — Python dependencies
-# Generated: S37
+# QuantLuna — pinned dependencies
+# Generated: 2026-07-14
+# Source: requirements.in
+# To regenerate: pip-compile requirements.in -o requirements.txt
+# Or: .venv/bin/python -m pip freeze | grep -iE "fastapi|uvicorn|pydantic|..." > requirements.txt
 
-# Core async
-asyncio==3.4.3
+# Core API
+fastapi==0.139.0
+uvicorn[standard]==0.29.0
+pydantic==2.13.4
+pydantic-core==2.46.4
+pydantic-settings==2.14.2
+httpx==0.28.1
+aiohttp==3.14.1
 
-# Exchange
-pybit>=5.6.0
+# Data & numerics
+numpy==2.5.0
+pandas==2.3.3
+scipy==1.13.0
+statsmodels==0.14.0
 
-# Numerics
-numpy>=1.26
-pandas>=2.2
-scipy>=1.13
+# Exchange SDKs
+pybit==5.16.0
+python-binance==1.0.37
 
-# Kalman
-pykalman>=0.9.7
-
-# API
-fastapi>=0.111
-uvicorn[standard]>=0.29
-httpx>=0.27
-
-# Services monitoring
-psutil>=5.9
-
-# Config
-python-dotenv>=1.0
-pydantic>=2.7
-pydantic-settings>=2.2
-
-# Logging
-loguru>=0.7
-
-# Redis (optional, pentru pub/sub multi-process)
-redis>=5.0
-
-# Notifications
-aiohttp>=3.9
+# Redis (optional, distributed state)
+redis==5.0.0
 
 # Scheduling
-apscheduler>=3.10
+APScheduler==3.11.3
 
-# Stats / backtest
-statsmodels>=0.14
+# Logging
+loguru==0.7.3
+
+# System
+psutil==7.2.2
+python-dotenv==1.0.0
+
+# Kalman filter
+pykalman==0.11.2
+
+# Testing
+pytest==9.1.1
+pytest-asyncio==1.4.0
