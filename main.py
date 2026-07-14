@@ -276,6 +276,69 @@ def _install_signal_handlers(loop, shutdown_event) -> None:
             signal.signal(sig, lambda s, _: _handle_signal(signal.Signals(s)))
 
 
+def _inject_api_state(orch, ctx, notifier_bus) -> None:
+    """Inject orchestrator state into API routers so dashboard gets live data."""
+    try:
+        # Build sizing engine (same logic as api/main.py lifespan)
+        from risk.bybit_position_sizer import BybitPositionSizer
+        from risk.sizing_engine import SizingEngine
+
+        raw_engine = getattr(ctx, "sizing_engine", None)
+        if isinstance(raw_engine, SizingEngine):
+            sizing_engine = raw_engine
+        elif raw_engine is not None:
+            try:
+                sizing_engine = SizingEngine(sizer=raw_engine)
+            except Exception:
+                sizing_engine = SizingEngine(sizer=BybitPositionSizer(
+                    capital_usdt=float(os.getenv("INITIAL_CAPITAL_USD", "10000")),
+                    max_leverage=float(os.getenv("MAX_LEVERAGE", "3.0")),
+                    kelly_fraction=os.getenv("KELLY_FRACTION", "half"),
+                    max_position_pct=float(os.getenv("MAX_POSITION_PCT", "0.25")),
+                ))
+        else:
+            sizing_engine = SizingEngine(sizer=BybitPositionSizer(
+                capital_usdt=float(os.getenv("INITIAL_CAPITAL_USD", "10000")),
+                max_leverage=float(os.getenv("MAX_LEVERAGE", "3.0")),
+                kelly_fraction=os.getenv("KELLY_FRACTION", "half"),
+                max_position_pct=float(os.getenv("MAX_POSITION_PCT", "0.25")),
+            ))
+
+        decision_engine = getattr(ctx, "decision_engine", None)
+        watchdog = getattr(orch, "watchdog", None)
+
+        from api.sizing import set_sizing_state
+        set_sizing_state({
+            "sizing_engine": sizing_engine,
+            "decision_engine": decision_engine,
+        })
+
+        from api.decision import set_decision_state
+        set_decision_state({"decision_engine": decision_engine})
+
+        from api.watchdog import set_watchdog_state
+        set_watchdog_state({
+            "watchdog": watchdog,
+            "dispatcher": notifier_bus,
+        })
+
+        from api.optimizer import set_optimizer_state
+        set_optimizer_state({
+            "running": False,
+            "last_run": None,
+            "last_results": {},
+            "pairs": orch.pairs if hasattr(orch, "pairs") else [],
+            "auto_reoptimizer": orch.reoptimizer if hasattr(orch, "reoptimizer") else None,
+        })
+
+        from api.notifications import set_dispatcher
+        set_dispatcher(notifier_bus)
+
+        logger.info("main: API state injected — dashboard should see live data")
+    except Exception as exc:
+        logger.warning("main: API state injection failed: {}", exc)
+
+
 async def main() -> int:
     args = _parse_args()
     os.makedirs(LOG_DIR, exist_ok=True)
@@ -355,11 +418,37 @@ async def main() -> int:
         return 1
 
     runner_task = asyncio.create_task(orch.start_runner(ctx))
+
+    # ── S48: Start API server alongside the runner ────────────────────
+    api_port = int(os.getenv("API_PORT", "8000"))
+    api_host = os.getenv("API_HOST", "0.0.0.0")
+    api_task = None
+    try:
+        # Inject orchestrator state into API routers (same as api/main.py lifespan)
+        _inject_api_state(orch, ctx, notifier_bus)
+
+        import uvicorn
+        from api.main import app
+
+        api_config = uvicorn.Config(
+            app, host=api_host, port=api_port,
+            log_level="info", lifespan="off",  # we manage lifecycle ourselves
+        )
+        api_server = uvicorn.Server(api_config)
+        api_task = asyncio.create_task(api_server.serve(), name="api_server")
+        logger.info("main: API server starting on {}:{}", api_host, api_port)
+    except Exception as exc:
+        logger.warning("main: Could not start API server: {}", exc)
+
     shutdown_task = asyncio.create_task(shutdown_event.wait())
+
+    tasks = [runner_task, shutdown_task]
+    if api_task is not None:
+        tasks.append(api_task)
 
     timeout = _RUNNER_TIMEOUT if _RUNNER_TIMEOUT > 0 else None
     done, _ = await asyncio.wait(
-        [runner_task, shutdown_task],
+        tasks,
         return_when=asyncio.FIRST_COMPLETED,
         timeout=timeout,
     )
@@ -374,6 +463,9 @@ async def main() -> int:
 
     if not shutdown_task.done():
         shutdown_task.cancel()
+
+    if api_task is not None and not api_task.done():
+        api_task.cancel()
 
     if not runner_task.done():
         logger.info("main: cancelling runner task...")
