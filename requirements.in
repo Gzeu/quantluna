@@ -1,33 +1,44 @@
-# QuantLuna — pinned direct dependencies
+# QuantLuna — direct dependencies
 # Run: pip-compile requirements.in -o requirements.txt
+# Or: pip install -r requirements.in  (for editable install)
+#
+# requirements.txt contains pinned transitive deps; .in is the source.
+# When adding a dependency: add it HERE, then regenerate requirements.txt.
 
-# Core
-fastapi>=0.111.0
+# Core API
+fastapi>=0.139.0
 uvicorn[standard]>=0.29.0
-pydantic>=2.7.0
-httpx>=0.27.0
-aiohttp>=3.9.0
+pydantic>=2.13.0
+pydantic-settings>=2.14.0
+httpx>=0.28.0
+aiohttp>=3.14.0
 
-# Data
-numpy>=1.26.0
-pandas>=2.2.0
+# Data & numerics
+numpy>=2.5.0
+pandas>=2.3.0
 scipy>=1.13.0
-pyarrow>=16.0.0
-requests>=2.32.0
+statsmodels>=0.14.0
 
 # Exchange SDKs
-python-binance>=1.0.19
-pybit>=5.8.0
+pybit>=5.16.0
+python-binance>=1.0.37
 
 # Redis (optional, for distributed state)
 redis>=5.0.0
 
-# Notifications
-# aiohttp covers Telegram + Discord (no extra dep)
+# Scheduling
+APScheduler>=3.11.0
 
-# Backtesting
-statsmodels>=0.14.0
+# Logging
+loguru>=0.7.0
 
-# Dev / test
-pytest>=8.2.0
-pytest-asyncio>=0.23.0
+# System
+psutil>=7.2.0
+python-dotenv>=1.0.0
+
+# Kalman filter
+pykalman>=0.11.0
+
+# Testing
+pytest>=9.0.0
+pytest-asyncio>=1.4.0
