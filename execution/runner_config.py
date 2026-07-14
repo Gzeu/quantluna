@@ -73,6 +73,8 @@ class BybitLiveRunnerConfig:
     pnl_reconciler_enabled: bool = os.getenv("PNL_RECONCILER_ENABLED", "true").lower() == "true"
     market_trade_enabled:   bool = os.getenv("MARKET_TRADE_ENABLED",   "true").lower() == "true"
     ml_enabled:             bool = os.getenv("ML_ENABLED",             "false").lower() == "true"
+    kalman_enabled:         bool = os.getenv("KALMAN_ENABLED",         "true").lower() == "true"
+    profit_guard_enabled:   bool = os.getenv("PROFIT_GUARD_ENABLED",   "true").lower() == "true"
 
     # Checkpoint
     checkpoint_path: str = os.getenv("CHECKPOINT_PATH", "state/position_checkpoint.db")

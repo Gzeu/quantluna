@@ -360,7 +360,7 @@ class WorkflowOrchestrator:
         while ctx.optimizer.active_count > 0:
             try:
                 prices = await price_feed_callback()
-                actions = await ctx.optimizer.on_price_tick(prices)
+                actions = await ctx.optimizer.tick(prices)
                 for action in actions:
                     logger.info("[OLoop] {} {} qty={:.4f} reason={} PnL={:+.2f}",
                                 action.symbol, action.action_type.value,

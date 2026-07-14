@@ -17,6 +17,7 @@ Backward-compatible re-exports so existing callers don't need changes::
 from __future__ import annotations
 
 import asyncio
+import os
 from typing import Any, Optional
 
 from loguru import logger
@@ -60,6 +61,12 @@ class BybitLiveRunner:
         self._bus_ext     = notifier_bus
         self._stop_event  = asyncio.Event()
 
+        # S48: Kalman, signal generator, profit guard (lazy init in start())
+        self._kalman: Optional[object] = None
+        self._signal_generator: Optional[object] = None
+        self._profit_guard: Optional[object] = None
+        self._spread_engine: Optional[object] = None
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -78,6 +85,9 @@ class BybitLiveRunner:
 
         # \u2500\u2500 ML pipeline (S47) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         ml_engine, signal_fusion = self._build_ml_pipeline()
+
+        # \u2500\u2500 S48: Kalman filter + SignalGenerator v4 \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        self._build_signal_pipeline(notifier_bus)
 
         if notifier_bus:
             await notifier_bus.send_alert(
@@ -307,6 +317,84 @@ class BybitLiveRunner:
             return None, None
 
     # ------------------------------------------------------------------
+    # Signal pipeline (S48 — Kalman + SignalGenerator v4 + ProfitGuard)
+    # ------------------------------------------------------------------
+
+    def _build_signal_pipeline(self, notifier_bus=None) -> None:
+        """Build Kalman filter, SpreadEngine, SignalGenerator v4, and ProfitGuard."""
+        kalman_enabled = getattr(
+            self.cfg, "kalman_enabled",
+            os.environ.get("KALMAN_ENABLED", "true").lower() == "true",
+        )
+
+        if not kalman_enabled:
+            logger.info("BybitLiveRunner: Kalman/SignalGenerator pipeline disabled")
+            return
+
+        try:
+            # 1. Kalman filter
+            from core.kalman_filter import KalmanHedgeRatio
+            delta = getattr(self.cfg, "delta", float(
+                os.environ.get("KALMAN_DELTA", "1e-4")
+            ))
+            self._kalman = KalmanHedgeRatio(delta=delta)
+            logger.info("BybitLiveRunner: KalmanHedgeRatio ready (delta={})", delta)
+
+            # 2. SpreadEngine
+            from core.spread import SpreadEngine
+            zscore_window = getattr(self.cfg, "kalman_window", 200)
+            bar_freq = getattr(self.cfg, "interval", 5)
+            bar_freq_hours = max(bar_freq / 60.0, 0.016)  # minutes → hours
+            self._spread_engine = SpreadEngine(
+                kalman=self._kalman,
+                zscore_window=zscore_window,
+                bar_freq_hours=bar_freq_hours,
+            )
+
+            # 3. SignalGenerator v4
+            from config.settings import SignalConfig
+            from strategy.signal import SignalGenerator
+            sig_cfg = SignalConfig()
+            self._signal_generator = SignalGenerator(
+                spread_engine=self._spread_engine,
+                config=sig_cfg,
+                cooldown_bars=getattr(self.cfg, "cooldown_seconds", 300) // max(
+                    self.cfg.interval * 60, 60
+                ),
+            )
+            logger.info(
+                "BybitLiveRunner: SignalGenerator v4 ready "
+                "(entry_z={:.1f}, exit_z={:.1f}, stop_z={:.1f})",
+                sig_cfg.zscore_entry, sig_cfg.zscore_exit, sig_cfg.zscore_stop,
+            )
+
+            # 4. ProfitGuard (S48)
+            pg_enabled = getattr(
+                self.cfg, "profit_guard_enabled",
+                os.environ.get("PROFIT_GUARD_ENABLED", "true").lower() == "true",
+            )
+            if pg_enabled:
+                try:
+                    from execution.profit_guard import ProfitGuard, ProfitGuardConfig
+                    pg_cfg = ProfitGuardConfig()
+                    self._profit_guard = ProfitGuard(pg_cfg, notifier_bus=notifier_bus)
+                    logger.info(
+                        "BybitLiveRunner: ProfitGuard ready "
+                        "(tp_improvement={:.1f}z, ladder={}, trailing={})",
+                        pg_cfg.tp_zscore_improvement,
+                        pg_cfg.ladder_enabled,
+                        pg_cfg.trailing_enabled,
+                    )
+                except ImportError:
+                    logger.warning("BybitLiveRunner: ProfitGuard not available")
+                    self._profit_guard = None
+
+        except ImportError as exc:
+            logger.warning("BybitLiveRunner: Signal pipeline imports failed: {}", exc)
+        except Exception as exc:
+            logger.warning("BybitLiveRunner: Signal pipeline build failed: {}", exc)
+
+    # ------------------------------------------------------------------
     # Main trading loop
     # ------------------------------------------------------------------
 
@@ -323,6 +411,7 @@ class BybitLiveRunner:
     ) -> None:
         watchdog_task = asyncio.create_task(watchdog.run())
         first_bar = True
+        bar_count = 0
 
         while not self._stop_event.is_set():
             try:
@@ -331,30 +420,86 @@ class BybitLiveRunner:
                     await asyncio.sleep(0.1)
                     continue
 
-                # Calculate spread manually for new SpreadMonitor API
-                spread = bar.price_y / bar.price_x
-                zscore = 0.0  # Would need Kalman for real zscore
-                half_life = 24.0  # Default half-life
+                bar_count += 1
+
+                # ── S48: Compute REAL z-score via Kalman filter ────────
+                spread = bar.price_y / bar.price_x if bar.price_x > 0 else 1.0
+
+                if self._kalman is not None and self._spread_engine is not None:
+                    try:
+                        # Incremental Kalman update
+                        ss = self._spread_engine.update_one(
+                            y=bar.price_y, x=bar.price_x,
+                            ts=getattr(bar, "timestamp", bar_count),
+                        )
+                        zscore = float(ss.get("zscore", 0.0))
+                        half_life = float(ss.get("half_life_hours", 24.0))
+                        beta = float(ss.get("beta", 1.0))
+                        uncertainty = float(ss.get("uncertainty", 0.0))
+                        kalman_warm = bool(ss.get("is_warm", False))
+                    except Exception as exc:
+                        logger.debug("Kalman update failed: {} — using fallback", exc)
+                        zscore = 0.0
+                        half_life = 24.0
+                        beta = 1.0
+                        uncertainty = 0.0
+                        kalman_warm = False
+                else:
+                    zscore = 0.0
+                    half_life = 24.0
+                    beta = 1.0
+                    uncertainty = 0.0
+                    kalman_warm = False
+
                 report = spread_monitor.update(spread, zscore, half_life)
-                zscore = report.zscore
+                zscore = getattr(report, "zscore", zscore)
 
                 if first_bar:
                     logger.info(
-                        "BybitLiveRunner: first bar | spread={:.6f} z={:.4f}",
-                        spread, zscore,
+                        "BybitLiveRunner: first bar | spread={:.6f} z={:.4f} "
+                        "hl={:.1f}h kalman_warm={}",
+                        spread, zscore, half_life, kalman_warm,
                     )
                     first_bar = False
 
                 if not circuit_breaker.is_available():
-                    logger.warning(
-                        "BybitLiveRunner: circuit OPEN — blocking trades"
-                    )
+                    logger.warning("BybitLiveRunner: circuit OPEN — blocking trades")
                     await asyncio.sleep(1.0)
                     continue
 
                 if self.cfg.funding_gate_enabled and not funding_gate.is_open(ws_feed):
                     logger.info("BybitLiveRunner: funding gate CLOSED")
                     continue
+
+                # ── S48: SignalGenerator v4 check ──────────────────────
+                v4_action = None
+                if self._signal_generator is not None and kalman_warm:
+                    try:
+                        trade_signal = self._signal_generator.generate_live(
+                            y=bar.price_y, x=bar.price_x,
+                            ts=getattr(bar, "timestamp", None),
+                            funding_annual=0.0,
+                            regime_multiplier=1.0,
+                            coint_valid=True,
+                        )
+                        if trade_signal.signal is not None:
+                            sig_val = int(trade_signal.signal)
+                            if sig_val == 2:  # PARTIAL_EXIT
+                                v4_action = "partial_exit"
+                                logger.info(
+                                    "SignalGen v4: PARTIAL_EXIT z={:.3f} "
+                                    "close={:.0%}",
+                                    zscore, getattr(trade_signal, "partial_close_pct", 0.5),
+                                )
+                            elif sig_val == 0:  # EXIT (v4 reasons: hard_stop, time_stop, etc.)
+                                v4_action = "exit"
+                                reason = getattr(trade_signal, "reason", "v4_exit")
+                                logger.info(
+                                    "SignalGen v4: EXIT z={:.3f} reason={}",
+                                    zscore, reason,
+                                )
+                    except Exception as exc:
+                        logger.debug("SignalGen v4 error: {}", exc)
 
                 # ── ML inference step (S47) ───────────────────────────
                 if ml_engine is not None:
@@ -367,10 +512,8 @@ class BybitLiveRunner:
                             "low": getattr(bar, "low", bar.price_y),
                         }
                         spread_state = {
-                            "spread": spread,
-                            "zscore": zscore,
-                            "beta": getattr(report, "beta", 1.0),
-                            "uncertainty": getattr(report, "kalman_p_diag", 0.0),
+                            "spread": spread, "zscore": zscore, "beta": beta,
+                            "uncertainty": uncertainty,
                             "half_life_hours": half_life,
                             "regime": getattr(report, "regime", "unknown"),
                             "vol_regime": getattr(report, "vol_regime", "NORMAL"),
@@ -378,16 +521,12 @@ class BybitLiveRunner:
                         ml_dir, ml_conf = ml_engine.update(bar_dict, spread_state)
                         if signal_fusion is not None and ml_engine.is_warm:
                             fused = signal_fusion.fuse(
-                                ml_direction=ml_dir,
-                                ml_confidence=ml_conf,
+                                ml_direction=ml_dir, ml_confidence=ml_conf,
                                 zscore=zscore,
                                 zscore_threshold=self.cfg.entry_zscore,
                                 regime=getattr(report, "regime", "unknown"),
                             )
-                            # Blend ML with Z-score: use fused direction to
-                            # bias the zscore fed to the decision engine
                             if fused.should_trade and abs(ml_dir) > 0.2:
-                                # ML strongly directional → shift effective zscore
                                 effective_zscore = zscore * (1.0 - fused.ml_contribution) + ml_dir * 3.5 * fused.ml_contribution
                             else:
                                 effective_zscore = zscore
@@ -399,10 +538,59 @@ class BybitLiveRunner:
                 else:
                     effective_zscore = zscore
 
-                action = decision_engine.decide(effective_zscore, circuit_breaker, order_manager)
+                # ── S48: ProfitGuard check ─────────────────────────────
+                if self._profit_guard is not None and order_manager.has_position():
+                    try:
+                        guard_action = self._profit_guard.update(
+                            pair=f"{self.cfg.symbol_y}/{self.cfg.symbol_x}",
+                            zscore=zscore,
+                            spread=spread,
+                            prices=(bar.price_y, bar.price_x),
+                            order_manager=order_manager,
+                        )
+                        if guard_action.action == "FULL_CLOSE":
+                            v4_action = "exit"
+                            logger.info(
+                                "ProfitGuard: {} | z={:.3f}",
+                                guard_action.reason, zscore,
+                            )
+                        elif guard_action.action == "PARTIAL_CLOSE":
+                            v4_action = "partial_exit"
+                            logger.info(
+                                "ProfitGuard: PARTIAL_CLOSE {:.0%} | {}",
+                                guard_action.close_ratio, guard_action.reason,
+                            )
+                    except Exception as exc:
+                        logger.debug("ProfitGuard error: {}", exc)
+
+                # ── Decision & execution ───────────────────────────────
+                # SignalGenerator v4 / ProfitGuard override takes precedence
+                if v4_action == "exit":
+                    action = "exit"
+                elif v4_action == "partial_exit":
+                    # Use partial exit handler if available
+                    try:
+                        from execution.partial_exit_handler import handle_partial_exit
+                        await handle_partial_exit(
+                            order_manager=order_manager,
+                            order_router=order_router,
+                            partial_close_pct=0.5,
+                        )
+                    except ImportError:
+                        action = "exit"  # fallback to full exit
+                    except Exception as exc:
+                        logger.warning("Partial exit failed: {} — falling back", exc)
+                        action = "exit"
+                    else:
+                        action = None  # partial exit handled externally
+                else:
+                    action = decision_engine.decide(
+                        effective_zscore, circuit_breaker, order_manager,
+                    )
+
                 if action:
                     await executor.execute(
-                        action, order_router, order_manager, notifier_bus, bar
+                        action, order_router, order_manager, notifier_bus, bar,
                     )
 
             except asyncio.CancelledError:
