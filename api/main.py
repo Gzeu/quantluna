@@ -79,6 +79,9 @@ from api.ml import ml_router, set_ml_state
 # ─ Router S48 — Diagnostics ──────────────────────────────────────────────
 from api.diagnostics import diagnostics_router, set_traffic_state
 
+# ─ Router S48 — Account & Positions ──────────────────────────────────────
+from api.account import account_router, set_account_state
+
 # ─ Orchestrator ─────────────────────────────────────────────────────────────
 from notifications.alert_dispatcher import AlertDispatcher
 from core.workflow_orchestrator import WorkflowOrchestrator
@@ -335,6 +338,9 @@ app.include_router(ml_router, prefix="/api/ml", tags=["ml"])
 
 # ─ Router S48 P0 — Diagnostics ───────────────────────────────────────────
 app.include_router(diagnostics_router)
+
+# ─ Router S48 P0 — Account & Positions ───────────────────────────────────
+app.include_router(account_router)
 
 
 @app.get("/", tags=["root"])

@@ -409,6 +409,17 @@ async def main() -> int:
     from api.diagnostics import set_traffic_state
     set_traffic_state({"controller": traffic_ctrl, "lock": singleton_lock})
 
+    # ── S48 P0: Account snapshot service ─────────────────────────────
+    from core.account_snapshot import AccountSyncService
+    account_sync = AccountSyncService(exchange=None, traffic_ctrl=traffic_ctrl)
+    from api.account import set_account_state
+    set_account_state({
+        "sync_service": account_sync,
+        "traffic_ctrl": traffic_ctrl,
+        "orchestrator": None,  # filled after orchestrator build
+    })
+    logger.info("main: AccountSyncService initialized")
+
     loop = asyncio.get_running_loop()
     shutdown_event = asyncio.Event()
     _install_signal_handlers(loop, shutdown_event)
