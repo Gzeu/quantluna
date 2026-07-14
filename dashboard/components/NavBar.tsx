@@ -107,6 +107,7 @@ export default function NavBar() {
     { href: '/strategy',  label: '🧠 Strategy' },
     { href: '/risk',      label: '🛡 Risk' },
     { href: '/backtest',  label: '🔭 Backtest' },
+    { href: '/compare',   label: '📊 Compare' },
   ];
 
   return (

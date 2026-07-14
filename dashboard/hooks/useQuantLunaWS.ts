@@ -332,5 +332,5 @@ export function useQuantLunaWS() {
       if (simRef.current)  clearInterval(simRef.current)
       if (pollRef.current) clearInterval(pollRef.current)
     }
-  }, [connect]) // nu mai depinde de simulateTick — e apelat prin ref
+  }, [connect, simulateTick]) // simulateTick e stabil ([] deps) — HMR-safe
 }

@@ -27,6 +27,7 @@ const NAV: Record<string, string> = {
   t: '/strategy',
   r: '/risk',
   b: '/backtest',
+  c: '/compare',
 };
 
 /* ── Inner app (needs ToastContainer context) ───────────────────── */
