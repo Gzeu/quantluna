@@ -333,19 +333,21 @@ class BybitWsFeed:
 
         try:
             while self._running:
-                # --- process bar queue ---
-                while not self._bar_queue.empty():
-                    try:
-                        msg = self._bar_queue.get_nowait()
-                        if self.on_bar:
+                # --- process bar queue (callback mode only) ---
+                # In stream mode (on_bar=None), messages stay in the
+                # queue for stream_bars() / get_bar() to consume.
+                if self.on_bar:
+                    while not self._bar_queue.empty():
+                        try:
+                            msg = self._bar_queue.get_nowait()
                             if inspect.iscoroutinefunction(self.on_bar):
                                 await self.on_bar(msg)
                             else:
                                 await asyncio.get_event_loop().run_in_executor(
                                     None, self.on_bar, msg
                                 )
-                    except asyncio.QueueEmpty:
-                        break
+                        except asyncio.QueueEmpty:
+                            break
 
                 # --- process orderbook queue ---
                 while not self._ob_queue.empty():

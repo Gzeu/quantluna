@@ -27,11 +27,12 @@ def wire_dashboard_engine(cfg, state_bus) -> None:
     try:
         from risk.dashboard_engine import RiskDashboardEngine
         raw_cfg = getattr(cfg, "initial_capital", None)
+        # Priority: cfg.initial_capital (auto-detected from Bybit) > env var > default
         initial_capital = float(
-            os.getenv("INITIAL_CAPITAL_USD")      # primary env var
-            or os.getenv("INITIAL_CAPITAL")        # fallback env var
-            or (str(raw_cfg) if raw_cfg is not None else None)
-            or "10000"                             # final default
+            (str(raw_cfg) if raw_cfg is not None else None)
+            or os.getenv("INITIAL_CAPITAL_USD")
+            or os.getenv("INITIAL_CAPITAL")
+            or "10000"
         )
         engine = RiskDashboardEngine(initial_capital=initial_capital)
         state_bus.set_risk_engine(engine)
