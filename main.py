@@ -89,7 +89,10 @@ def _parse_args() -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--dry-run", action="store_true", default=None)
-    parser.add_argument("--pair", type=str, default=None, metavar="Y/X")
+    parser.add_argument("--pairs", type=str, default=None, metavar="Y/X,Y/X",
+                        help="Comma-separated pairs: ETHUSDT/SOLUSDT,BTCUSDT/ETHUSDT")
+    parser.add_argument("--pair", type=str, default=None, metavar="Y/X",
+                        help="[deprecated] Single pair — use --pairs instead")
     parser.add_argument("--interval", type=str, default=None, metavar="MIN")
     parser.add_argument(
         "--skip-health",
@@ -219,26 +222,44 @@ async def main() -> int:
 
     if args.dry_run:
         cfg.dry_run = True
-    if args.pair:
-        parts = args.pair.split("/")
-        if len(parts) == 2 and parts[0] and parts[1]:
-            cfg.symbol_y, cfg.symbol_x = parts[0].upper(), parts[1].upper()
-        else:
-            logger.error("Invalid --pair format: {!r} (expected Y/X)", args.pair)
-            return 1
-    if args.interval:
-        cfg.interval = args.interval
 
-    # Auto-detect initial capital from Bybit unless manually set
-    cfg.initial_capital = await BybitLiveRunnerConfig.resolve_initial_capital(cfg)
+    # ── Parse pairs ─────────────────────────────────────────────────────
+    raw_pairs = args.pairs or args.pair or os.getenv("PAIRS", "ETHUSDT/SOLUSDT")
+    if "/" in raw_pairs and "," not in raw_pairs:
+        pair_list = [raw_pairs]
+    else:
+        pair_list = [p.strip() for p in raw_pairs.split(",") if p.strip()]
+
+    parsed_pairs = []
+    for raw in pair_list:
+        parts = raw.split("/")
+        if len(parts) == 2 and parts[0] and parts[1]:
+            parsed_pairs.append((parts[0].upper(), parts[1].upper()))
+        else:
+            logger.error("Invalid pair format: {!r} (expected Y/X)", raw)
+            return 1
+
+    if not parsed_pairs:
+        logger.error("No valid pairs specified. Use --pairs Y/X,Y/X or PAIRS env var.")
+        return 1
+
+    # ── Resolve capital once (shared across all pairs) ──────────────────
+    total_capital = await BybitLiveRunnerConfig.resolve_initial_capital(cfg)
+    cfg.initial_capital = total_capital
+    capital_per_pair = total_capital / len(parsed_pairs)
 
     logger.info(
-        "QuantLuna starting — {}/{} interval={}m dry_run={} log_dir={} state_dir={}",
-        cfg.symbol_y, cfg.symbol_x, cfg.interval, cfg.dry_run, LOG_DIR, STATE_DIR,
+        "QuantLuna multi-pair starting — {} pairs capital={:.2f} USDT dry_run={}",
+        len(parsed_pairs), total_capital, cfg.dry_run,
     )
+    for sy, sx in parsed_pairs:
+        logger.info("  → {}/{}", sy, sx)
 
     mode = "live" if not cfg.dry_run else "paper"
     _validate_config(cfg, mode)
+
+    # ── Set default symbol on cfg (used by non-pair-specific code) ──────
+    cfg.symbol_y, cfg.symbol_x = parsed_pairs[0]
 
     # ── S48 P0: Singleton lock — prevent duplicate runners ────────────
     from core.singleton_lock import SingletonLock
@@ -281,39 +302,85 @@ async def main() -> int:
     _install_signal_handlers(loop, shutdown_event)
 
     notifier_bus = await build_notifier_bus(cfg)
-    ws_feed      = await build_ws_feed(cfg)
 
     from core.state_bus import bus as state_bus
     wire_dashboard_engine(cfg, state_bus)
 
-    # Canonical import: execution.workflow_orchestrator is the startup-workflow
-    # orchestrator (5 phases: HealthCheck, PositionScanner, ResumeManager,
-    # AdoptionEngine, ProfitOptimizer -> BybitLiveRunner).
-    # core/workflow_orchestrator.py is a deprecated shim — do NOT import from there.
-    from execution.workflow_orchestrator import WorkflowOrchestrator
-    orch = WorkflowOrchestrator.from_runner_cfg(
-        cfg=cfg,
-        notifier_bus=notifier_bus,
-        ws_feed=ws_feed,
-        skip_health_check=args.skip_health,
-        position_store=position_store,
-    )
+    # --- Build one BybitLiveRunner per pair ---
+    from execution.bybit_live_runner import BybitLiveRunner, BybitLiveRunnerConfig
+    from execution.exchange_factory import get_order_router
 
-    ctx = await orch.run_startup_workflow()
+    runners = []
+    pair_labels = []
 
-    if ctx.should_halt:
-        logger.error("Startup HALT: {}", ctx.halt_reason)
-        if notifier_bus:
-            try:
-                await notifier_bus.send_alert(
-                    f"\u274c QuantLuna HALT: {ctx.halt_reason}",
-                    level="error",
-                )
-            except Exception as exc:
-                logger.warning("main: failed to send HALT notification: {}", exc)
+    for sy, sx in parsed_pairs:
+        try:
+            pair_cfg = BybitLiveRunnerConfig.from_env()
+            pair_cfg.symbol_y = sy
+            pair_cfg.symbol_x = sx
+            pair_cfg.interval = args.interval or pair_cfg.interval
+            if args.dry_run:
+                pair_cfg.dry_run = True
+            pair_cfg.initial_capital = capital_per_pair
+
+            ws = await build_ws_feed(pair_cfg)
+            if ws is None:
+                logger.warning("Skipping {}/{} -- WS feed build failed", sy, sx)
+                continue
+
+            runner = BybitLiveRunner(
+                cfg=pair_cfg,
+                exchange=get_order_router(mode="live" if not pair_cfg.dry_run else "paper"),
+                ws_feed=ws,
+                notifier_bus=notifier_bus,
+            )
+            runners.append(runner)
+            pair_labels.append(f"{sy}/{sx}")
+            logger.info("Runner created: {}/{} (capital={:.2f})", sy, sx, capital_per_pair)
+        except Exception as exc:
+            logger.error("Failed to build runner for {}/{}: {}", sy, sx, exc)
+
+    if not runners:
+        logger.error("No runners could be created -- aborting")
         return 1
 
-    runner_task = asyncio.create_task(orch.start_runner(ctx))
+    # --- Start all runners via asyncio.gather + CapitalAllocator ---
+    from execution.capital_allocator import CapitalAllocator, StrategyAllocation
+    from execution.daily_pnl_tracker import DailyPnLTracker
+
+    capital_allocator = None
+    try:
+        tracker = DailyPnLTracker(db_path="state/daily_pnl.db")
+        allocations = [
+            StrategyAllocation(name="pairs_futures", target_pct=1.0, profit_take_pct=0.03),
+        ]
+        capital_allocator = CapitalAllocator(
+            tracker=tracker, allocations=allocations, notifier_bus=notifier_bus,
+        )
+        logger.info("CapitalAllocator initialized")
+    except Exception as exc:
+        logger.warning("CapitalAllocator init failed: {}", exc)
+
+    async def _run_all_pairs():
+        tasks = []
+        for r, label in zip(runners, pair_labels):
+            tasks.append(asyncio.create_task(r.start(), name=label))
+        if capital_allocator is not None:
+            tasks.append(asyncio.create_task(capital_allocator.run_loop(), name="capital_allocator"))
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            logger.info("All runners cancelled")
+
+    runner_task = asyncio.create_task(_run_all_pairs(), name="multi_runner")
+
+    for sy, sx in parsed_pairs:
+        logger.info("  -> {}/{}", sy, sx)
+    await notifier_bus.send_alert(
+        "\U0001f680 QuantLuna Multi-Pair | " + str(len(runners)) + " perechi | "
+        "$" + "{:.2f}".format(total_capital) + " | " + ", ".join(pair_labels),
+        level="info",
+    )
 
     # ── Daily summary reporter ─────────────────────────────────────────
     async def _daily_summary_loop():
@@ -350,8 +417,15 @@ async def main() -> int:
     api_host = os.getenv("API_HOST", "0.0.0.0")
     api_task = None
     try:
-        # Inject orchestrator state into API routers (same as api/main.py lifespan)
-        inject_api_state(orch, ctx, notifier_bus)
+        # Inject risk engine into API (simplified for multi-pair)
+        try:
+            from api.risk import set_risk_engine
+            from core.state_bus import bus as sb
+            eng = sb.risk_engine
+            if eng:
+                set_risk_engine(eng)
+        except Exception:
+            pass
 
         import uvicorn
         from api.main import app
