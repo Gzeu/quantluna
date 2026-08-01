@@ -16,7 +16,7 @@ jobs:
     name: Mark stale issues and PRs
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/stale@v9
+      - uses: actions/stale@v11
         with:
           # Issues inactive 30 zile -> stale, 7 zile dupa -> close
           days-before-issue-stale: 30
