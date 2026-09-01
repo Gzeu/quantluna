@@ -23,7 +23,7 @@ jobs:
     name: Trivy Docker scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Build image for scanning
         run: docker build --target production -t quantluna:scan .
@@ -51,7 +51,7 @@ jobs:
     name: CodeQL Python
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4
